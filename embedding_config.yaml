@@ -1,0 +1,79 @@
+# Config for embedding generation (initial setup + ongoing)
+# Used by GraphSAGE training and semantic embedding workers
+
+graph_sage:
+  # Graph projection for training
+  graph_name: customer_recipe_graph
+  node_labels:
+    - B2C_Customer
+    - Recipe
+    - Product
+    - Ingredient
+    - Cuisine
+    - Household
+    - Allergens
+    - Dietary_Preferences
+    - B2C_Customer_Health_Profiles
+    - B2C_Customer_Health_Conditions
+  relationship_types:
+    - HAS_PROFILE
+    - HAS_CONDITION
+    - IS_ALLERGIC
+    - FOLLOWS_DIET
+    - BELONGS_TO
+    - VIEWED
+    - RATED
+    - SAVED
+    - REJECTED
+    - WHITELISTED
+    - BLACKLISTED
+    - TRIED
+    - USES_INGREDIENT
+    - BELONGS_TO_CUSINE
+  # Numeric properties to use as GraphSAGE features (must exist on all projected nodes)
+  # Add your node numeric properties here
+  feature_properties: []
+  # Fallback if nodes lack numeric features - will add dummyFeature = 1.0
+  use_dummy_feature_fallback: true
+  model_name: b2c_customer_model
+  embedding_dimension: 128
+  write_property: graphSageEmbedding
+
+semantic:
+  # Per-label text assembly: which properties to concatenate for embedding
+  label_text_rules:
+    Recipe:
+      properties: [title, description, meal_type, instructions]
+      separator: " "
+    Ingredient:
+      properties: [name, category]
+      separator: " "
+    Product:
+      properties: [name, brand, description]
+      separator: " "
+    B2C_Customer:
+      properties: [health_goal, activity_level, intolerances]
+      separator: " "
+    Cuisine:
+      properties: [name, region]
+      separator: " "
+  write_property: semanticEmbedding
+
+vector_indexes:
+  semantic:
+    - label: Recipe
+      property: semanticEmbedding
+      dimensions: 1536
+      index_name: recipe_semantic_idx
+    - label: Ingredient
+      property: semanticEmbedding
+      dimensions: 1536
+      index_name: ingredient_semantic_idx
+    - label: Product
+      property: semanticEmbedding
+      dimensions: 1536
+      index_name: product_semantic_idx
+  structural:
+    - label: B2C_Customer
+      property: graphSageEmbedding
+      dimensions: 128
