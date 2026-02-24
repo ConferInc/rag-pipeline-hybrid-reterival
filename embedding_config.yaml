@@ -43,19 +43,19 @@ semantic:
   # Per-label text assembly: which properties to concatenate for embedding
   label_text_rules:
     Recipe:
-      properties: [title, description, meal_type, instructions]
+      properties: [title, description, difficulty, cuisine_code, total_time_minutes]
       separator: " "
     Ingredient:
       properties: [name, category]
       separator: " "
     Product:
-      properties: [name, brand, description]
+      properties: [name, brand, status]
       separator: " "
     B2C_Customer:
-      properties: [health_goal, activity_level, intolerances]
+      properties: [email, full_name, gender]
       separator: " "
     Cuisine:
-      properties: [name, region]
+      properties: [code]
       separator: " "
   write_property: semanticEmbedding
 
@@ -64,16 +64,110 @@ vector_indexes:
     - label: Recipe
       property: semanticEmbedding
       dimensions: 1536
-      index_name: recipe_semantic_idx
+      index_name: vec_recipe_semanticembedding
     - label: Ingredient
       property: semanticEmbedding
       dimensions: 1536
-      index_name: ingredient_semantic_idx
+      index_name: vec_ingredient_semanticembedding
     - label: Product
       property: semanticEmbedding
       dimensions: 1536
-      index_name: product_semantic_idx
+      index_name: vec_product_semanticembedding
+    - label: B2C_Customer
+      property: semanticEmbedding
+      dimensions: 1536
+      index_name: vec_b2c_customer_semanticembedding
+    - label: Cuisine
+      property: semanticEmbedding
+      dimensions: 1536
+      index_name: vec_cuisine_semanticembedding
   structural:
+    - label: Allergens
+      property: graphSageEmbedding
+      dimensions: 128
+      index_name: vec_allergens_graphsageembedding
     - label: B2C_Customer
       property: graphSageEmbedding
       dimensions: 128
+      index_name: vec_b2c_customer_graphsageembedding
+    - label: B2C_Customer_Health_Profiles
+      property: graphSageEmbedding
+      dimensions: 128
+      index_name: vec_b2c_customer_health_profiles_graphsageembedding
+    - label: B2C_Customer_Health_Conditions
+      property: graphSageEmbedding
+      dimensions: 128
+      index_name: vec_b2c_customer_health_conditions_graphsageembedding
+    - label: Cuisine
+      property: graphSageEmbedding
+      dimensions: 128
+      index_name: vec_cuisine_graphsageembedding
+    - label: Dietary_Preferences
+      property: graphSageEmbedding
+      dimensions: 128
+      index_name: vec_dietary_preferences_graphsageembedding
+    - label: Household
+      property: graphSageEmbedding
+      dimensions: 128
+      index_name: vec_household_graphsageembedding
+    - label: Ingredient
+      property: graphSageEmbedding
+      dimensions: 128
+      index_name: vec_ingredient_graphsageembedding
+    - label: Product
+      property: graphSageEmbedding
+      dimensions: 128
+      index_name: vec_product_graphsageembedding
+    - label: Recipe
+      property: graphSageEmbedding
+      dimensions: 128
+      index_name: vec_recipe_graphsageembedding
+
+# Intent → semantic label routing
+# Maps extractor_classifier intent to which semantic index to search
+intent_semantic_labels:
+  find_recipe: Recipe
+  find_recipe_by_pantry: Recipe
+  get_nutritional_info: Ingredient
+  compare_foods: Ingredient
+  check_diet_compliance: Ingredient
+  check_substitution: Ingredient
+  get_substitution_suggestion: Ingredient
+  rank_results: Recipe
+
+# Intent → structural expansion config
+# Maps intent to seed label + which labels/rels to expand into
+intent_structural:
+  find_recipe:
+    seed_label: B2C_Customer
+    expand_labels: [Recipe]
+    expand_relationships: [SAVED, RATED, LIKED, VIEWED]
+  find_recipe_by_pantry:
+    seed_label: B2C_Customer
+    expand_labels: [Recipe]
+    expand_relationships: [SAVED, RATED, LIKED, VIEWED]
+
+# Intent-based filtering for structural expansion
+# Maps intent → which labels and relationships to keep after k-hop expansion
+intent_filters:
+  recommend_recipe:
+    labels: [Recipe]
+    relationships: [SAVED, RATED, LIKED, VIEWED]
+  check_allergen:
+    labels: [Allergens]
+    relationships: [IS_ALLERGIC]
+  dietary_info:
+    labels: [Dietary_Preferences]
+    relationships: [FOLLOWS_DIET]
+  health_condition:
+    labels: [B2C_Customer_Health_Conditions]
+    relationships: [HAS_CONDITION]
+  similar_customer:
+    labels: [B2C_Customer]
+    relationships: []
+  ingredient_info:
+    labels: [Ingredient]
+    relationships: [USES_INGREDIENT]
+  cuisine_preference:
+    labels: [Cuisine, Recipe]
+    relationships: [BELONGS_TO_CUSINE]
