@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
+import time
+import uuid
 from argparse import ArgumentParser
 from pathlib import Path
 
+import yaml
+
 from dotenv import load_dotenv
+
+from rag_pipeline.logging_utils import (
+    set_request_id,
+    setup_pipeline_logging,
+    truncate_for_log,
+)
 from openai import OpenAI
 
 from rag_pipeline.config import load_embedding_config
@@ -88,6 +99,9 @@ def build_parser() -> ArgumentParser:
     return p
 
 
+logger_cli = logging.getLogger(__name__)
+
+
 def main() -> None:
     load_dotenv()
     parser = build_parser()
@@ -119,7 +133,10 @@ def main() -> None:
                 cfg=cfg,
                 embedder=embedder,
                 request=SemanticRetrievalRequest(
-                    query=str(args.query), top_k=int(args.top_k), label=args.label
+                    query=str(args.query),
+                    top_k=int(args.top_k),
+                    label=args.label,
+                    config_path=str(args.config),
                 ),
                 database=neo_settings.database,
             )
@@ -282,6 +299,7 @@ def main() -> None:
                 "semantic_count": len(orch_result.semantic_results),
                 "structural_count": len(orch_result.structural_results.get("expanded_context", [])),
                 "cypher_count": len(orch_result.cypher_results),
+                "fused_count": len(orch_result.fused_results),
                 "errors": orch_result.errors,
             }, indent=2, ensure_ascii=False))
 
@@ -289,6 +307,10 @@ def main() -> None:
         from rag_pipeline.orchestrator.orchestrator import orchestrate
         from rag_pipeline.augmentation.prompt_builder import build_augmented_prompt
         from rag_pipeline.generation.generator import generate_response
+
+        setup_pipeline_logging(args.config)
+        request_id = str(uuid.uuid4())
+        set_request_id(request_id)
 
         cfg = load_embedding_config(Path(args.config))
 
@@ -309,6 +331,13 @@ def main() -> None:
         neo_settings = neo4j_settings_from_env()
         driver = create_neo4j_driver(neo_settings)
 
+        query_truncated = truncate_for_log(str(args.query))
+        logger_cli.info(
+            "Request start",
+            extra={"component": "cli", "query": query_truncated},
+        )
+        t_start = time.perf_counter()
+
         try:
             orch_result = orchestrate(
                 driver,
@@ -323,8 +352,59 @@ def main() -> None:
         finally:
             driver.close()
 
+        t_retrieval_ms = (time.perf_counter() - t_start) * 1000
+        semantic_count = len(orch_result.semantic_results)
+        structural_count = len(orch_result.structural_results.get("expanded_context", []))
+        cypher_count = len(orch_result.cypher_results)
+        fused_count = len(orch_result.fused_results)
+
+        logger_cli.info(
+            "Retrieval complete",
+            extra={
+                "component": "cli",
+                "query": query_truncated,
+                "intent": orch_result.intent,
+                "retrieval_counts": {
+                    "semantic": semantic_count,
+                    "structural": structural_count,
+                    "cypher": cypher_count,
+                },
+                "fused_count": fused_count,
+                "latency_ms": round(t_retrieval_ms, 1),
+            },
+        )
+
+        # Check if all retrieval context is empty; skip LLM if configured
+        has_context = (
+            bool(orch_result.fused_results)
+            or bool(orch_result.semantic_results)
+            or bool(orch_result.structural_results.get("expanded_context"))
+            or bool(orch_result.cypher_results)
+        )
+        if not has_context:
+            failure_cfg = {}
+            try:
+                with open(args.config) as f:
+                    raw = yaml.safe_load(f)
+                failure_cfg = raw.get("retrieval_failure_handling", {}) or {}
+            except Exception:
+                pass
+            all_empty = failure_cfg.get("all_empty", {}) or {}
+            if all_empty.get("skip_generation", True):
+                msg = all_empty.get(
+                    "user_message",
+                    "No recipes could be loaded right now. Please try again.",
+                )
+                logger_cli.warning(
+                    "All retrievals empty; skipping LLM generation",
+                    extra={"component": "cli", "query": query_truncated},
+                )
+                print(msg)
+                return
+
         prompt = build_augmented_prompt(orch_result, str(args.query))
 
+        t_gen_start = time.perf_counter()
         if args.show_prompt:
             print("=" * 60)
             print("AUGMENTED PROMPT:")
@@ -335,14 +415,61 @@ def main() -> None:
             print("=" * 60)
 
         try:
-            answer = generate_response(prompt)
+            answer = generate_response(prompt, config_path=str(args.config))
         except Exception as e:
+            t_gen_ms = (time.perf_counter() - t_gen_start) * 1000
+            logger_cli.error(
+                "Generation failed",
+                extra={
+                    "component": "generation",
+                    "query": query_truncated,
+                    "error": str(e),
+                    "latency_ms": round(t_gen_ms, 1),
+                },
+                exc_info=True,
+            )
             print(f"[ERROR] Generation failed: {e}", file=sys.stderr)
             raise
 
+        t_gen_ms = (time.perf_counter() - t_gen_start) * 1000
+
+        # Response post-validation (forbidden items)
+        validation_cfg = {}
+        try:
+            with open(args.config) as f:
+                raw_cfg = yaml.safe_load(f)
+            validation_cfg = raw_cfg.get("response_validation", {}) or {}
+        except Exception:
+            pass
+        if validation_cfg.get("enabled", False) and answer:
+            from rag_pipeline.validation.response_validator import validate_response
+            is_valid, violations, validated = validate_response(
+                answer, orch_result.entities, validation_cfg
+            )
+            answer = validated
+
         if not answer:
+            logger_cli.warning(
+                "LLM returned empty response",
+                extra={
+                    "component": "generation",
+                    "query": query_truncated,
+                    "latency_ms": round(t_gen_ms, 1),
+                },
+            )
             print("[WARN] LLM returned an empty response. Check API key, model, and base URL.", file=sys.stderr)
         else:
+            t_total_ms = (time.perf_counter() - t_start) * 1000
+            logger_cli.info(
+                "Request complete",
+                extra={
+                    "component": "cli",
+                    "query": query_truncated,
+                    "intent": orch_result.intent,
+                    "latency_ms": round(t_total_ms, 1),
+                    "generation_latency_ms": round(t_gen_ms, 1),
+                },
+            )
             print(answer)
 
 

@@ -7,12 +7,18 @@ from rag_pipeline.augmentation.condense import (
     format_context_as_text,
     format_semantic_results_as_text,
 )
+from rag_pipeline.augmentation.fusion import format_fused_results_as_text
 from rag_pipeline.orchestrator.orchestrator import OrchestratorResult
 
 
 SYSTEM_PROMPT = """You are a knowledgeable and empathetic nutrition assistant.
 Your goal is to recommend recipes, answer food and nutrition questions, and suggest meal plans
 based on the user's preferences, health conditions, dietary restrictions, and allergens.
+
+CRITICAL: Only recommend recipes that appear in the context provided below. Do not recommend
+any recipe, ingredient, or product not listed in the context. You must use only the data
+from the user's knowledge graph/database. If the context does not contain suitable options,
+say so and suggest the user refine their query—do not suggest recipes from your general knowledge.
 
 Always respect the customer's hard constraints (allergens, dietary preferences, health conditions).
 Never recommend recipes that contain allergens the customer is sensitive to.
@@ -26,16 +32,21 @@ def build_augmented_prompt(
     max_semantic: int = 5,
     max_structural: int = 7,
     max_cypher: int = 10,
+    max_fused: int = 15,
 ) -> str:
     """
-    Build the final augmented LLM prompt from all three retrieval results.
+    Build the final augmented LLM prompt from retrieval results.
+
+    When fused_results is available (from RRF), uses a single RANKED CONTEXT section.
+    Otherwise falls back to separate semantic, collaborative, and graph sections.
 
     Args:
         result: OrchestratorResult from orchestrate()
         user_query: Original user query
-        max_semantic: Max semantic results to include
-        max_structural: Max structural results to include
-        max_cypher: Max cypher results to include
+        max_semantic: Max semantic results (fallback only)
+        max_structural: Max structural results (fallback only)
+        max_cypher: Max cypher results (fallback only)
+        max_fused: Max fused results when using RRF
 
     Returns:
         Full augmented prompt string ready for LLM
@@ -44,33 +55,40 @@ def build_augmented_prompt(
 
     sections.append(f"[SYSTEM]\n{SYSTEM_PROMPT}")
 
-    # ── Semantic context ──────────────────────────────────────────────────────
-    if result.semantic_results:
-        semantic_text = format_semantic_results_as_text(
-            result.semantic_results,
-            header="Semantically relevant results from knowledge graph:",
-            max_items=max_semantic,
+    # ── Fused RRF context (primary when available) ─────────────────────────────
+    if result.fused_results:
+        fused_text = format_fused_results_as_text(
+            result.fused_results,
+            header="Ranked results (semantic + collaborative + graph):",
+            max_items=max_fused,
         )
-        sections.append(f"[SEMANTIC CONTEXT]\n{semantic_text}")
+        sections.append(f"[RANKED CONTEXT]\n{fused_text}")
+    else:
+        # Fallback: separate sections
+        if result.semantic_results:
+            semantic_text = format_semantic_results_as_text(
+                result.semantic_results,
+                header="Semantically relevant results from knowledge graph:",
+                max_items=max_semantic,
+            )
+            sections.append(f"[SEMANTIC CONTEXT]\n{semantic_text}")
 
-    # ── Structural context ────────────────────────────────────────────────────
-    expanded = result.structural_results.get("expanded_context", [])
-    if expanded:
-        condensed = condense_for_llm(expanded, max_items=max_structural)
-        structural_text = format_context_as_text(
-            condensed,
-            header="Recipes liked by similar users:",
-        )
-        sections.append(f"[COLLABORATIVE CONTEXT]\n{structural_text}")
+        expanded = result.structural_results.get("expanded_context", [])
+        if expanded:
+            condensed = condense_for_llm(expanded, max_items=max_structural)
+            structural_text = format_context_as_text(
+                condensed,
+                header="Recipes liked by similar users:",
+            )
+            sections.append(f"[COLLABORATIVE CONTEXT]\n{structural_text}")
 
-    # ── Cypher context ────────────────────────────────────────────────────────
-    if result.cypher_results:
-        cypher_text = _format_cypher_results(
-            result.intent,
-            result.cypher_results,
-            max_items=max_cypher,
-        )
-        sections.append(f"[GRAPH FACTS]\n{cypher_text}")
+        if result.cypher_results:
+            cypher_text = _format_cypher_results(
+                result.intent,
+                result.cypher_results,
+                max_items=max_cypher,
+            )
+            sections.append(f"[GRAPH FACTS]\n{cypher_text}")
 
     # ── Errors (if any) ───────────────────────────────────────────────────────
     if result.errors:

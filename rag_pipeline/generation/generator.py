@@ -1,9 +1,30 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
+from pathlib import Path
+from typing import Any
 
+import yaml
 from openai import OpenAI
+
+from rag_pipeline.llm_retry import with_retry
+
+logger = logging.getLogger(__name__)
+
+
+def _load_llm_retry_config(config_path: str | Path = "embedding_config.yaml") -> dict[str, Any]:
+    """Load llm_retry config from YAML."""
+    path = Path(config_path)
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            raw = yaml.safe_load(f)
+        return raw.get("llm_retry", {}) or {}
+    except Exception:
+        return {}
 
 
 def generate_response(
@@ -12,6 +33,7 @@ def generate_response(
     model: str | None = None,
     temperature: float = 0.7,
     max_tokens: int | None = None,
+    config_path: str | Path = "embedding_config.yaml",
 ) -> str:
     """
     Send the augmented prompt to an LLM and return the response.
@@ -21,6 +43,7 @@ def generate_response(
         model: LLM model name (defaults to GENERATION_MODEL env var)
         temperature: Controls randomness (0 = deterministic, 1 = creative)
         max_tokens: Max tokens in response
+        config_path: Path to embedding_config.yaml for llm_retry settings
 
     Returns:
         LLM response text
@@ -36,14 +59,29 @@ def generate_response(
     # Split augmented prompt into system and user parts
     system_content, user_content = _split_prompt(augmented_prompt)
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content},
-        ],
-        temperature=temperature,
-        max_tokens=max_tokens,
+    retry_cfg = _load_llm_retry_config(config_path)
+    max_attempts = retry_cfg.get("max_attempts", 3)
+    initial_delay_ms = retry_cfg.get("initial_delay_ms", 1000)
+    max_delay_ms = retry_cfg.get("max_delay_ms", 30000)
+    jitter = retry_cfg.get("jitter", True)
+
+    def _call() -> Any:
+        return client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+    response = with_retry(
+        _call,
+        max_attempts=max_attempts,
+        initial_delay_ms=float(initial_delay_ms),
+        max_delay_ms=float(max_delay_ms),
+        jitter=jitter,
     )
 
     content = response.choices[0].message.content if response.choices else None

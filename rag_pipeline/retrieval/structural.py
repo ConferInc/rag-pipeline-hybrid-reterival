@@ -75,6 +75,10 @@ def structural_search_by_label(
                 )
             )
 
+    logger.debug(
+        "Structural search complete",
+        extra={"component": "structural", "label": label, "count": len(results)},
+    )
     return results
 
 
@@ -204,6 +208,7 @@ def structural_search_with_expansion(
     allowed_labels: list[str] | None = None,
     allowed_relationships: list[str] | None = None,
     database: str | None = None,
+    min_score: float | None = None,
 ) -> dict[str, Any]:
     """
     Combined structural search + k-hop expansion + intent filtering.
@@ -222,6 +227,7 @@ def structural_search_with_expansion(
         allowed_labels: Filter to these node types
         allowed_relationships: Filter to these relationships
         database: Neo4j database
+        min_score: Minimum GraphSAGE similarity score (filter similar nodes before expansion)
 
     Returns:
         Dict with 'similar_nodes' and 'expanded_context'
@@ -234,6 +240,9 @@ def structural_search_with_expansion(
         top_k=top_k,
         database=database,
     )
+
+    if min_score is not None:
+        similar = [r for r in similar if r.score_raw >= min_score]
 
     seed_ids = [r.node_id for r in similar]
 

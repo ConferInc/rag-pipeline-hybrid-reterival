@@ -1,6 +1,13 @@
 # Config for embedding generation (initial setup + ongoing)
 # Used by GraphSAGE training and semantic embedding workers
 
+# Logging (structured JSON, PII-safe)
+logging:
+  level: INFO
+  format: human  # json | human
+  truncate_query_max: 200
+  include_stack_trace_on_error: true
+
 graph_sage:
   # Graph projection for training
   graph_name: customer_recipe_graph
@@ -122,6 +129,89 @@ vector_indexes:
       property: graphSageEmbedding
       dimensions: 128
       index_name: vec_recipe_graphsageembedding
+
+# Intent / entity extraction failure handling (defaults preserve current flow)
+intent_extraction:
+  # On JSON parse failure: "abort" (current), "fallback", or "retry"
+  on_parse_failure: abort
+  fallback_intent: find_recipe
+  fallback_entities: {}
+  max_retries: 1
+  retry_user_message: "Return only valid JSON with keys 'intent' and 'entities'. No markdown."
+  # Entity heuristics: add missing entities from query keywords (set entity_enrichment_enabled: true to use)
+  entity_enrichment_enabled: false
+  entity_fallbacks:
+    diet_keywords:
+      gluten-free: [Gluten-Free]
+      gluten free: [Gluten-Free]
+      vegan: [Vegan]
+      vegetarian: [Vegetarian]
+      keto: [Keto]
+      paleo: [Paleo]
+      dairy-free: [Dairy-Free]
+      dairy free: [Dairy-Free]
+      nut-free: [Nut-Free]
+      nut free: [Nut-Free]
+      high-protein: [High-Protein]
+      low-fat: [Low-Fat]
+      low-carb: [Low-Carb]
+    course_keywords:
+      breakfast: breakfast
+      lunch: lunch
+      dinner: dinner
+      dessert: dessert
+      appetizer: appetizer
+      main course: main_dish
+      main dish: main_dish
+      side dish: side_dish
+      salad: salad
+      soup: soup
+      snack: snack
+  # Wrong intent: broaden semantic search when query is short/ambiguous (disabled by default)
+  broaden_on_low_confidence: false
+  broaden_max_word_count: 3
+  broaden_labels: [Recipe, Ingredient]
+
+# LLM retry (retries only on 429, timeout, connection, 5xx)
+llm_retry:
+  max_attempts: 3
+  initial_delay_ms: 1000
+  max_delay_ms: 30000
+  jitter: true
+
+# Response post-validation (forbidden items: allergens, excluded ingredients)
+response_validation:
+  enabled: false
+  action: warn  # warn | truncate | reject
+  forbidden_extra_terms: []  # Additional terms beyond exclude_ingredient
+  warn_disclaimer: "\n\n_Please verify allergens and dietary restrictions before consuming._"
+  reject_fallback_message: "I couldn't safely generate a recommendation. Please verify any dietary restrictions or allergens."
+  truncate_fallback_message: "Some content was removed for safety. Please double-check allergens and dietary restrictions."
+
+# Retrieval failure handling (keep pipeline running on retrieval failures)
+retrieval_failure_handling:
+  skip_on_failure: true
+  all_empty:
+    skip_generation: true
+    user_message: "No recipes could be loaded right now. Please try again."
+
+# Retrieval guardrails (thresholds applied before fusion/RRF)
+retrieval_guardrails:
+  semantic:
+    min_score: 0.5
+  structural:
+    min_score: 0.5
+  cypher:
+    max_rows: 50
+  rrf:
+    k: 60
+    max_items: 15
+
+# Label inference (for semantic search when --label not provided)
+label_inference:
+  allowed_labels: [Recipe, Ingredient, Product, B2C_Customer, Cuisine]
+  fallback_to_llm: true
+  default_label: Recipe
 
 # Intent → semantic label routing
 # Maps extractor_classifier intent to which semantic index to search
