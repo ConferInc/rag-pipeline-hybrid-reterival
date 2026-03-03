@@ -1,6 +1,18 @@
 # Config for embedding generation (initial setup + ongoing)
 # Used by GraphSAGE training and semantic embedding workers
 
+# Embedding cache: avoids repeat API calls for duplicate/similar user queries
+embedding_cache:
+  enabled: true
+  max_size: 500
+  key_normalize: strip_lower  # strip_lower | strip | none
+
+# Intent cache: avoids repeat LLM calls for duplicate/similar queries
+intent_cache:
+  enabled: true
+  max_size: 500
+  key_normalize: strip_lower  # strip_lower | strip | none
+
 # Logging (structured JSON, PII-safe)
 logging:
   level: INFO
@@ -50,19 +62,19 @@ semantic:
   # Per-label text assembly: which properties to concatenate for embedding
   label_text_rules:
     Recipe:
-      properties: [title, description, difficulty, cuisine_code, total_time_minutes]
+      properties: [id, title, description, difficulty, cuisine_code, total_time_minutes]
       separator: " "
     Ingredient:
-      properties: [name, category]
+      properties: [id, name, category]
       separator: " "
     Product:
-      properties: [name, brand, status]
+      properties: [id, name, brand, status]
       separator: " "
     B2C_Customer:
-      properties: [email, full_name, gender]
+      properties: [id, email, full_name, gender]
       separator: " "
     Cuisine:
-      properties: [code]
+      properties: [id, code]
       separator: " "
   write_property: semanticEmbedding
 
@@ -179,6 +191,13 @@ llm_retry:
   max_delay_ms: 30000
   jitter: true
 
+# Generation (response generation cost tuning)
+# Env vars GENERATION_MODEL, GENERATION_MAX_TOKENS override these.
+generation:
+  model: openai/gpt-4o-mini      # Cheaper: gpt-4o-mini | Higher quality: gpt-4o
+  max_tokens: 1024               # Lower = less cost; 512-1024 usually enough for recipe answers
+  temperature: 0.5               # 0-0.5 = more deterministic, 0.5-0.7 = slightly creative
+
 # Response post-validation (forbidden items: allergens, excluded ingredients)
 response_validation:
   enabled: false
@@ -197,6 +216,8 @@ retrieval_failure_handling:
 
 # Retrieval guardrails (thresholds applied before fusion/RRF)
 retrieval_guardrails:
+  # Per-retrieval timeout in ms; on timeout, that path returns empty (best-effort).
+  timeout_ms: 15000
   semantic:
     min_score: 0.5
   structural:
@@ -205,7 +226,7 @@ retrieval_guardrails:
     max_rows: 50
   rrf:
     k: 60
-    max_items: 15
+    max_items: 10
 
 # Label inference (for semantic search when --label not provided)
 label_inference:
@@ -213,17 +234,38 @@ label_inference:
   fallback_to_llm: true
   default_label: Recipe
 
+# Label inference cache (avoids repeat LLM calls for same query)
+label_cache:
+  enabled: true
+  max_size: 500
+  key_normalize: strip_lower
+
 # Intent → semantic label routing
 # Maps extractor_classifier intent to which semantic index to search
 intent_semantic_labels:
   find_recipe: Recipe
   find_recipe_by_pantry: Recipe
+  similar_recipes: Recipe
+  recipes_for_cuisine: Recipe
+  recipes_by_nutrient: Recipe
+  rank_results: Recipe
   get_nutritional_info: Ingredient
+  nutrient_in_foods: Ingredient
+  nutrient_category: Ingredient  # Cypher primary; semantic fallback
   compare_foods: Ingredient
   check_diet_compliance: Ingredient
   check_substitution: Ingredient
   get_substitution_suggestion: Ingredient
-  rank_results: Recipe
+  similar_ingredients: Ingredient
+  ingredient_in_recipes: Recipe
+  ingredient_nutrients: Ingredient
+  find_product: Product
+  product_nutrients: Product
+  cuisine_recipes: Recipe
+  cuisine_hierarchy: Cuisine
+  cross_reactive_allergens: Ingredient  # Cypher primary (Allergens)
+  general_nutrition: Ingredient
+  out_of_scope: Recipe
 
 # Intent → structural expansion config
 # Maps intent to seed label + which labels/rels to expand into

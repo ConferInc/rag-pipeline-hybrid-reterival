@@ -7,33 +7,34 @@ and generates parameterized Neo4j Cypher queries ready for session.run().
 Graph Schema: v3.0
 ──────────────────
 Key nodes used here:
-  Recipe         — title, recipe_type, total_time_minutes,
+  Recipe         — id, title, meal_type, difficulty, total_time_minutes,
+                   prep_time_minutes, cook_time_minutes, servings, image_url,
                    percent_calories_protein, percent_calories_fat, percent_calories_carbs
   Ingredient     — name, calories (per 100g), protein_g, total_fat_g, total_carbs_g,
                    dietary_fiber_g, total_sugars_g, sodium_mg, cholesterol_mg,
                    saturated_fat_g, polyunsaturated_fat_g, monounsaturated_fat_g,
                    vitamin_a_mcg, vitamin_c_mg, vitamin_d_mcg, vitamin_e_mg,
                    vitamin_k_mcg, calcium_mg, iron_mg, magnesium_mg, potassium_mg
-  DietaryPreference — name
-  NutrientDefinition — nutrient_name, unit_name
-  IngredientNutritionValue — amount, unit, per_amount
-  RecipeNutritionValue     — amount, unit, per_amount, data_source
+  Dietary_Preferences — name
+  NutrientDefinition  — nutrient_name, unit_name
+  NutritionValue      — amount, unit, per_amount
+  Allergens           — name, code, cross_reactive_with, common_names
 
 Key relationships used here:
-  (Recipe)      -[:USES_INGREDIENT]->    (Ingredient)
-  (Recipe)      -[:SUITABLE_FOR_DIET]->  (DietaryPreference)
-  (Ingredient)  -[:SUBSTITUTE_FOR]->     (Ingredient)
-  (DietaryPreference) -[:FORBIDS]->      (Ingredient)
-  (DietaryPreference) -[:ALLOWS]->       (Ingredient)
-  (Ingredient)  -[:HAS_NUTRITION_VALUE]-> (IngredientNutritionValue)
-  (IngredientNutritionValue) -[:OF_NUTRIENT]-> (NutrientDefinition)
-  (Recipe)      -[:HAS_NUTRITION_VALUE]-> (RecipeNutritionValue)
-  (RecipeNutritionValue)     -[:OF_NUTRIENT]-> (NutrientDefinition)
+  (Recipe)             -[:USES_INGREDIENT]->  (Ingredient)
+  (Recipe)             -[:BELONGS_TO_CUSINE]-> (Cuisine)
+  (B2C_Customer)       -[:FOLLOWS_DIET]->      (Dietary_Preferences)
+  (Ingredient)         -[:SUBSTITUTE_FOR]->    (Ingredient)
+  (Dietary_Preferences)-[:FORBIDS]->           (Ingredient)
+  (Dietary_Preferences)-[:ALLOWS]->            (Ingredient)
+  (Ingredient)         -[:HAS_NUTRITION]->     (NutritionValue)
+  (NutritionValue)     -[:OF_NUTRIENT]->       (NutrientDefinition)
+  (B2C_Customer)       -[:IS_ALLERGIC]->       (Allergens)
 
-NOTE: There is NO Course node and no BELONGS_TO_COURSE relationship in v3.0.
-      Recipe course/type is stored as the inline property `recipe_type`.
+NOTE: There is NO Course node and no BELONGS_TO_COURSE relationship.
+      Recipe course/type is stored as the inline property `meal_type`.
       Recipe does NOT have an inline `calories` property; calorie data lives
-      in RecipeNutritionValue nodes (nutrient_name = "Energy").
+      in NutritionValue nodes linked via HAS_NUTRITION → OF_NUTRIENT.
 """
 
 import json
@@ -63,17 +64,18 @@ def _build_find_recipe(entities: dict) -> tuple[str, dict]:
     ---------------------
     include_ingredient  List[str]  – ingredients that MUST be in the recipe
     exclude_ingredient  List[str]  – ingredients that MUST NOT be in the recipe
-    diet                List[str]  – DietaryPreference names (SUITABLE_FOR_DIET)
-    course              str        – maps to r.recipe_type (inline property)
+    diet                List[str]  – Dietary_Preferences names (FORBIDS/ALLOWS)
+    course              str        – maps to r.meal_type (inline property)
     dish                str        – keyword match on r.title
-    cal_upper_limit     int        – max calories via RecipeNutritionValue
+    cal_upper_limit     int        – max calories via NutritionValue (HAS_NUTRITION)
     nutrient_threshold  dict       – {nutrient, operator, value}
 
     Graph notes
     -----------
-    * recipe_type is an inline property on Recipe (no Course node in v3.0).
-    * Recipe has no inline `calories` property; energy is in RecipeNutritionValue.
-    * Recipe adds %_calories_protein/fat/carbs as v3.0 inline properties.
+    * meal_type is an inline property on Recipe (no Course node).
+    * Recipe has no inline `calories` property; energy is in NutritionValue
+      linked via (Recipe)-[:HAS_NUTRITION]->(NutritionValue)-[:OF_NUTRIENT]->(NutrientDefinition).
+    * Recipe has percent_calories_protein/fat/carbs as inline properties.
     """
     clauses: list[str] = ["MATCH (r:Recipe)"]
     where_parts: list[str] = []
@@ -97,20 +99,26 @@ def _build_find_recipe(entities: dict) -> tuple[str, dict]:
         )
         params[param_key] = ing
 
-    # ── Diet filter — each diet requires its own MATCH ─────────────────────
+    # ── Diet filter — via B2C_Customer FOLLOWS_DIET relationship
+    # Finds recipes saved/viewed by customers who follow the requested diet.
+    # This uses the existing (B2C_Customer)-[:FOLLOWS_DIET]->(Dietary_Preferences)
+    # and (B2C_Customer)-[:SAVED]->(Recipe) relationships which are present in Neo4j.
+    # NOTE: FORBIDS/USES_INGREDIENT don't exist yet — using collaborative signal instead.
     diets = entities.get("diet", [])
     for idx, diet in enumerate(diets):
         alias = f"dp_{idx}"
         clauses.append(
-            f"MATCH (r)-[:SUITABLE_FOR_DIET]->({alias}:DietaryPreference "
-            f"{{name: $diet_{idx}}})"
+            f"MATCH (cust_{idx}:B2C_Customer)-[:FOLLOWS_DIET]->({alias}:Dietary_Preferences {{name: $diet_{idx}}})"
+        )
+        where_parts.append(
+            f"EXISTS {{ MATCH (cust_{idx})-[:SAVED|VIEWED]->(r) }}"
         )
         params[f"diet_{idx}"] = diet
 
-    # ── Course / recipe_type ─────────────────────────────────────────────────
+    # ── Course / meal_type ───────────────────────────────────────────────────
     course = entities.get("course")
     if course:
-        where_parts.append("toLower(r.recipe_type) = toLower($course)")
+        where_parts.append("toLower(r.meal_type) = toLower($course)")
         params["course"] = course
 
     # ── Dish / title keyword ──────────────────────────────────────────────────
@@ -119,19 +127,19 @@ def _build_find_recipe(entities: dict) -> tuple[str, dict]:
         where_parts.append("toLower(r.title) CONTAINS toLower($dish)")
         params["dish"] = dish
 
-    # ── Calorie upper limit — via RecipeNutritionValue ────────────────────────
+    # ── Calorie upper limit — via NutritionValue (HAS_NUTRITION) ─────────────
     cal_limit = entities.get("cal_upper_limit")
     if cal_limit is not None:
         where_parts.append(
             "EXISTS { "
-            "MATCH (r)-[:HAS_NUTRITION_VALUE]->(rnv_cal:RecipeNutritionValue)"
+            "MATCH (r)-[:HAS_NUTRITION]->(rnv_cal:NutritionValue)"
             "-[:OF_NUTRIENT]->(nd_cal:NutrientDefinition) "
             "WHERE nd_cal.nutrient_name = 'Energy' "
             "AND rnv_cal.amount <= $cal_upper_limit }"
         )
         params["cal_upper_limit"] = cal_limit
 
-    # ── Nutrient threshold — via RecipeNutritionValue ─────────────────────────
+    # ── Nutrient threshold — via NutritionValue ───────────────────────────────
     threshold = entities.get("nutrient_threshold")
     if threshold and isinstance(threshold, dict):
         nutrient = threshold.get("nutrient", "Protein")
@@ -139,7 +147,7 @@ def _build_find_recipe(entities: dict) -> tuple[str, dict]:
         value = threshold.get("value", 0)
         where_parts.append(
             "EXISTS { "
-            "MATCH (r)-[:HAS_NUTRITION_VALUE]->(rnv_nt:RecipeNutritionValue)"
+            "MATCH (r)-[:HAS_NUTRITION]->(rnv_nt:NutritionValue)"
             "-[:OF_NUTRIENT]->(nd_nt:NutrientDefinition) "
             "WHERE nd_nt.nutrient_name = $threshold_nutrient "
             f"AND rnv_nt.amount {op_sym} $threshold_value }}"
@@ -152,7 +160,7 @@ def _build_find_recipe(entities: dict) -> tuple[str, dict]:
         clauses.append("WHERE " + "\n  AND ".join(where_parts))
 
     clauses.append(
-        "RETURN r.title, r.recipe_type, r.total_time_minutes,\n"
+        "RETURN r.id, r.title, r.meal_type, r.total_time_minutes,\n"
         "       r.percent_calories_protein, r.percent_calories_fat, r.percent_calories_carbs"
     )
     clauses.append("LIMIT 10")
@@ -179,7 +187,7 @@ def _build_find_recipe_by_pantry(entities: dict) -> tuple[str, dict]:
         "AS have_ingredients,\n"
         "     SIZE(recipe_ingredients) AS total_needed\n"
         "WHERE SIZE(have_ingredients) >= (total_needed * 0.5)\n"
-        "RETURN r.title, r.recipe_type,\n"
+        "RETURN r.id, r.title, r.meal_type,\n"
         "       SIZE(have_ingredients) AS matching_count,\n"
         "       total_needed\n"
         "ORDER BY matching_count DESC\n"
@@ -198,7 +206,7 @@ def _build_get_nutritional_info(entities: dict) -> tuple[str, dict]:
     ingredient  str   – Ingredient.name
     nutrient    str   – NutrientDefinition.nutrient_name (optional)
 
-    If `nutrient` is provided → deep traversal through IngredientNutritionValue.
+    If `nutrient` is provided → deep traversal through NutritionValue.
     If omitted → fast inline macro properties returned directly from Ingredient.
     """
     ingredient = entities.get("ingredient", "")
@@ -209,7 +217,7 @@ def _build_get_nutritional_info(entities: dict) -> tuple[str, dict]:
         cypher = (
             "MATCH (i:Ingredient)\n"
             "WHERE toLower(i.name) = toLower($ingredient_name)\n"
-            "MATCH (i)-[:HAS_NUTRITION_VALUE]->(inv:IngredientNutritionValue)"
+            "MATCH (i)-[:HAS_NUTRITION]->(inv:NutritionValue)"
             "-[:OF_NUTRIENT]->(nd:NutrientDefinition)\n"
             "WHERE toLower(nd.nutrient_name) = toLower($nutrient_name)\n"
             "RETURN i.name AS ingredient,\n"
@@ -261,7 +269,7 @@ def _build_compare_foods(entities: dict) -> tuple[str, dict]:
     nutrient     str        – optional: narrow to one NutrientDefinition
 
     Graph note: Ingredient has 20 inline nutrition properties (per 100g).
-    When a specific nutrient is requested we traverse IngredientNutritionValue
+    When a specific nutrient is requested we traverse NutritionValue
     so we can return the exact data-source and unit from the graph.
     """
     foods = entities.get("ingredients", [])
@@ -272,7 +280,7 @@ def _build_compare_foods(entities: dict) -> tuple[str, dict]:
         cypher = (
             "MATCH (i:Ingredient)\n"
             "WHERE toLower(i.name) IN [x IN $food_list | toLower(x)]\n"
-            "MATCH (i)-[:HAS_NUTRITION_VALUE]->(inv:IngredientNutritionValue)"
+            "MATCH (i)-[:HAS_NUTRITION]->(inv:NutritionValue)"
             "-[:OF_NUTRIENT]->(nd:NutrientDefinition)\n"
             "WHERE toLower(nd.nutrient_name) = toLower($nutrient_name)\n"
             "  AND inv.per_amount = '100g'\n"
@@ -314,11 +322,11 @@ def _build_check_diet_compliance(entities: dict) -> tuple[str, dict]:
     Supported entity keys
     ---------------------
     ingredient  str        – Ingredient.name
-    diet        List[str]  – DietaryPreference.name (first entry used)
+    diet        List[str]  – Dietary_Preferences.name (first entry used)
 
     Graph relationships used:
-      (DietaryPreference) -[:FORBIDS]-> (Ingredient)
-      (DietaryPreference) -[:ALLOWS]->  (Ingredient)
+      (Dietary_Preferences) -[:FORBIDS]-> (Ingredient)
+      (Dietary_Preferences) -[:ALLOWS]->  (Ingredient)
     """
     ingredient = entities.get("ingredient", "")
     diets = entities.get("diet", [])
@@ -329,7 +337,7 @@ def _build_check_diet_compliance(entities: dict) -> tuple[str, dict]:
         cypher = (
             "MATCH (ing:Ingredient)\n"
             "WHERE toLower(ing.name) = toLower($ingredient_name)\n"
-            "MATCH (diet:DietaryPreference {name: $diet_name})\n"
+            "MATCH (diet:Dietary_Preferences {name: $diet_name})\n"
             "OPTIONAL MATCH (diet)-[forbidden:FORBIDS]->(ing)\n"
             "OPTIONAL MATCH (diet)-[allowed:ALLOWS]->(ing)\n"
             "RETURN\n"
@@ -396,8 +404,8 @@ def _build_get_substitution_suggestion(entities: dict) -> tuple[str, dict]:
     diet        List[str]  – optional diet context (first entry used)
 
     Graph relationships:
-      (Ingredient) -[:SUBSTITUTE_FOR]-> (Ingredient)
-      (DietaryPreference) -[:FORBIDS]-> (Ingredient)
+      (Ingredient) -[:SUBSTITUTE_FOR]->    (Ingredient)
+      (Dietary_Preferences) -[:FORBIDS]->  (Ingredient)
     """
     ingredient = entities.get("ingredient", "")
     diets = entities.get("diet", [])
@@ -412,7 +420,7 @@ def _build_get_substitution_suggestion(entities: dict) -> tuple[str, dict]:
 
     if diet_context:
         cypher_lines.extend([
-            "MATCH (diet:DietaryPreference {name: $diet_context})",
+            "MATCH (diet:Dietary_Preferences {name: $diet_context})",
             "WHERE NOT EXISTS {",
             "  MATCH (diet)-[:FORBIDS]->(candidate)",
             "}",
@@ -439,8 +447,8 @@ def _build_rank_results(entities: dict) -> tuple[str, dict]:
     criterion  str        – "protein_to_calorie_ratio" | "lowest_fat" | "lowest_calories"
     target     List[str]  – Recipe IDs to rank
 
-    Graph note: Recipe v3.0 adds percent_calories_protein/fat/carbs as inline props.
-                Calorie data lives in RecipeNutritionValue (no inline `calories` on Recipe).
+    Graph note: Recipe has percent_calories_protein/fat/carbs as inline props.
+                Calorie data lives in NutritionValue nodes linked via HAS_NUTRITION → OF_NUTRIENT.
     """
     criterion = entities.get("criterion", "protein_to_calorie_ratio")
     recipe_ids = entities.get("target", [])
@@ -456,9 +464,9 @@ def _build_rank_results(entities: dict) -> tuple[str, dict]:
         cypher = (
             "MATCH (r:Recipe)\n"
             "WHERE r.id IN $recipe_ids\n"
-            "MATCH (r)-[:HAS_NUTRITION_VALUE]->(rnv:RecipeNutritionValue)"
+            "MATCH (r)-[:HAS_NUTRITION]->(rnv:NutritionValue)"
             "-[:OF_NUTRIENT]->(nd:NutrientDefinition {nutrient_name: 'Energy'})\n"
-            "RETURN r.title, rnv.amount AS calories, rnv.unit\n"
+            "RETURN r.id, r.title, rnv.amount AS calories, rnv.unit\n"
             "ORDER BY calories ASC"
         )
     else:
@@ -468,12 +476,218 @@ def _build_rank_results(entities: dict) -> tuple[str, dict]:
         cypher = (
             "MATCH (r:Recipe)\n"
             "WHERE r.id IN $recipe_ids\n"
-            f"RETURN r.title, {prop} AS sort_value\n"
+            f"RETURN r.id, r.title, {prop} AS sort_value\n"
             f"ORDER BY sort_value {direction}"
         )
 
     params = {"recipe_ids": recipe_ids}
     return cypher, params
+
+
+def _build_recipes_for_cuisine(entities: dict) -> tuple[str, dict]:
+    """
+    Find recipes from a specific cuisine.
+    Recipe -[:BELONGS_TO_CUSINE]-> Cuisine.
+    """
+    cuisine = entities.get("cuisine", "")
+    include_ing = entities.get("include_ingredient", [])
+    params = {"cuisine_name": cuisine or ""}
+
+    clauses = [
+        "MATCH (r:Recipe)-[:BELONGS_TO_CUSINE]->(c:Cuisine)",
+        "WHERE toLower(c.name) CONTAINS toLower($cuisine_name) OR toLower(c.code) CONTAINS toLower($cuisine_name)",
+    ]
+
+    for idx, ing in enumerate(include_ing):
+        param_key = f"include_ing_{idx}"
+        clauses.append(
+            f"MATCH (r)-[:USES_INGREDIENT]->(i{idx}:Ingredient) WHERE toLower(i{idx}.name) CONTAINS toLower(${param_key})"
+        )
+        params[param_key] = ing
+
+    clauses.append(
+        "RETURN DISTINCT r.id, r.title, r.meal_type, r.total_time_minutes, "
+        "r.percent_calories_protein, c.name AS cuisine_name"
+    )
+    clauses.append("LIMIT 10")
+    cypher = "\n".join(clauses)
+    return cypher, params
+
+
+def _build_recipes_by_nutrient(entities: dict) -> tuple[str, dict]:
+    """
+    Recipes filtered by nutrient (e.g. high-protein).
+    Uses Recipe percent_calories_* or nutrient_threshold.
+    """
+    course = entities.get("course", "")
+    threshold = entities.get("nutrient_threshold", {})
+    params = {}
+
+    clauses = ["MATCH (r:Recipe)"]
+    where = []
+    if course:
+        where.append("toLower(r.meal_type) = toLower($course)")
+        params["course"] = course
+    if threshold and isinstance(threshold, dict):
+        nutrient = threshold.get("nutrient", "Protein")
+        op = threshold.get("operator", "gt")
+        val = threshold.get("value", 20)
+        if "protein" in nutrient.lower():
+            prop = "r.percent_calories_protein"
+        elif "fat" in nutrient.lower():
+            prop = "r.percent_calories_fat"
+        elif "carb" in nutrient.lower():
+            prop = "r.percent_calories_carbs"
+        else:
+            prop = "r.percent_calories_protein"
+        op_sym = ">=" if op == "gt" else "<="
+        where.append(f"{prop} {op_sym} $threshold_val")
+        params["threshold_val"] = val
+    if where:
+        clauses.append("WHERE " + " AND ".join(where))
+    clauses.append(
+        "RETURN r.id, r.title, r.meal_type, r.total_time_minutes, "
+        "r.percent_calories_protein, r.percent_calories_fat, r.percent_calories_carbs"
+    )
+    clauses.append("ORDER BY r.percent_calories_protein DESC")
+    clauses.append("LIMIT 10")
+    return "\n".join(clauses), params
+
+
+def _build_nutrient_in_foods(entities: dict) -> tuple[str, dict]:
+    """
+    Foods/ingredients high or low in a nutrient.
+    Uses Ingredient inline props (iron_mg, protein_g, etc) or NutritionValue path.
+    """
+    nutrient = entities.get("nutrient", "iron")
+    nutrient_lower = nutrient.lower()
+
+    prop_map = {
+        "iron": ("i.iron_mg", "iron_mg"),
+        "protein": ("i.protein_g", "protein_g"),
+        "calcium": ("i.calcium_mg", "calcium_mg"),
+        "fiber": ("i.dietary_fiber_g", "dietary_fiber_g"),
+        "sodium": ("i.sodium_mg", "sodium_mg"),
+        "potassium": ("i.potassium_mg", "potassium_mg"),
+        "vitamin c": ("i.vitamin_c_mg", "vitamin_c_mg"),
+        "vitamin d": ("i.vitamin_d_mcg", "vitamin_d_mcg"),
+    }
+    prop_expr = None
+    prop_alias = None
+    for k, (expr, alias) in prop_map.items():
+        if k in nutrient_lower:
+            prop_expr = expr
+            prop_alias = alias
+            break
+    if prop_expr:
+        cypher = (
+            f"MATCH (i:Ingredient)\n"
+            f"WHERE {prop_expr} IS NOT NULL AND {prop_expr} > 0\n"
+            f"RETURN i.name AS ingredient, {prop_expr} AS amount\n"
+            f"ORDER BY {prop_expr} DESC\n"
+            "LIMIT 15"
+        )
+        return cypher, {}
+    cypher = (
+        "MATCH (i:Ingredient)-[:HAS_NUTRITION]->(nv:NutritionValue)"
+        "-[:OF_NUTRIENT]->(nd:NutrientDefinition)\n"
+        "WHERE toLower(nd.nutrient_name) CONTAINS toLower($nutrient_name)\n"
+        "RETURN i.name AS ingredient, nd.nutrient_name AS nutrient, nv.amount AS amount, nv.unit AS unit\n"
+        "ORDER BY nv.amount DESC\n"
+        "LIMIT 15"
+    )
+    return cypher, {"nutrient_name": nutrient}
+
+
+def _build_nutrient_category(entities: dict) -> tuple[str, dict]:
+    """
+    Nutrient categories / hierarchy.
+    NutritionCategory has parent_category_id, category_name.
+    """
+    cypher = (
+        "MATCH (nc:NutritionCategory)\n"
+        "OPTIONAL MATCH (parent:NutritionCategory) WHERE nc.parent_category_id = parent.id\n"
+        "RETURN nc.category_name, nc.subcategory_name, nc.display_name, parent.category_name AS parent_category\n"
+        "ORDER BY nc.sort_order, nc.category_name\n"
+        "LIMIT 50"
+    )
+    return cypher, {}
+
+
+def _build_ingredient_in_recipes(entities: dict) -> tuple[str, dict]:
+    """Recipes containing a specific ingredient."""
+    ingredient = entities.get("ingredient", "")
+    params = {"ingredient_pattern": ingredient}
+    cypher = (
+        "MATCH (r:Recipe)-[:USES_INGREDIENT]->(i:Ingredient)\n"
+        "WHERE toLower(i.name) CONTAINS toLower($ingredient_name)\n"
+        "RETURN r.id, r.title, r.meal_type, r.total_time_minutes, i.name AS ingredient\n"
+        "LIMIT 10"
+    )
+    params["ingredient_name"] = ingredient
+    return cypher, params
+
+
+def _build_ingredient_nutrients(entities: dict) -> tuple[str, dict]:
+    """Alias for get_nutritional_info - same logic."""
+    return _build_get_nutritional_info(entities)
+
+
+def _build_product_nutrients(entities: dict) -> tuple[str, dict]:
+    """
+    Product nutrition from inline Product properties.
+    """
+    product = entities.get("product", "")
+    nutrient = entities.get("nutrient", "")
+    params = {"product_pattern": product}
+    if nutrient and "protein" in nutrient.lower():
+        cols = "p.name AS product, p.protein_g AS amount, 'g' AS unit"
+    elif nutrient and "cal" in nutrient.lower():
+        cols = "p.name AS product, p.calories AS amount, 'kcal' AS unit"
+    else:
+        cols = (
+            "p.name AS product, p.calories, p.protein_g, p.total_fat_g, p.total_carbs_g, "
+            "p.dietary_fiber_g, p.sodium_mg, p.iron_mg, p.calcium_mg"
+        )
+    cypher = (
+        "MATCH (p:Product)\n"
+        "WHERE toLower(p.name) CONTAINS toLower($product_name)\n"
+        f"RETURN {cols}\n"
+        "LIMIT 5"
+    )
+    params["product_name"] = product
+    return cypher, params
+
+
+def _build_cuisine_hierarchy(entities: dict) -> tuple[str, dict]:
+    """Cuisine taxonomy via parent_cuisine_id."""
+    cypher = (
+        "MATCH (c:Cuisine)\n"
+        "OPTIONAL MATCH (parent:Cuisine) WHERE c.parent_cuisine_id = parent.id\n"
+        "RETURN c.name, c.code, c.region, parent.name AS parent_cuisine\n"
+        "ORDER BY c.name\n"
+        "LIMIT 50"
+    )
+    return cypher, {}
+
+
+def _build_cross_reactive_allergens(entities: dict) -> tuple[str, dict]:
+    """Allergens cross-reactive with a given allergen (e.g. latex)."""
+    allergen = entities.get("allergen", "")
+    params = {"allergen_name": allergen}
+    cypher = (
+        "MATCH (a:Allergens)\n"
+        "WHERE toLower(a.name) CONTAINS toLower($allergen_name) "
+        "OR toLower(a.code) CONTAINS toLower($allergen_name)\n"
+        "RETURN a.name, a.code, a.cross_reactive_with, a.common_names\n"
+        "LIMIT 10"
+    )
+    return cypher, params
+
+
+def _build_noop_cypher(entities: dict) -> tuple[str, dict]:
+    """No-op for semantic-only intents (similar_recipes, find_product, general_nutrition, out_of_scope)."""
+    return "MATCH (r:Recipe) WHERE 1 = 0 RETURN r.title LIMIT 0", {}
 
 
 # ---------------------------------------------------------------------------
@@ -483,12 +697,26 @@ def _build_rank_results(entities: dict) -> tuple[str, dict]:
 _INTENT_BUILDERS = {
     "find_recipe":                  _build_find_recipe,
     "find_recipe_by_pantry":        _build_find_recipe_by_pantry,
+    "similar_recipes":              _build_noop_cypher,
+    "recipes_for_cuisine":          _build_recipes_for_cuisine,
+    "recipes_by_nutrient":          _build_recipes_by_nutrient,
     "get_nutritional_info":         _build_get_nutritional_info,
+    "nutrient_in_foods":            _build_nutrient_in_foods,
+    "nutrient_category":            _build_nutrient_category,
     "compare_foods":                _build_compare_foods,
     "check_diet_compliance":        _build_check_diet_compliance,
     "check_substitution":           _build_check_substitution,
     "get_substitution_suggestion":  _build_get_substitution_suggestion,
-    "rank_results":                 _build_rank_results,
+    "similar_ingredients":          _build_noop_cypher,
+    "ingredient_in_recipes":        _build_ingredient_in_recipes,
+    "ingredient_nutrients":         _build_ingredient_nutrients,
+    "find_product":                 _build_noop_cypher,
+    "product_nutrients":            _build_product_nutrients,
+    "cuisine_recipes":              _build_recipes_for_cuisine,
+    "cuisine_hierarchy":            _build_cuisine_hierarchy,
+    "cross_reactive_allergens":     _build_cross_reactive_allergens,
+    "general_nutrition":            _build_noop_cypher,
+    "out_of_scope":                 _build_noop_cypher,
 }
 
 
@@ -498,13 +726,13 @@ def generate_cypher_query(intent: str, entities: dict) -> tuple[str, dict]:
 
     Parameters
     ----------
-    intent   : str   — one of the 8 supported intents
+    intent   : str   — supported intent from extractor_classifier
     entities : dict  — entity dict from extractor_classifier output
 
     Returns
     -------
     (cypher_string, params_dict)
-        Ready for  neo4j_session.run(cypher_string, **params_dict)
+        Ready for neo4j_session.run(cypher_string, **params_dict)
     """
     builder = _INTENT_BUILDERS.get(intent)
     if builder is None:
@@ -648,7 +876,7 @@ if __name__ == "__main__":
             },
         },
         {
-            "label": "rank_results — lowest_calories (uses RecipeNutritionValue)",
+            "label": "rank_results — lowest_calories (uses NutritionValue via HAS_NUTRITION)",
             "intent": "rank_results",
             "entities": {
                 "criterion": "lowest_calories",

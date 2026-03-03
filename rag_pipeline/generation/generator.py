@@ -27,6 +27,19 @@ def _load_llm_retry_config(config_path: str | Path = "embedding_config.yaml") ->
         return {}
 
 
+def _load_generation_config(config_path: str | Path = "embedding_config.yaml") -> dict[str, Any]:
+    """Load generation config from YAML."""
+    path = Path(config_path)
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            raw = yaml.safe_load(f)
+        return raw.get("generation", {}) or {}
+    except Exception:
+        return {}
+
+
 def generate_response(
     augmented_prompt: str,
     *,
@@ -52,9 +65,14 @@ def generate_response(
         base_url=os.environ.get("OPENAI_BASE_URL"),
         api_key=os.environ.get("OPENAI_API_KEY"),
     )
-    model = model or os.environ.get("GENERATION_MODEL", "openai/gpt-5-mini")
+
+    gen_cfg = _load_generation_config(config_path)
+    model = model or os.environ.get("GENERATION_MODEL") or gen_cfg.get("model", "openai/gpt-4o-mini")
     if max_tokens is None:
-        max_tokens = int(os.environ.get("GENERATION_MAX_TOKENS", "2048"))
+        env_max = os.environ.get("GENERATION_MAX_TOKENS")
+        max_tokens = int(env_max) if env_max else gen_cfg.get("max_tokens", 1024)
+    if "temperature" in gen_cfg:
+        temperature = float(gen_cfg["temperature"])
 
     # Split augmented prompt into system and user parts
     system_content, user_content = _split_prompt(augmented_prompt)

@@ -11,24 +11,46 @@ from rag_pipeline.augmentation.fusion import format_fused_results_as_text
 from rag_pipeline.orchestrator.orchestrator import OrchestratorResult
 
 
-SYSTEM_PROMPT = """You are a knowledgeable and empathetic nutrition assistant.
-Your goal is to recommend recipes, answer food and nutrition questions, and suggest meal plans
-based on the user's preferences, health conditions, dietary restrictions, and allergens.
+SYSTEM_PROMPT = """Nutrition assistant. Recommend recipes and answer food/nutrition questions using ONLY the context below.
 
-CRITICAL: Only recommend recipes that appear in the context provided below. Do not recommend
-any recipe, ingredient, or product not listed in the context. You must use only the data
-from the user's knowledge graph/database. If the context does not contain suitable options,
-say so and suggest the user refine their query—do not suggest recipes from your general knowledge.
+RULES: Use only recipes/ingredients from the context. Respect allergens, diets, and health conditions. If no suitable options, say so and suggest refining the query. Be concise and practical."""
 
-Always respect the customer's hard constraints (allergens, dietary preferences, health conditions).
-Never recommend recipes that contain allergens the customer is sensitive to.
-Be concise, friendly, and practical in your responses."""
+
+def _build_profile_section(profile: dict[str, Any]) -> str:
+    """
+    Render the customer profile as a compact, readable block for the LLM prompt.
+    Only includes fields that are non-empty so the section stays concise.
+    """
+    lines: list[str] = []
+
+    diets = profile.get("diets") or []
+    if diets:
+        lines.append(f"Dietary preferences: {', '.join(diets)}")
+
+    allergens = profile.get("allergens") or []
+    if allergens:
+        lines.append(f"Allergens (NEVER include in recommendations): {', '.join(allergens)}")
+
+    conditions = profile.get("health_conditions") or []
+    if conditions:
+        lines.append(f"Health conditions: {', '.join(conditions)}")
+
+    goal = profile.get("health_goal")
+    if goal:
+        lines.append(f"Health goal: {goal.replace('_', ' ')}")
+
+    activity = profile.get("activity_level")
+    if activity:
+        lines.append(f"Activity level: {activity}")
+
+    return "\n".join(lines) if lines else ""
 
 
 def build_augmented_prompt(
     result: OrchestratorResult,
     user_query: str,
     *,
+    customer_profile: dict[str, Any] | None = None,
     max_semantic: int = 5,
     max_structural: int = 7,
     max_cypher: int = 10,
@@ -43,6 +65,10 @@ def build_augmented_prompt(
     Args:
         result: OrchestratorResult from orchestrate()
         user_query: Original user query
+        customer_profile: Dict from fetch_customer_profile() — when provided, a
+                          [USER PROFILE] section is injected so the LLM always
+                          knows the customer's hard constraints (allergens, diets,
+                          health conditions) when generating the response.
         max_semantic: Max semantic results (fallback only)
         max_structural: Max structural results (fallback only)
         max_cypher: Max cypher results (fallback only)
@@ -54,6 +80,21 @@ def build_augmented_prompt(
     sections: list[str] = []
 
     sections.append(f"[SYSTEM]\n{SYSTEM_PROMPT}")
+
+    # ── Customer profile (injected right after system prompt) ──────────────────
+    if customer_profile:
+        profile_text = _build_profile_section(customer_profile)
+        if profile_text:
+            sections.append(f"[USER PROFILE]\n{profile_text}")
+
+    # ── Zero-results fallback (takes priority over context sections) ──────────
+    # When post-fusion hard filters removed everything, inject the structured
+    # explanation so the LLM can tell the user why and suggest alternatives.
+    if result.fallback_message:
+        sections.append(f"[NO RESULTS]\n{result.fallback_message}")
+        # Still append the user query below so the LLM has full context
+        sections.append(f"[USER QUERY]\n{user_query}")
+        return "\n\n".join(sections)
 
     # ── Fused RRF context (primary when available) ─────────────────────────────
     if result.fused_results:
@@ -112,16 +153,18 @@ def _format_cypher_results(
 
     lines: list[str] = []
 
-    if intent in ("find_recipe", "find_recipe_by_pantry"):
+    if intent in ("find_recipe", "find_recipe_by_pantry", "recipes_for_cuisine", "recipes_by_nutrient", "ingredient_in_recipes", "cuisine_recipes"):
         lines.append("Matching recipes from graph:")
         for i, row in enumerate(rows[:max_items], 1):
             title = row.get("r.title", row.get("title", "Unknown"))
-            rtype = row.get("r.recipe_type", row.get("recipe_type", ""))
+            rtype = row.get("r.meal_type", row.get("r.recipe_type", row.get("meal_type", row.get("recipe_type", ""))))
             time = row.get("r.total_time_minutes", row.get("total_time_minutes", ""))
             protein = row.get("r.percent_calories_protein", "")
+            cuisine = row.get("cuisine_name", row.get("c.name", ""))
             time_str = f", {time} min" if time else ""
-            protein_str = f", {round(float(protein), 1)}% protein" if protein else ""
-            lines.append(f"{i}. {title} [{rtype}{time_str}{protein_str}]")
+            protein_str = f", {round(float(protein), 1)}% protein" if protein and protein != "" else ""
+            cuisine_str = f", {cuisine}" if cuisine else ""
+            lines.append(f"{i}. {title} [{rtype}{time_str}{protein_str}{cuisine_str}]")
 
     elif intent == "get_nutritional_info":
         lines.append("Nutritional information:")
@@ -167,6 +210,78 @@ def _format_cypher_results(
                 lines.append(f"- {sub} can replace {original} (direct: {is_direct}) {notes or ''}")
             else:
                 lines.append(f"- {sub}")
+
+    elif intent == "nutrient_in_foods":
+        lines.append("Foods high in this nutrient:")
+        for row in rows[:max_items]:
+            ingredient = row.get("ingredient", "")
+            amount = row.get("amount", "")
+            unit = row.get("unit", "")
+            nutrient = row.get("nutrient", "")
+            if nutrient:
+                lines.append(f"- {ingredient}: {amount} {unit} of {nutrient}")
+            else:
+                lines.append(f"- {ingredient}: {amount}")
+
+    elif intent == "nutrient_category":
+        lines.append("Nutrient categories:")
+        for row in rows[:max_items]:
+            cat = row.get("nc.category_name", row.get("category_name", row.get("display_name", "")))
+            sub = row.get("nc.subcategory_name", row.get("subcategory_name", ""))
+            parent = row.get("parent_category", "")
+            parts = [cat]
+            if sub:
+                parts.append(f"({sub})")
+            if parent:
+                parts.append(f"under {parent}")
+            lines.append(f"- {' '.join(parts)}")
+
+    elif intent == "product_nutrients":
+        lines.append("Product nutrition:")
+        for row in rows[:max_items]:
+            product = row.get("product", row.get("p.name", ""))
+            if "amount" in row and row["amount"] is not None:
+                lines.append(f"- {product}: {row.get('amount')} {row.get('unit', '')}")
+            else:
+                filtered = {k: v for k, v in row.items() if v is not None and k not in ("product",)}
+                lines.append(f"- {product}: {filtered}")
+
+    elif intent == "cuisine_hierarchy":
+        lines.append("Cuisine taxonomy:")
+        for row in rows[:max_items]:
+            name = row.get("c.name", row.get("name", ""))
+            code = row.get("c.code", row.get("code", ""))
+            region = row.get("c.region", row.get("region", ""))
+            parent = row.get("parent_cuisine", "")
+            parts = [name]
+            if code:
+                parts.append(f"[{code}]")
+            if region:
+                parts.append(f"({region})")
+            if parent:
+                parts.append(f"← {parent}")
+            lines.append(f"- {' '.join(parts)}")
+
+    elif intent == "cross_reactive_allergens":
+        lines.append("Cross-reactive allergens:")
+        for row in rows[:max_items]:
+            name = row.get("a.name", row.get("name", ""))
+            cross = row.get("a.cross_reactive_with", row.get("cross_reactive_with", ""))
+            common = row.get("a.common_names", row.get("common_names", ""))
+            lines.append(f"- {name}: cross-reactive with {cross or 'N/A'} | common names: {common or 'N/A'}")
+
+    elif intent == "ingredient_nutrients":
+        lines.append("Ingredient nutrition:")
+        for row in rows[:max_items]:
+            ingredient = row.get("ingredient", "")
+            nutrient = row.get("nutrient", "")
+            amount = row.get("amount", "")
+            unit = row.get("unit", "")
+            if nutrient:
+                lines.append(f"- {ingredient}: {nutrient} = {amount} {unit}")
+            else:
+                filtered = {k: v for k, v in row.items() if v is not None and k != "ingredient"}
+                lines.append(f"- {ingredient}: {filtered}")
 
     else:
         for i, row in enumerate(rows[:max_items], 1):
