@@ -1,0 +1,212 @@
+[
+    {
+        "category": "Recipe discovery & recommendations",
+        "expected_intent": "find_recipe",
+        "query": "vegan lunch under 600 cal"
+    },
+    {
+        "category": "Recipe discovery & recommendations",
+        "expected_intent": "find_recipe_by_pantry",
+        "query": "I have chicken, tomatoes, onion, what can I make?"
+    },
+    {
+        "category": "Recipe discovery & recommendations",
+        "expected_intent": "similar_recipes",
+        "query": "Recipes like Pasta Carbonara"
+    },
+    {
+        "category": "Recipe discovery & recommendations",
+        "expected_intent": "recipes_for_diet",
+        "query": "Keto dinner recipes"
+    },
+    {
+        "category": "Recipe discovery & recommendations",
+        "expected_intent": "recipes_for_cuisine",
+        "query": "Italian pasta recipes"
+    },
+    {
+        "category": "Recipe discovery & recommendations",
+        "expected_intent": "recipes_for_allergen_safe",
+        "query": "Nut-free recipes"
+    },
+    {
+        "category": "Recipe discovery & recommendations",
+        "expected_intent": "recipes_by_nutrient",
+        "query": "High-protein breakfast"
+    },
+    {
+        "category": "Recipe discovery & recommendations",
+        "expected_intent": "rank_results",
+        "query": "Rank these by lowest fat"
+    },
+    {
+        "category": "Recipe discovery & recommendations",
+        "expected_intent": "plan_meal",
+        "query": "Weekly meal plan for 2"
+    },
+    {
+        "category": "Nutritional information",
+        "expected_intent": "get_nutritional_info",
+        "query": "How much protein in quinoa?"
+    },
+    {
+        "category": "Nutritional information",
+        "expected_intent": "recipe_nutrition",
+        "query": "Calories in this recipe?"
+    },
+    {
+        "category": "Nutritional information",
+        "expected_intent": "product_nutrition",
+        "query": "Protein in this product?"
+    },
+    {
+        "category": "Nutritional information",
+        "expected_intent": "compare_foods",
+        "query": "More carbs: rice or pasta?"
+    },
+    {
+        "category": "Nutritional information",
+        "expected_intent": "nutrient_in_foods",
+        "query": "Foods high in iron"
+    },
+    {
+        "category": "Nutritional information",
+        "expected_intent": "nutrient_category",
+        "query": "What nutrients exist?"
+    },
+    {
+        "category": "Diet & compliance",
+        "expected_intent": "check_diet_compliance",
+        "query": "Is honey vegan?"
+    },
+    {
+        "category": "Diet & compliance",
+        "expected_intent": "diet_forbids",
+        "query": "What can't I eat on keto?"
+    },
+    {
+        "category": "Diet & compliance",
+        "expected_intent": "diet_allows",
+        "query": "What can I eat on paleo?"
+    },
+    {
+        "category": "Diet & compliance",
+        "expected_intent": "diet_recipes",
+        "query": "Vegan dessert recipes"
+    },
+    {
+        "category": "Allergen safety",
+        "expected_intent": "allergen_in_ingredient",
+        "query": "Does soy contain peanuts?"
+    },
+    {
+        "category": "Allergen safety",
+        "expected_intent": "recipes_avoid_allergen",
+        "query": "Shellfish-free recipes"
+    },
+    {
+        "category": "Allergen safety",
+        "expected_intent": "cross_reactive_allergens",
+        "query": "Cross-reactive with latex?"
+    },
+    {
+        "category": "Substitutions",
+        "expected_intent": "check_substitution",
+        "query": "Can rice flour replace wheat?"
+    },
+    {
+        "category": "Substitutions",
+        "expected_intent": "get_substitution_suggestion",
+        "query": "Substitute for butter (vegan)"
+    },
+    {
+        "category": "Ingredients",
+        "expected_intent": "similar_ingredients",
+        "query": "Ingredients like quinoa"
+    },
+    {
+        "category": "Ingredients",
+        "expected_intent": "ingredient_in_recipes",
+        "query": "Recipes with avocado"
+    },
+    {
+        "category": "Ingredients",
+        "expected_intent": "ingredient_in_products",
+        "query": "Products containing soy"
+    },
+    {
+        "category": "Ingredients",
+        "expected_intent": "ingredient_nutrients",
+        "query": "Iron content of spinach"
+    },
+    {
+        "category": "Ingredients",
+        "expected_intent": "ingredient_allergens",
+        "query": "Allergens in milk"
+    },
+    {
+        "category": "Products",
+        "expected_intent": "find_product",
+        "query": "Gluten-free bread"
+    },
+    {
+        "category": "Products",
+        "expected_intent": "product_ingredients",
+        "query": "Ingredients in this product"
+    },
+    {
+        "category": "Products",
+        "expected_intent": "product_nutrients",
+        "query": "Nutrition of product X"
+    },
+    {
+        "category": "Products",
+        "expected_intent": "product_for_diet",
+        "query": "Keto-friendly products"
+    },
+    {
+        "category": "Health conditions",
+        "expected_intent": "condition_restricts",
+        "query": "Ingredients to avoid for diabetes"
+    },
+    {
+        "category": "Health conditions",
+        "expected_intent": "condition_recommends",
+        "query": "Recommended Recipes for blood pressure"
+    },
+    {
+        "category": "Health conditions",
+        "expected_intent": "condition_nutrient_limits",
+        "query": "Sodium limit for hypertension"
+    },
+    {
+        "category": "Health conditions",
+        "expected_intent": "recipes_for_condition",
+        "query": "Recipes for heart health"
+    },
+    {
+        "category": "Cuisine & taxonomy",
+        "expected_intent": "cuisine_recipes",
+        "query": "Mediterranean recipes"
+    },
+    {
+        "category": "Cuisine & taxonomy",
+        "expected_intent": "cuisine_hierarchy",
+        "query": "Types of Asian cuisine"
+    },
+    {
+        "category": "Cuisine & taxonomy",
+        "expected_intent": "category_products",
+        "query": "Products in snacks"
+    },
+    {
+        "category": "Clarification & general",
+        "expected_intent": "general_nutrition",
+        "query": "What is fiber?"
+    },
+    {
+        "category": "Clarification & general",
+        "expected_intent": "out_of_scope",
+        "query": "Weather today"
+    }
+]

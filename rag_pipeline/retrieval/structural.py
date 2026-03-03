@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Iterable, Sequence
 
 from neo4j import Driver
 
 from rag_pipeline.config import EmbeddingConfig, get_structural_index_spec
 from rag_pipeline.retrieval.types import RetrievalResult
+
+logger = logging.getLogger(__name__)
 
 
 def structural_search_by_label(
@@ -91,31 +94,46 @@ def get_seed_embedding(
     database: str | None = None,
 ) -> list[float] | None:
     """
-    Fetch the GraphSAGE embedding for a specific node by its elementId.
+    Fetch the GraphSAGE embedding for a specific node.
+
+    Tries two lookup strategies in order:
+      1. Match by node's `id` property (PostgreSQL UUID from Express backend)
+      2. Match by Neo4j internal elementId (legacy fallback)
 
     Args:
         driver: Neo4j driver instance
         cfg: Embedding configuration
         label: Node label (used to get the embedding property name)
-        node_id: Neo4j elementId of the node
+        node_id: PostgreSQL UUID or Neo4j elementId of the node
         database: Neo4j database name (optional)
 
     Returns:
-        The GraphSAGE embedding vector, or None if not found
+        The GraphSAGE embedding vector, or None if not found / not yet generated
     """
     spec = get_structural_index_spec(cfg, label=label, require_index_name=False)
 
-    cypher = f"""
+    # Strategy 1: match by id property (UUID from PostgreSQL — what Express sends)
+    cypher_by_id = f"""
+    MATCH (n:{label} {{id: $node_id}})
+    RETURN n.{spec.property} AS embedding
+    """
+
+    # Strategy 2: match by Neo4j elementId (internal — legacy fallback)
+    cypher_by_element_id = f"""
     MATCH (n)
     WHERE elementId(n) = $node_id
     RETURN n.{spec.property} AS embedding
     """
 
     with driver.session(database=database) as session:
-        result = session.run(cypher, node_id=node_id)
-        record = result.single()
-        if record and record["embedding"]:
-            return list(record["embedding"])
+        for cypher in (cypher_by_id, cypher_by_element_id):
+            try:
+                result = session.run(cypher, node_id=node_id)
+                record = result.single()
+                if record and record["embedding"]:
+                    return list(record["embedding"])
+            except Exception:
+                continue
     return None
 
 

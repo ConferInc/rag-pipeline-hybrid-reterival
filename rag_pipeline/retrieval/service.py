@@ -11,6 +11,11 @@ from neo4j import Driver
 from rag_pipeline.config import EmbeddingConfig
 from rag_pipeline.embeddings.base import QueryEmbedder
 from rag_pipeline.retrieval.label_inference import infer_label_with_llm
+
+try:
+    from rag_pipeline.label_cache import get_label_cache
+except ImportError:
+    get_label_cache = None
 from rag_pipeline.retrieval.semantic import semantic_search_by_label
 from rag_pipeline.retrieval.types import RetrievalResult
 
@@ -51,9 +56,21 @@ def infer_label_from_query(
     Returns:
         Label string or None
     """
+    # Label cache: if hit, skip heuristics and LLM
+    if get_label_cache:
+        cache = get_label_cache(config_path)
+        if cache:
+            cached = cache.get(query)
+            if cached is not None:
+                return cached
+
     # Heuristics first
     label = _infer_label_heuristics(query)
     if label:
+        if get_label_cache:
+            c = get_label_cache(config_path)
+            if c:
+                c.put(query, label)
         return label
 
     # Load config for fallback and defaults
@@ -79,13 +96,22 @@ def infer_label_from_query(
     if fallback_to_llm:
         label = infer_label_with_llm(query, allowed_labels)
         if label:
+            if get_label_cache:
+                c = get_label_cache(config_path)
+                if c:
+                    c.put(query, label)
             logger.warning(
                 "Label inference fallback used",
                 extra={"component": "semantic", "inferred_label": label},
             )
             return label
 
-    return default_label if default_label else None
+    result = default_label if default_label else None
+    if result and get_label_cache:
+        c = get_label_cache(config_path)
+        if c:
+            c.put(query, result)
+    return result
 
 
 @dataclass(frozen=True)

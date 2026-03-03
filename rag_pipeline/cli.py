@@ -21,6 +21,7 @@ from rag_pipeline.logging_utils import (
 from openai import OpenAI
 
 from rag_pipeline.config import load_embedding_config
+from rag_pipeline.embeddings.caching_embedder import CachingQueryEmbedder
 from rag_pipeline.embeddings.openai_embedder import OpenAIQueryEmbedder
 from rag_pipeline.neo4j_client import create_neo4j_driver, neo4j_settings_from_env
 from rag_pipeline.retrieval.service import SemanticRetrievalRequest, retrieve_semantic
@@ -29,6 +30,23 @@ from rag_pipeline.retrieval.structural import (
     structural_search_by_label,
     structural_search_with_expansion,
 )
+
+
+def _maybe_wrap_embedder_with_cache(embedder: OpenAIQueryEmbedder, config_path: str | Path):
+    """Wrap embedder with CachingQueryEmbedder if embedding_cache.enabled in config."""
+    try:
+        with open(config_path) as f:
+            raw = yaml.safe_load(f)
+        cache_cfg = (raw or {}).get("embedding_cache", {}) or {}
+    except Exception:
+        return embedder
+    if not cache_cfg.get("enabled", False):
+        return embedder
+    return CachingQueryEmbedder(
+        embedder,
+        max_size=cache_cfg.get("max_size", 500),
+        key_normalize=cache_cfg.get("key_normalize", "strip_lower"),
+    )
 
 
 def _print_structural_prompt_preview(condensed: list, *, user_query: str = "Recommend me some recipes") -> None:
@@ -123,6 +141,7 @@ def main() -> None:
             client=OpenAI(base_url=base_url, api_key=api_key),
             model=model,
         )
+        embedder = _maybe_wrap_embedder_with_cache(embedder, args.config)
 
         neo_settings = neo4j_settings_from_env()
         driver = create_neo4j_driver(neo_settings)
@@ -253,6 +272,7 @@ def main() -> None:
                 _print_structural_prompt_preview(condensed)
 
     elif args.command == "full-retrieval":
+        import asyncio
         from rag_pipeline.orchestrator.orchestrator import orchestrate
         from rag_pipeline.augmentation.prompt_builder import build_augmented_prompt
 
@@ -271,12 +291,13 @@ def main() -> None:
             client=OpenAI(base_url=base_url, api_key=api_key),
             model=model,
         )
+        embedder = _maybe_wrap_embedder_with_cache(embedder, args.config)
 
         neo_settings = neo4j_settings_from_env()
         driver = create_neo4j_driver(neo_settings)
 
         try:
-            orch_result = orchestrate(
+            orch_result = asyncio.run(orchestrate(
                 driver,
                 cfg=cfg,
                 embedder=embedder,
@@ -285,7 +306,7 @@ def main() -> None:
                 top_k=int(args.top_k),
                 database=neo_settings.database,
                 config_path=str(args.config),
-            )
+            ))
         finally:
             driver.close()
 
@@ -293,7 +314,7 @@ def main() -> None:
             prompt = build_augmented_prompt(orch_result, str(args.query))
             print(prompt)
         else:
-            print(json.dumps({
+            out = {
                 "intent": orch_result.intent,
                 "entities": orch_result.entities,
                 "semantic_count": len(orch_result.semantic_results),
@@ -301,9 +322,13 @@ def main() -> None:
                 "cypher_count": len(orch_result.cypher_results),
                 "fused_count": len(orch_result.fused_results),
                 "errors": orch_result.errors,
-            }, indent=2, ensure_ascii=False))
+            }
+            if orch_result.fallback_message:
+                out["fallback_message"] = orch_result.fallback_message
+            print(json.dumps(out, indent=2, ensure_ascii=False))
 
     elif args.command == "ask":
+        import asyncio
         from rag_pipeline.orchestrator.orchestrator import orchestrate
         from rag_pipeline.augmentation.prompt_builder import build_augmented_prompt
         from rag_pipeline.generation.generator import generate_response
@@ -327,6 +352,7 @@ def main() -> None:
             client=OpenAI(base_url=base_url, api_key=api_key),
             model=model,
         )
+        embedder = _maybe_wrap_embedder_with_cache(embedder, args.config)
 
         neo_settings = neo4j_settings_from_env()
         driver = create_neo4j_driver(neo_settings)
@@ -339,7 +365,7 @@ def main() -> None:
         t_start = time.perf_counter()
 
         try:
-            orch_result = orchestrate(
+            orch_result = asyncio.run(orchestrate(
                 driver,
                 cfg=cfg,
                 embedder=embedder,
@@ -348,7 +374,7 @@ def main() -> None:
                 top_k=int(args.top_k),
                 database=neo_settings.database,
                 config_path=str(args.config),
-            )
+            ))
         finally:
             driver.close()
 

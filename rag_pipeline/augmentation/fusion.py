@@ -42,15 +42,31 @@ def _get_key_from_structural(item: dict[str, Any]) -> str | None:
 
 
 def _get_key_from_cypher(row: dict[str, Any], intent: str) -> str | None:
-    """Extract normalized title from Cypher result row based on intent."""
-    if intent in ("find_recipe", "find_recipe_by_pantry", "rank_results"):
+    """
+    Extract fusion key from a Cypher result row.
+    Prefers r.id (UUID) for recipe intents so the API returns hydration-ready IDs.
+    Falls back to normalized title for non-recipe intents.
+    """
+    if intent in ("find_recipe", "find_recipe_by_pantry", "rank_results", "recipes_for_cuisine", "recipes_by_nutrient", "ingredient_in_recipes"):
+        # Prefer UUID id; fall back to title for fusion matching with semantic results
+        uuid_key = row.get("r.id") or row.get("id")
+        if uuid_key:
+            return str(uuid_key)
         key = _normalize_title(row.get("r.title") or row.get("title"))
-    elif intent in ("get_nutritional_info", "compare_foods", "check_diet_compliance"):
+    elif intent in ("get_nutritional_info", "compare_foods", "check_diet_compliance", "nutrient_in_foods", "ingredient_nutrients"):
         key = _normalize_title(row.get("ingredient") or row.get("name"))
     elif intent in ("check_substitution", "get_substitution_suggestion"):
         key = _normalize_title(row.get("suggested_substitute") or row.get("substitute") or row.get("original"))
+    elif intent in ("find_product", "product_nutrients"):
+        key = _normalize_title(row.get("product") or row.get("p.name") or row.get("name"))
+    elif intent in ("cuisine_recipes", "cuisine_hierarchy"):
+        key = _normalize_title(row.get("cuisine_name") or row.get("c.name") or row.get("name") or row.get("parent_cuisine"))
+    elif intent == "cross_reactive_allergens":
+        key = _normalize_title(row.get("a.name") or row.get("name"))
+    elif intent == "nutrient_category":
+        key = _normalize_title(row.get("nc.category_name") or row.get("category_name") or row.get("display_name"))
     else:
-        key = _normalize_title(row.get("title") or row.get("name") or row.get("ingredient"))
+        key = _normalize_title(row.get("title") or row.get("name") or row.get("ingredient") or row.get("product"))
     return key if key else None
 
 
@@ -120,11 +136,35 @@ def apply_rrf(
             add(key, rank, "structural", {"label": label, "title": title, "relationship": item.get("relationship"), **item})
 
     # Cypher
+    def _cypher_label(intent: str, row: dict) -> str:
+        if intent in ("find_recipe", "find_recipe_by_pantry", "rank_results", "recipes_for_cuisine", "recipes_by_nutrient", "ingredient_in_recipes", "cuisine_recipes"):
+            return "Recipe"
+        if intent in ("find_product", "product_nutrients"):
+            return "Product"
+        if intent in ("cuisine_hierarchy",):
+            return "Cuisine"
+        if intent == "cross_reactive_allergens":
+            return "Allergen"
+        if intent == "nutrient_category":
+            return "NutritionCategory"
+        return "Ingredient"
+
     for rank, row in enumerate(cypher_results, 1):
         key = _get_key_from_cypher(row, intent)
         if key:
-            title = str(row.get("r.title") or row.get("title") or row.get("ingredient") or key)
-            add(key, rank, "cypher", {"label": "Recipe" if "recipe" in intent or intent in ("find_recipe", "find_recipe_by_pantry", "rank_results") else "Ingredient", "title": title, **row})
+            title = str(
+                row.get("r.title") or row.get("title") or row.get("ingredient")
+                or row.get("product") or row.get("cuisine_name") or row.get("c.name")
+                or row.get("a.name") or row.get("category_name") or row.get("display_name")
+                or key
+            )
+            label = _cypher_label(intent, row)
+            # Normalise id field so _merge_results always finds it as "id"
+            recipe_id = row.get("r.id") or row.get("id")
+            payload = {"label": label, "title": title, **row}
+            if recipe_id:
+                payload["id"] = str(recipe_id)
+            add(key, rank, "cypher", payload)
 
     # Sort by RRF score descending, limit
     sorted_keys = sorted(scores.keys(), key=lambda x: -scores[x])[:max_items]
@@ -218,6 +258,12 @@ def format_fused_results_as_text(
             category = payload.get("category", "")
             cat_str = f" ({category})" if category else ""
             lines.append(f"{i}. Ingredient: {title}{cat_str} (sources: {sources_str})")
+        elif label == "Product":
+            brand = payload.get("brand", "")
+            brand_str = f" [{brand}]" if brand else ""
+            lines.append(f"{i}. Product: {title}{brand_str} (sources: {sources_str})")
+        elif label in ("Cuisine", "Allergen", "NutritionCategory"):
+            lines.append(f"{i}. {label}: {title} (sources: {sources_str})")
         else:
             lines.append(f"{i}. {title} (sources: {sources_str})")
 
