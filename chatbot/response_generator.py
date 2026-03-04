@@ -22,15 +22,26 @@ from rag_pipeline.orchestrator.orchestrator import OrchestratorResult
 TEMPLATE_INTENTS = frozenset({"greeting", "help", "farewell", "out_of_scope"})
 
 
-def get_template_response(intent: str) -> str:
+def get_template_response(
+    intent: str,
+    *,
+    customer_name: str | None = None,
+    profile: dict[str, Any] | None = None,
+) -> str:
     """Return canned response for template intents. No LLM call."""
     if intent == "greeting":
+        if customer_name:
+            return f"Hi {customer_name}! I'm NutriBot. I can help you find recipes, plan meals, check nutrition, and more. What would you like to do?"
         return "Hi! I'm NutriBot. I can help you find recipes, plan meals, check nutrition, and more. What would you like to do?"
     if intent == "help":
-        return (
+        base = (
             "I can find recipes (e.g. 'find me a keto dinner'), show your meal plan, "
-            "log meals, plan meals for the week, check nutrition info, and answer dietary questions. Try asking something!"
+            "log meals, plan meals for the week, check nutrition info, and answer dietary questions."
         )
+        diets = (profile or {}).get("diets") or []
+        if diets:
+            return f"{base} You're following {', '.join(diets)}, so I can focus on those options. Try asking something!"
+        return f"{base} Try asking something!"
     if intent == "farewell":
         return "Bye! Take care and eat well!"
     if intent == "out_of_scope":

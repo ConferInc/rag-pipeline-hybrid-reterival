@@ -37,7 +37,16 @@ from rag_pipeline.retrieval.structural import get_seed_embedding, structural_sea
 
 from chatbot.action_orchestrator import (
     is_confirmation_message,
+    is_rejection_message,
     route_intent,
+)
+from chatbot.chatbot_cypher import (
+    format_meal_history_response,
+    format_meal_plan_response,
+    format_nutrition_summary_response,
+    run_meal_history,
+    run_nutrition_summary,
+    run_show_meal_plan,
 )
 from chatbot.nlu import extract_hybrid
 from chatbot.response_generator import (
@@ -72,6 +81,13 @@ DATA_INTENTS_NEEDING_RETRIEVAL = frozenset({
     "cuisine_hierarchy",
     "cross_reactive_allergens",
     "general_nutrition",
+})
+
+# Deterministic chatbot intents: fixed Cypher, no LLM
+CHATBOT_DATA_INTENTS = frozenset({
+    "show_meal_plan",
+    "meal_history",
+    "nutrition_summary",
 })
 
 
@@ -211,6 +227,7 @@ class ChatProcessRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=500, description="User message")
     customer_id: str = Field(..., description="B2C customer UUID")
     session_id: str | None = Field(None, description="Existing session UUID (null for new session)")
+    display_name: str | None = Field(None, description="Customer name from auth/PostgreSQL if Neo4j has none")
 
 
 class ChatRecipeItem(BaseModel):
@@ -224,6 +241,7 @@ class PendingActionResponse(BaseModel):
     """Action awaiting user confirmation."""
     type: str = Field(..., description="Action type, e.g. log_meal, plan_meals")
     params: dict[str, Any] = Field(default_factory=dict, description="Action parameters")
+    action_id: str | None = Field(None, description="Unique ID for matching confirmation")
 
 
 class ChatProcessResponse(BaseModel):
@@ -254,6 +272,7 @@ def fetch_customer_profile(
     Fetch all personalization signals for a customer from Neo4j in one query.
 
     Returns a dict with:
+      display_name      — customer name (display_name, full_name, or name from B2C_Customer)
       diets             — list of Dietary_Preferences names the customer follows
       allergens         — list of Allergens names the customer is allergic to
       health_conditions — list of B2C_Customer_Health_Conditions names (e.g. "Type 2 Diabetes")
@@ -268,7 +287,8 @@ def fetch_customer_profile(
     future data task.
     """
     cypher = """
-    MATCH (c:B2C_Customer {id: $customer_id})
+    MATCH (c:B2C_Customer)
+    WHERE c.id = $customer_id OR elementId(c) = $customer_id
     OPTIONAL MATCH (c)-[:FOLLOWS_DIET]->(dp:Dietary_Preferences)
     OPTIONAL MATCH (c)-[:IS_ALLERGIC]->(a:Allergens)
     OPTIONAL MATCH (c)-[:HAS_CONDITION]->(hc:B2C_Customer_Health_Conditions)
@@ -276,8 +296,9 @@ def fetch_customer_profile(
     OPTIONAL MATCH (c)-[:HAS_MEAL_LOG]->(ml:MealLog)
                    -[:CONTAINS_ITEM]->(mli:MealLogItem)
                    -[:OF_RECIPE]->(r:Recipe)
-    WHERE ml.log_date >= date() - duration({days: 14})
+    WHERE (ml IS NULL OR ml.log_date >= date() - duration({days: 14}))
     RETURN
+      coalesce(c.display_name, c.full_name, c.name) AS display_name,
       collect(DISTINCT dp.name)  AS diets,
       collect(DISTINCT a.name)   AS allergens,
       collect(DISTINCT hc.name)  AS health_conditions,
@@ -291,20 +312,28 @@ def fetch_customer_profile(
             if not record:
                 logger.warning("fetch_customer_profile: no record for customer_id=%s", customer_id)
                 return {
+                    "display_name": None,
                     "diets": [], "allergens": [], "health_conditions": [],
                     "health_goal": None, "activity_level": None, "recent_recipes": [],
                 }
+            name = record["display_name"]
+            if isinstance(name, str) and name.strip():
+                name = name.strip()
+            else:
+                name = None
             return {
-                "diets":             list(record["diets"] or []),
-                "allergens":         list(record["allergens"] or []),
+                "display_name":    name,
+                "diets":           list(record["diets"] or []),
+                "allergens":       list(record["allergens"] or []),
                 "health_conditions": list(record["health_conditions"] or []),
-                "health_goal":       record["health_goal"],
-                "activity_level":    record["activity_level"],
-                "recent_recipes":    list(record["recent_recipes"] or []),
+                "health_goal":     record["health_goal"],
+                "activity_level":  record["activity_level"],
+                "recent_recipes":  list(record["recent_recipes"] or []),
             }
     except Exception as e:
         logger.warning("fetch_customer_profile failed: %s", e)
         return {
+            "display_name": None,
             "diets": [], "allergens": [], "health_conditions": [],
             "health_goal": None, "activity_level": None, "recent_recipes": [],
         }
@@ -474,6 +503,14 @@ def _merge_results(orch: OrchestratorResult, *, limit: int = 20) -> list[Recomme
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
+
+@app.get("/debug/profile", dependencies=[Depends(verify_api_key)])
+async def debug_profile(customer_id: str):
+    """Debug: return raw profile for a customer_id to verify Neo4j lookup."""
+    database = os.getenv("NEO4J_DATABASE")
+    profile = fetch_customer_profile(_driver, customer_id, database)
+    return {"customer_id": customer_id, "profile": profile}
+
 
 @app.get("/health")
 async def health():
@@ -797,7 +834,26 @@ async def chat_process(req: ChatProcessRequest):
             action_to_execute=PendingActionResponse(
                 type=action_to_exec.get("type", "unknown"),
                 params=action_to_exec.get("params", {}),
+                action_id=action_to_exec.get("action_id"),
             ),
+            recipes=[],
+            nutrition_data=None,
+        )
+
+    # Rejection flow: user declined the pending action
+    if session.pending_action_payload and is_rejection_message(msg):
+        session.pending_action_payload = None
+        session.pending_action = None
+        session.add_message("assistant", "No problem, I won't do that.")
+        return ChatProcessResponse(
+            response="No problem, I won't do that.",
+            intent="rejection",
+            session_id=session.session_id,
+            message_count=len(session.history),
+            action_required=False,
+            confirmation_prompt=None,
+            pending_action=None,
+            action_to_execute=None,
             recipes=[],
             nutrition_data=None,
         )
@@ -825,15 +881,69 @@ async def chat_process(req: ChatProcessRequest):
             pending_action=PendingActionResponse(
                 type=orch.pending_action.get("type", nlu_result.intent),
                 params=orch.pending_action.get("params", {}),
+                action_id=orch.pending_action.get("action_id"),
             ),
             action_to_execute=None,
             recipes=[],
             nutrition_data=None,
         )
 
-    # Template intents — canned response, no retrieval/LLM
+    # Chatbot data intents — fixed Cypher, deterministic formatting, no LLM
+    if nlu_result.intent in CHATBOT_DATA_INTENTS:
+        try:
+            database = os.getenv("NEO4J_DATABASE")
+            if nlu_result.intent == "show_meal_plan":
+                rows = run_show_meal_plan(_driver, req.customer_id, database)
+                _response, _nutrition = format_meal_plan_response(rows)
+            elif nlu_result.intent == "meal_history":
+                rows = run_meal_history(_driver, req.customer_id, target_date=None, database=database)
+                _response, _nutrition = format_meal_history_response(rows)
+            elif nlu_result.intent == "nutrition_summary":
+                data = run_nutrition_summary(_driver, req.customer_id, days=7, database=database)
+                _response, _nutrition = format_nutrition_summary_response(data)
+            else:
+                _response = _stub_chat_response(nlu_result.intent)
+                _nutrition = None
+            session.add_message("assistant", _response)
+            return ChatProcessResponse(
+                response=_response,
+                intent=nlu_result.intent,
+                session_id=session.session_id,
+                message_count=len(session.history),
+                action_required=False,
+                confirmation_prompt=None,
+                pending_action=None,
+                action_to_execute=None,
+                recipes=[],
+                nutrition_data=_nutrition,
+            )
+        except Exception as e:
+            logger.exception("Chatbot data intent failed: %s", e)
+            _response = "I couldn't load that data right now. Please try again later."
+            session.add_message("assistant", _response)
+            return ChatProcessResponse(
+                response=_response,
+                intent=nlu_result.intent,
+                session_id=session.session_id,
+                message_count=len(session.history),
+                action_required=False,
+                confirmation_prompt=None,
+                pending_action=None,
+                action_to_execute=None,
+                recipes=[],
+                nutrition_data=None,
+            )
+
+    # Template intents — canned response, no retrieval/LLM (fetch profile for personalization)
     if nlu_result.intent in TEMPLATE_INTENTS:
-        _response = get_template_response(nlu_result.intent)
+        database = os.getenv("NEO4J_DATABASE")
+        profile = fetch_customer_profile(_driver, req.customer_id, database)
+        display_name = profile.get("display_name") or req.display_name
+        _response = get_template_response(
+            nlu_result.intent,
+            customer_name=display_name,
+            profile=profile,
+        )
         session.add_message("assistant", _response)
         return ChatProcessResponse(
             response=_response,
