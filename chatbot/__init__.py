@@ -5,7 +5,11 @@ Processes natural language messages via NLU → intent routing → graph queries
 Session management, action orchestration, and response generation live here.
 """
 
-from chatbot.action_orchestrator import is_confirmation_message, route_intent
+from chatbot.action_orchestrator import (
+    is_confirmation_message,
+    is_rejection_message,
+    route_intent,
+)
 from chatbot.nlu import NLUResult, extract_hybrid
 from chatbot.response_generator import (
     TEMPLATE_INTENTS,
@@ -23,6 +27,7 @@ from chatbot.session import (
 
 __all__ = [
     "is_confirmation_message",
+    "is_rejection_message",
     "route_intent",
     "NLUResult",
     "extract_hybrid",

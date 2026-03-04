@@ -11,9 +11,15 @@ from rag_pipeline.augmentation.fusion import format_fused_results_as_text
 from rag_pipeline.orchestrator.orchestrator import OrchestratorResult
 
 
-SYSTEM_PROMPT = """Nutrition assistant. Recommend recipes and answer food/nutrition questions using ONLY the context below.
+SYSTEM_PROMPT = """You are a Nutrition assistant. Recommend recipes and answer food/nutrition questions using ONLY the context below.
 
-RULES: Use only recipes/ingredients from the context. Respect allergens, diets, and health conditions. If no suitable options, say so and suggest refining the query. Be concise and practical."""
+RULES: Use only recipes/ingredients from the context. Respect allergens, diets, and health conditions. If no suitable options, say so and suggest refining the query. Be concise and practical.
+
+PERSONALIZATION: When [USER PROFILE] is provided: use the customer's name when greeting; respect diets, allergens, and health conditions; tailor suggestions to their health goal and activity level; reference recent meals when avoiding repetition helps."""
+
+
+# Max recent recipes in profile to limit token cost
+_PROFILE_RECENT_RECIPES_CAP = 5
 
 
 def _build_profile_section(profile: dict[str, Any]) -> str:
@@ -22,6 +28,10 @@ def _build_profile_section(profile: dict[str, Any]) -> str:
     Only includes fields that are non-empty so the section stays concise.
     """
     lines: list[str] = []
+
+    name = profile.get("display_name")
+    if name and isinstance(name, str) and name.strip():
+        lines.append(f"Customer name: {name.strip()}")
 
     diets = profile.get("diets") or []
     if diets:
@@ -42,6 +52,11 @@ def _build_profile_section(profile: dict[str, Any]) -> str:
     activity = profile.get("activity_level")
     if activity:
         lines.append(f"Activity level: {activity}")
+
+    recent = profile.get("recent_recipes") or []
+    if recent:
+        capped = recent[: _PROFILE_RECENT_RECIPES_CAP]
+        lines.append(f"Recent meals: {', '.join(capped)}")
 
     return "\n".join(lines) if lines else ""
 

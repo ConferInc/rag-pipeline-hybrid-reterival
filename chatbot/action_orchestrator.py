@@ -15,6 +15,7 @@ HOW CONFIRMATION WORKS:
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from enum import Enum
@@ -67,10 +68,22 @@ ACTION_REGISTRY: dict[str, ActionType] = {
 }
 
 
-# Confirmation phrases — user agreeing to execute pending action
+# Confirmation phrases — user agreeing to execute pending action (exact match)
 CONFIRMATION_PHRASES = frozenset({
     "yes", "yeah", "yep", "sure", "ok", "okay", "confirm", "confirmed",
     "go ahead", "do it", "please", "proceed", "absolutely", "yup",
+    "good to go", "go for it", "yes please", "yeah please", "please do",
+    "sure thing", "sure do it",
+})
+
+# Prefixes for natural confirmations like "yes, please log item"
+# Must be followed by space, comma, or end (avoids "ok" matching "okra")
+CONFIRMATION_PREFIXES = ("yes", "yeah", "sure", "ok", "okay", "go ahead", "do it")
+
+# Rejection phrases — user explicitly declining the pending action
+REJECTION_PHRASES = frozenset({
+    "no", "nope", "cancel", "nevermind", "never mind", "don't", "stop",
+    "actually no", "forget it", "not now", "maybe later", "nah",
 })
 
 
@@ -124,16 +137,35 @@ def route_intent(intent: str, entities: dict[str, Any]) -> ActionOrchestratorRes
 def is_confirmation_message(message: str) -> bool:
     """True if the message is a user confirming a pending action."""
     normalized = message.strip().lower()
-    return normalized in CONFIRMATION_PHRASES
+    if not normalized:
+        return False
+    if normalized in CONFIRMATION_PHRASES:
+        return True
+    # Prefix match for natural confirmations ("yes, please log item", "sure, go ahead")
+    for prefix in CONFIRMATION_PREFIXES:
+        if normalized.startswith(prefix):
+            # Require space, comma, or end after prefix (avoid "ok" matching "okra")
+            rest = normalized[len(prefix) :]
+            if not rest or rest[0] in " ,.!?":
+                return True
+    return False
+
+
+def is_rejection_message(message: str) -> bool:
+    """True if the message is a user explicitly declining the pending action."""
+    normalized = message.strip().lower()
+    return normalized in REJECTION_PHRASES
 
 
 def _build_pending_action(intent: str, entities: dict[str, Any]) -> dict[str, Any] | None:
-    """Build {type, params} for the pending action."""
+    """Build {type, params, action_id} for the pending action."""
     today = date.today().isoformat()
+    action_id = str(uuid.uuid4())
 
     if intent in ("plan_meals", "create_meal_plan"):
         return {
             "type": "plan_meals",
+            "action_id": action_id,
             "params": {
                 "date_range": entities.get("date_range", "next week"),
                 "meals_per_day": entities.get("meals_per_day", ["breakfast", "lunch", "dinner"]),
@@ -145,6 +177,7 @@ def _build_pending_action(intent: str, entities: dict[str, Any]) -> dict[str, An
         meal_type = entities.get("meal_type", "lunch")
         return {
             "type": "log_meal",
+            "action_id": action_id,
             "params": {
                 "recipe": _title_case(recipe),
                 "meal_type": meal_type,
@@ -156,6 +189,7 @@ def _build_pending_action(intent: str, entities: dict[str, Any]) -> dict[str, An
         meal_type = entities.get("meal_type", "dinner")
         return {
             "type": "swap_meal",
+            "action_id": action_id,
             "params": {
                 "meal_type": meal_type,
                 "date": today,
@@ -165,6 +199,7 @@ def _build_pending_action(intent: str, entities: dict[str, Any]) -> dict[str, An
     if intent in ("grocery_list", "create_grocery_list"):
         return {
             "type": "grocery_list",
+            "action_id": action_id,
             "params": {"items": entities.get("items", [])},
         }
 
@@ -174,11 +209,12 @@ def _build_pending_action(intent: str, entities: dict[str, Any]) -> dict[str, An
             diets = [diets]
         return {
             "type": "set_preference",
+            "action_id": action_id,
             "params": {"diet": diets},
         }
 
     if intent in ("modify_meal_plan", "modify_grocery_list"):
-        return {"type": intent, "params": dict(entities)}
+        return {"type": intent, "action_id": action_id, "params": dict(entities)}
 
     return None
 
