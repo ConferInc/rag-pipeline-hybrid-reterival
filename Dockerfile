@@ -22,6 +22,7 @@ COPY --from=builder /install /usr/local
 # Copy only what the API needs at runtime
 COPY api/             ./api/
 COPY rag_pipeline/    ./rag_pipeline/
+COPY chatbot/         ./chatbot/
 COPY cypher_query_generator.py  .
 COPY extractor_classifier.py    .
 COPY embedding_config.yaml      .

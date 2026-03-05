@@ -278,20 +278,85 @@ def _filter_calories(
     return kept
 
 
-# ── Filter D — Dietary preference compliance (PLACEHOLDER) ────────────────────
-# Requires (Dietary_Preferences)-[:FORBIDS]->(Ingredient) to be populated in Neo4j.
-# Once that data exists, activate this filter by uncommenting and wiring it in
-# apply_hard_constraints() below.
-#
-# def _fetch_diet_violating_ids(driver, recipe_ids, diets, database):
-#     cypher = """
-#     UNWIND $recipe_ids AS rid
-#     MATCH (r:Recipe {id: rid})-[:USES_INGREDIENT]->(i:Ingredient)
-#           <-[:FORBIDS]-(dp:Dietary_Preferences)
-#     WHERE dp.name IN $diets
-#     RETURN DISTINCT r.id AS flagged_id
-#     """
-#     ...
+# ── Filter D — Dietary preference compliance (FORBIDDEN relationships) ────────
+
+def _fetch_diet_violating_ids(
+    driver: Driver,
+    recipe_ids: list[str],
+    diets: list[str],
+    database: str | None,
+) -> set[str]:
+    """
+    Return the set of recipe IDs that use any ingredient forbidden by the diet(s).
+    Uses (Dietary_Preferences)-[:FORBIDDEN]->(Ingredient) and (Recipe)-[:USES_INGREDIENT]->(Ingredient).
+    """
+    if not recipe_ids or not diets:
+        return set()
+
+    cypher = """
+    UNWIND $recipe_ids AS rid
+    MATCH (r:Recipe {id: rid})-[:USES_INGREDIENT]->(i:Ingredient)
+          <-[:FORBIDDEN]-(dp:Dietary_Preferences)
+    WHERE dp.name IN $diets
+    RETURN DISTINCT r.id AS flagged_id
+    """
+    try:
+        with driver.session(database=database) as session:
+            rows = session.run(
+                cypher,
+                recipe_ids=recipe_ids,
+                diets=diets,
+            )
+            return {str(row["flagged_id"]) for row in rows}
+    except Exception as e:
+        logger.warning(
+            "Diet filter DB call failed — skipping filter: %s", e,
+            extra={"component": "constraint_filter"},
+        )
+        return set()
+
+
+def _filter_diet_compliance(
+    fused: list[dict[str, Any]],
+    diets: list[str],
+    driver: Driver,
+    database: str | None,
+) -> list[dict[str, Any]]:
+    """
+    Drop recipes that use any ingredient forbidden by the requested diet(s).
+    Recipes without an ID cannot be verified and are kept but marked.
+    """
+    recipe_ids = _recipe_ids_from_fused(fused)
+    violating_ids = _fetch_diet_violating_ids(driver, recipe_ids, diets, database)
+
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for item in fused:
+        payload = item.get("payload") or {}
+        rid = str(payload.get("id") or payload.get("r.id") or "")
+
+        if not rid:
+            item = dict(item)
+            sources = list(item.get("sources", []))
+            if "unverified_diet" not in sources:
+                sources.append("unverified_diet")
+            item["sources"] = sources
+            kept.append(item)
+        elif rid in violating_ids:
+            dropped += 1
+            logger.info(
+                "Diet filter dropped recipe: id=%s title=%s (diets=%s)",
+                rid, item.get("title", "?"), diets,
+            )
+        else:
+            kept.append(item)
+
+    if dropped:
+        logger.info(
+            "Diet filter: dropped %d / %d results (diets=%s)",
+            dropped, len(fused), diets,
+        )
+    return kept
 
 
 # ── Filter E — Health condition compliance (PLACEHOLDER) ──────────────────────
@@ -348,10 +413,12 @@ def apply_hard_constraints(
     if cal_limit is not None:
         result = _filter_calories(result, cal_limit, driver, database)
 
-    # ── D: Diet compliance — PLACEHOLDER (needs FORBIDS in Neo4j) ─────────────
-    # diets = entities.get("diet") or []
-    # if diets:
-    #     result = _filter_diet_compliance(result, diets, driver, database)
+    # ── D: Diet compliance (FORBIDDEN relationships in Neo4j) ─────────────────
+    diets = entities.get("diet") or []
+    if isinstance(diets, str):
+        diets = [diets] if diets else []
+    if diets:
+        result = _filter_diet_compliance(result, diets, driver, database)
 
     logger.info(
         "Hard constraint filter complete",
@@ -364,6 +431,7 @@ def apply_hard_constraints(
                 "course": bool(course),
                 "allergens": bool(allergens),
                 "cal_limit": cal_limit is not None,
+                "diet": bool(diets),
             },
         },
     )
