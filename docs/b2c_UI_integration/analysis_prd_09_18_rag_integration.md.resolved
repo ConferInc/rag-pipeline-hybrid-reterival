@@ -1,0 +1,260 @@
+# PRD 09–18 Implementation Analysis: RAG Pipeline Integration
+
+> Deep scan of `nutrition-backend-b2c` (Backend), `nutrib2c-frontend` (Frontend), and `rag-pipeline-hybrid-reterival` (RAG API) — performed 2026-03-04.
+
+---
+
+## Executive Summary
+
+The RAG pipeline integration across all three repos is **substantially implemented**. The foundational infrastructure (PRD-09) is in production shape. The four core feature endpoints in the RAG API are functional. Backend service files are all wired to [ragClient.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts). Frontend components exist for search, feed, meal plan, scanner, substitutions, and chatbot surfaces.
+
+**However, 4 of the 8 RAG API endpoints specified in the PRDs are NOT implemented**, along with missing data-layer automation (PG→Neo4j sync, GraphSAGE training). These gaps prevent full end-to-end integration for ~4 features.
+
+---
+
+## PRD-by-PRD Status
+
+### PRD-09: Foundation & Resilience ✅ IMPLEMENTED
+
+| Deliverable | Status | Location |
+|---|---|---|
+| FastAPI wrapper ([api/app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py)) | ✅ Done | [app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py) — 1,081 lines |
+| [ragClient.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts) — circuit breaker | ✅ Done | [ragClient.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts) — 413 lines, 3-gate pattern, `HALF_OPEN` single-probe |
+| 8 feature functions in ragClient | ✅ Done | [ragSearch](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#276-283), [ragFeed](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#284-298), [ragMealCandidates](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#299-314), [ragProducts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#315-324), [ragAlternatives](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#325-334), [ragMealPatterns](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#335-344), [ragChat](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#345-356), [ragIngredientSubstitutions](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#372-381) |
+| Per-feature env flags (all OFF) | ✅ Done | 8 flags configured in `FEATURE_CONFIG` |
+| [getCircuitStatus()](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#384-413) admin endpoint | ✅ Done | [admin.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/routes/admin.ts) imports it |
+| Dockerfile — multi-stage, non-root | ✅ Done | [Dockerfile](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/Dockerfile) — builder+runtime, health check on 8000 |
+| X-API-Key auth middleware | ✅ Done | [verify_api_key()](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py#156-164) in [api/app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py) |
+| `chat_sessions` PG table schema | ✅ Done | `chatSessions` in [goldSchema.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/shared/goldSchema.ts)#L684 |
+| [recipeHydration.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/recipeHydration.ts) | ✅ Done | [recipeHydration.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/recipeHydration.ts) — 209 lines |
+| [.env.example](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/.env.example) (RAG side) | ✅ Done | NEO4J_*, RAG_API_KEY, ALLOWED_ORIGINS |
+| PG → Neo4j sync script (`sync/pg_sync.py`) | ❌ **Missing** | No `sync/` dir exists in RAG repo |
+| Neo4j schema expansion (14 constraints, 7 indexes) | ⚠️ **Unverifiable** | No DDL scripts found in repo; may be run manually |
+
+---
+
+### PRD-10: Graph-Enhanced Search ✅ IMPLEMENTED
+
+| Deliverable | Status | Location |
+|---|---|---|
+| `POST /search/hybrid` RAG endpoint | ✅ Done | [app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py) line 525 — full orchestrator pipeline |
+| `searchRecipesWithRAG()` in [search.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/search.ts) | ✅ Done | Line 305 calls [ragSearch()](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#276-283) |
+| [hydrateRecipesByIds()](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/recipeHydration.ts#164-209) | ✅ Done | [recipeHydration.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/recipeHydration.ts) |
+| `MatchReasonBadge` component | ✅ Done | [match-reason-badge.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/search/match-reason-badge.tsx) |
+| Recipe card renders `reasons[]` | ✅ Done | [recipe-card.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/recipe-card.tsx) lines 111-114 |
+| NL search hints | ⚠️ Unverified | Needs visual check |
+
+---
+
+### PRD-11: Graph-Enhanced Feed ✅ IMPLEMENTED
+
+| Deliverable | Status | Location |
+|---|---|---|
+| `POST /recommend/feed` RAG endpoint | ✅ Done | [app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py) line 567 — profile fetch, semantic+structural+cypher, RRF, recent exclusion |
+| `getPersonalizedFeedWithRAG()` in [feed.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/routes/feed.ts) | ✅ Done | Line 265 calls [ragFeed()](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#284-298) |
+| `RecommendationReason` badge | ✅ Done | [recommendation-reason.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/feed/recommendation-reason.tsx) |
+| Reason generation (_build_reasons) | ✅ Done | [app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py) lines 372-416 — diet, structural, semantic, time, protein reasons |
+
+---
+
+### PRD-12: Graph-Enhanced Meal Planning ✅ IMPLEMENTED
+
+| Deliverable | Status | Location |
+|---|---|---|
+| `POST /recommend/meal-candidates` | ✅ Done | [app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py) line 676 — profile, retrieval, exclusion, MealCandidateItem format |
+| [ragMealCandidates()](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#299-314) call in [mealPlan.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/routes/mealPlan.ts) | ✅ Done | Line 218 |
+| Meal card tooltip with graph reasons | ✅ Done | [meal-reason-tooltip.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/meal-plan/meal-reason-tooltip.tsx), [meal-card.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/meal-plan/meal-card.tsx) line 46-47 |
+
+---
+
+### PRD-13: Graph Grocery Substitutions ⚠️ PARTIAL
+
+| Deliverable | Status | Location |
+|---|---|---|
+| `POST /recommend/products` RAG endpoint | ❌ **Not implemented** | Not in [app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py) |
+| [ragProducts()](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#315-324) call in [groceryList.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/routes/groceryList.ts) | ✅ Done | Import exists (line 10) |
+| Substitution endpoint in grocery route | ✅ Done | [groceryList.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/routes/groceryList.ts) |
+| `SubstitutionCard` component | ✅ Done | [substitution-card.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/grocery/substitution-card.tsx) |
+| `SubstitutionDrawer` component | ✅ Done | [substitution-drawer.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/grocery/substitution-drawer.tsx) |
+
+> [!WARNING]
+> The backend calls [ragProducts()](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#315-324) which hits `/recommend/products`, but this endpoint **does not exist** in [app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py). When the grocery feature flag is ON, the call will get a 404 → circuit breaker → SQL fallback.
+
+---
+
+### PRD-14: Scanner Alternatives ⚠️ PARTIAL
+
+| Deliverable | Status | Location |
+|---|---|---|
+| `POST /recommend/alternatives` RAG endpoint | ❌ **Not implemented** | Not in [app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py) |
+| [ragAlternatives()](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#325-334) call in [scan.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/routes/scan.ts) | ✅ Done | Line 626 |
+| `ProductAlternativeCard` component | ✅ Done | [product-alternative-card.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/scan/product-alternative-card.tsx) |
+| Scan result sheet alternatives section | ✅ Done | [scan-result-sheet.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/scan/scan-result-sheet.tsx) includes `alternatives` type |
+
+> [!WARNING]
+> Same issue as PRD-13: backend calls `/recommend/alternatives` which doesn't exist in the RAG API.
+
+---
+
+### PRD-15: Meal Log Patterns ⚠️ PARTIAL
+
+| Deliverable | Status | Location |
+|---|---|---|
+| `POST /analytics/meal-patterns` RAG endpoint | ❌ **Not implemented** | Not in [app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py) |
+| [ragMealPatterns()](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/ragClient.ts#335-344) call in [mealLog.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/routes/mealLog.ts) | ✅ Done | Line 864 |
+| `PatternDashboard` component | ✅ Done | [pattern-dashboard.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/meal-log/pattern-dashboard.tsx) |
+| `VarietyScore` component | ✅ Done | [variety-score.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/meal-log/variety-score.tsx) |
+| `CuisineChart` component | ✅ Done | [cuisine-chart.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/meal-log/cuisine-chart.tsx) |
+
+> [!WARNING]
+> Backend calls `/analytics/meal-patterns` which doesn't exist in the RAG API. SQL fallback `computeBasicPatterns()` will run instead.
+
+---
+
+### PRD-16: AI Chatbot ✅ IMPLEMENTED
+
+| Deliverable | Status | Location |
+|---|---|---|
+| `POST /chat/process` RAG endpoint | ✅ Done | [app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py) line 802 — full NLU + action orchestrator + 17 intents |
+| NLU engine ([chatbot/nlu.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/chatbot/nlu.py)) | ✅ Done | [nlu.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/chatbot/nlu.py) — hybrid extraction |
+| Action orchestrator | ✅ Done | [action_orchestrator.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/chatbot/action_orchestrator.py) — confirmation/rejection flow |
+| Session management | ✅ Done | [session.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/chatbot/session.py) — in-memory with cleanup |
+| Cypher data intents | ✅ Done | [chatbot_cypher.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/chatbot/chatbot_cypher.py) — show_meal_plan, meal_history, nutrition_summary |
+| Express [chatbot.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/chatbot.ts) service | ✅ Done | [chatbot.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/chatbot.ts) |
+| Express [chat.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/routes/chat.ts) route | ✅ Done | [chat.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/routes/chat.ts) — POST /, GET /history |
+| `ChatWidget` component | ✅ Done | [chat-widget.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/chat/chat-widget.tsx) |
+| `ChatBubble` component | ✅ Done | [chat-bubble.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/chat/chat-bubble.tsx) |
+| `ChatInput` component | ✅ Done | [chat-input.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/chat/chat-input.tsx) |
+| [chat-api.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/lib/chat-api.ts) client | ✅ Done | [chat-api.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/lib/chat-api.ts) |
+| Response generator | ✅ Done | [response_generator.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/chatbot/response_generator.py) |
+
+---
+
+### PRD-17: Collaborative Filtering ❌ NOT IMPLEMENTED
+
+| Deliverable | Status | Location |
+|---|---|---|
+| `sync/train_graphsage.py` | ❌ **Missing** | No file, no `sync/` directory |
+| Collaborative scoring in `/recommend/feed` | ⚠️ **Structural only** | [app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py) uses GraphSAGE seed embedding for structural retrieval but no explicit collaborative weight blending |
+| Cold-start weight transitions | ❌ **Missing** | No interaction count logic or weight blending |
+| `CollaborativeBadge` frontend | ❌ **Missing** | No `collaborative-badge.tsx` found |
+
+> [!IMPORTANT]
+> GraphSAGE embeddings are used for structural search via `get_seed_embedding()`, but the full collaborative filtering system (cold-start weights, cosine similarity scoring across users, weekly retraining) is NOT implemented.
+
+---
+
+### PRD-18: Smart Substitutions ✅ IMPLEMENTED (B2C side)
+
+| Deliverable | Status | Location |
+|---|---|---|
+| `POST /substitutions/ingredient` RAG endpoint | ❌ **Not implemented** | Not in [app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py) |
+| [substitutions.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/routes/substitutions.ts) B2C service | ✅ Done | [substitutions.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/substitutions.ts) — ingredient + product substitutions |
+| [substitutions.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/routes/substitutions.ts) B2C route | ✅ Done | [substitutions.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/routes/substitutions.ts) |
+| [IngredientSubstitution](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrition-backend-b2c/server/services/substitutions.ts#18-35) popover | ✅ Done | [ingredient-substitution.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/recipe/ingredient-substitution.tsx) |
+| `NutritionComparison` component | ✅ Done | [nutrition-comparison.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/shared/nutrition-comparison.tsx) |
+| `SubstitutionCard` (shared) | ✅ Done | [substitution-card.tsx](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/components/shared/substitution-card.tsx) |
+| [substitution-api.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/lib/substitution-api.ts) client | ✅ Done | [substitution-api.ts](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/nutrib2c-frontend/lib/substitution-api.ts) |
+| `[:CAN_SUBSTITUTE]` seed data | ⚠️ **Unknown** | No CSV seed file found in RAG repo |
+
+> [!WARNING]
+> B2C backend + frontend are fully wired, but `/substitutions/ingredient` endpoint doesn't exist in the RAG API → current calls return `null` → empty substitutions shown.
+
+---
+
+## Gap Summary
+
+### RAG API Endpoints (in [rag-pipeline-hybrid-reterival/api/app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py))
+
+| Endpoint | PRD | Status |
+|---|---|---|
+| `GET /health` | 09 | ✅ Implemented |
+| `POST /search/hybrid` | 10 | ✅ Implemented |
+| `POST /recommend/feed` | 11 | ✅ Implemented |
+| `POST /recommend/meal-candidates` | 12 | ✅ Implemented |
+| `POST /recommend/products` | 13 | ❌ **Missing** |
+| `POST /recommend/alternatives` | 14 | ❌ **Missing** |
+| `POST /analytics/meal-patterns` | 15 | ❌ **Missing** |
+| `POST /chat/process` | 16 | ✅ Implemented |
+| `POST /substitutions/ingredient` | 18 | ❌ **Missing** |
+
+### Data Layer Automation
+
+| Component | PRD | Status |
+|---|---|---|
+| PG → Neo4j sync (`sync/pg_sync.py`) | 09 | ❌ **Missing** |
+| GraphSAGE automated training | 17 | ❌ **Missing** |
+| `[:CAN_SUBSTITUTE]` seed data | 18 | ❌ **Missing** |
+| Neo4j constraints/indexes DDL | 09 | ⚠️ Unverifiable |
+
+### Frontend Gaps
+
+| Component | PRD | Status |
+|---|---|---|
+| `collaborative-badge.tsx` | 17 | ❌ **Missing** |
+| All other frontend components | 10-18 | ✅ Implemented |
+
+---
+
+## Architecture Diagram — Current State
+
+```mermaid
+graph LR
+    subgraph Frontend
+        A[Next.js App]
+    end
+
+    subgraph "Express Backend"
+        B[ragClient.ts<br/>Circuit Breaker]
+        C[search.ts / feed.ts / etc]
+        D[chatbot.ts]
+    end
+
+    subgraph "RAG API (FastAPI)"
+        E["/search/hybrid ✅"]
+        F["/recommend/feed ✅"]
+        G["/recommend/meal-candidates ✅"]
+        H["/chat/process ✅"]
+        I["/recommend/products ❌"]
+        J["/recommend/alternatives ❌"]
+        K["/analytics/meal-patterns ❌"]
+        L["/substitutions/ingredient ❌"]
+    end
+
+    subgraph "Neo4j"
+        M["Graph DB"]
+    end
+
+    A -->|"API calls"| C
+    A -->|"Chat API"| D
+    C --> B
+    D --> B
+    B -->|"3-gate: flag→breaker→HTTP"| E
+    B --> F
+    B --> G
+    B --> H
+    B -.->|"404 → fallback"| I
+    B -.->|"404 → fallback"| J
+    B -.->|"404 → fallback"| K
+    B -.->|"404 → fallback"| L
+    E & F & G & H --> M
+```
+
+---
+
+## Questions for You
+
+1. **RAG Pipeline ownership** — Are the 4 missing RAG endpoints (`/recommend/products`, `/recommend/alternatives`, `/analytics/meal-patterns`, `/substitutions/ingredient`) something the RAG team (Priya?) is working on separately? Or should we implement them ourselves?
+
+2. **PG→Neo4j sync** — Is data sync being done manually right now, or is there a separate deployment for this? The PRD spec calls for `sync/pg_sync.py` with cron scheduling.
+
+3. **GraphSAGE training** — Is periodic GraphSAGE retraining planned for a later phase? PRD-17 specifies weekly automated training but no automation exists.
+
+4. **Neo4j data state** — What's the current state of Neo4j? Are all node types populated (B2CCustomer, Recipe, Ingredient, Allergen, etc.)? Are `[:CAN_SUBSTITUTE]` edges seeded?
+
+5. **Deployment environment** — Is the RAG API deployed on Coolify alongside Neo4j? Or is this still local-only? The [.env.example](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/.env.example) references `bolt://localhost:7687` which suggests local dev.
+
+6. **Next steps priority** — Do you want me to:
+   - (a) Implement the 4 missing RAG API endpoints in [app.py](file:///c:/Users/Sourav%20Patil/Desktop/ASM/B2C/rag-pipeline-hybrid-reterival/api/app.py)?
+   - (b) Create the PG→Neo4j sync script?
+   - (c) Focus on something else (e.g., testing integration end-to-end)?

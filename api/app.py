@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -30,6 +31,8 @@ from rag_pipeline.config import load_embedding_config
 from rag_pipeline.embeddings.caching_embedder import CachingQueryEmbedder
 from rag_pipeline.embeddings.openai_embedder import OpenAIQueryEmbedder
 from rag_pipeline.neo4j_client import create_neo4j_driver, neo4j_settings_from_env
+from rag_pipeline.nlu.intents import CHATBOT_DATA_INTENTS, DATA_INTENTS_NEEDING_RETRIEVAL
+from rag_pipeline.orchestrator.constraint_filter import apply_hard_constraints, build_zero_results_message
 from rag_pipeline.orchestrator.cypher_runner import run_cypher_retrieval
 from rag_pipeline.orchestrator.orchestrator import orchestrate, OrchestratorResult
 from rag_pipeline.retrieval.service import retrieve_semantic, SemanticRetrievalRequest
@@ -56,40 +59,10 @@ from chatbot.response_generator import (
     get_template_response,
 )
 from chatbot.session import get_or_create_session, cleanup_expired
+from .ingredient_substitution import run_ingredient_substitution
+from .product_recommendation import run_recommend_products, run_recommend_alternatives
 
 logger = logging.getLogger(__name__)
-
-# Intents that run retrieval + LLM (same flow as /search/hybrid)
-DATA_INTENTS_NEEDING_RETRIEVAL = frozenset({
-    "find_recipe",
-    "find_recipe_by_pantry",
-    "get_nutritional_info",
-    "compare_foods",
-    "check_diet_compliance",
-    "check_substitution",
-    "get_substitution_suggestion",
-    "similar_recipes",
-    "recipes_for_cuisine",
-    "recipes_by_nutrient",
-    "nutrient_in_foods",
-    "nutrient_category",
-    "ingredient_in_recipes",
-    "ingredient_nutrients",
-    "find_product",
-    "product_nutrients",
-    "cuisine_recipes",
-    "cuisine_hierarchy",
-    "cross_reactive_allergens",
-    "general_nutrition",
-})
-
-# Deterministic chatbot intents: fixed Cypher, no LLM
-CHATBOT_DATA_INTENTS = frozenset({
-    "show_meal_plan",
-    "meal_history",
-    "nutrition_summary",
-})
-
 
 # ── Startup / Shutdown ─────────────────────────────────────────────────────
 
@@ -203,6 +176,7 @@ class MealCandidateItem(BaseModel):
 class MealCandidateResponse(BaseModel):
     candidates: list[MealCandidateItem]
     retrieval_time_ms: float
+    zero_results_explanation: str | None = Field(None, description="Explanation when no candidates satisfy constraints")
 
 
 class RecommendationResult(BaseModel):
@@ -218,6 +192,88 @@ class SearchResponse(BaseModel):
     intent: str
     entities: dict[str, Any]
     retrieval_time_ms: float
+    zero_results_explanation: str | None = Field(None, description="Explanation when no results satisfy constraints")
+    confidence: float | None = Field(None, description="Intent extraction confidence (0–1)")
+
+
+# ── Ingredient substitution schemas ────────────────────────────────────────
+
+class IngredientSubstitutionRequest(BaseModel):
+    """Request for POST /substitutions/ingredient."""
+    ingredient_id: str = Field(..., description="Ingredient UUID or elementId")
+    ingredient_name: str | None = Field(None, description="Ingredient name (optional, resolved from id if missing)")
+    customer_allergens: list[str] = Field(default_factory=list, description="Allergen IDs or names for safety filter")
+    customer_diets: list[str] = Field(default_factory=list, description="Diet names for compliance filter (e.g. Vegan)")
+    limit: int = Field(5, ge=1, le=20)
+    debug: bool = Field(False, description="Include debug_info in response")
+
+
+class IngredientSubstitutionItem(BaseModel):
+    """Single substitute suggestion."""
+    ingredient_id: str
+    name: str
+    reason: str
+    source: str = "unknown"
+    nutritionComparison: dict[str, Any] | None = None
+    allergenSafe: bool = True
+
+
+class IngredientSubstitutionResponse(BaseModel):
+    """Response from POST /substitutions/ingredient."""
+    substitutions: list[IngredientSubstitutionItem]
+    debug_info: dict[str, Any] | None = None
+
+
+# ── Product recommendation schemas ──────────────────────────────────────────
+
+class ProductsRequest(BaseModel):
+    """Request for POST /recommend/products (grocery list)."""
+    ingredient_ids: list[str] = Field(..., description="Ingredient UUIDs to match products for")
+    customer_allergens: list[str] = Field(default_factory=list, description="Allergen IDs/names for safety filter")
+
+
+class ProductMatchItem(BaseModel):
+    """Single product match for an ingredient."""
+    ingredient_id: str
+    product_id: str
+    product_name: str
+    brand: str = ""
+    price: float | None = None
+    currency: str = "USD"
+    weight_g: int | None = None
+    category: str = ""
+    image_url: str = ""
+    match_reason: str = ""
+
+
+class ProductsResponse(BaseModel):
+    """Response from POST /recommend/products."""
+    products: list[ProductMatchItem]
+
+
+class AlternativesRequest(BaseModel):
+    """Request for POST /recommend/alternatives (scanner)."""
+    product_id: str = Field(..., description="Scanned product UUID")
+    customer_allergens: list[str] = Field(default_factory=list, description="Allergen IDs/names for safety filter")
+    limit: int = Field(5, ge=1, le=20)
+
+
+class AlternativeItem(BaseModel):
+    """Single alternative product."""
+    product_id: str
+    name: str
+    brand: str = ""
+    price: float | None = None
+    image_url: str = ""
+    reason: str = ""
+    savings: float | None = None
+    allergen_safe: bool = True
+    category: str = ""
+
+
+class AlternativesResponse(BaseModel):
+    """Response from POST /recommend/alternatives."""
+    alternatives: list[AlternativeItem]
 
 
 # ── Chatbot schemas ────────────────────────────────────────────────────────
@@ -249,6 +305,7 @@ class ChatProcessResponse(BaseModel):
     response: str = Field(..., description="Natural language or template response")
     intent: str = Field(..., description="Detected intent")
     session_id: str = Field(..., description="Session UUID for follow-up messages")
+    confidence: float | None = Field(None, description="Intent extraction confidence (0–1), when available")
     message_count: int = Field(0, ge=0, description="Messages in this session")
     action_required: bool = Field(False, description="True if user must confirm before execution")
     confirmation_prompt: str | None = Field(None, description="Prompt shown for confirmation")
@@ -321,9 +378,11 @@ def fetch_customer_profile(
                 name = name.strip()
             else:
                 name = None
+            diets_raw = record["diets"] or []
+            diets_clean = [d for d in diets_raw if d and isinstance(d, str)]
             return {
                 "display_name":    name,
-                "diets":           list(record["diets"] or []),
+                "diets":           diets_clean,
                 "allergens":       list(record["allergens"] or []),
                 "health_conditions": list(record["health_conditions"] or []),
                 "health_goal":     record["health_goal"],
@@ -418,13 +477,115 @@ def _build_reasons(
 
 # ── Merge helpers ──────────────────────────────────────────────────────────
 
+def _is_uuid(val: str) -> bool:
+    """Return True if val looks like a UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)."""
+    if not val or not isinstance(val, str):
+        return False
+    return bool(re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", val.lower()))
+
+
+def _looks_like_element_id(val: str) -> bool:
+    """Return True if val looks like Neo4j elementId (e.g. 4:abc123:42)."""
+    if not val or not isinstance(val, str):
+        return False
+    return ":" in val and len(val) > 5 and not _is_uuid(val)
+
+
+def _lookup_uuid_from_neo4j(
+    driver: Driver,
+    *,
+    element_id: str | None = None,
+    label: str = "Recipe",
+    title: str | None = None,
+    name: str | None = None,
+    database: str | None = None,
+) -> str | None:
+    """
+    Lookup PostgreSQL UUID from Neo4j when it is not present in the payload.
+    Uses elementId, or label+title/name depending on what is available.
+    """
+    try:
+        with driver.session(database=database) as session:
+            if element_id and _looks_like_element_id(element_id):
+                rec = session.run(
+                    "MATCH (n) WHERE elementId(n) = $elem_id RETURN n.id AS id",
+                    elem_id=element_id,
+                ).single()
+                if rec and rec["id"]:
+                    return str(rec["id"])
+            if label and (title or name):
+                prop = "title" if title else "name"
+                val = (title or name or "").strip()
+                if not val:
+                    return None
+                cypher = (
+                    f"MATCH (n:{label}) WHERE toLower(n.{prop}) = toLower($val) "
+                    "RETURN n.id AS id LIMIT 1"
+                )
+                rec = session.run(cypher, val=val).single()
+                if rec and rec["id"]:
+                    return str(rec["id"])
+    except Exception as e:
+        logger.warning(
+            "UUID lookup failed",
+            extra={"element_id": element_id, "label": label, "title": title, "name": name, "error": str(e)},
+        )
+    return None
+
+
 def _resolve_id(payload: dict[str, Any], key: str) -> str:
-    """Resolve the best available recipe ID from a fused result payload."""
-    return (
+    """
+    Resolve the best available recipe ID from a fused result payload.
+    Returns only what is in payload; does not perform DB lookup.
+    Priority: payload.id > payload["r.id"] > nested payload.id (structural) > key fallback.
+    """
+    uid = (
         payload.get("id")
         or payload.get("r.id")
-        or key
-    ) or str(id(payload))
+        or (payload.get("payload") or {}).get("id")
+        or (payload.get("payload") or {}).get("r.id")
+    )
+    if uid:
+        return str(uid)
+    return key or str(id(payload))
+
+
+def _resolve_id_with_lookup(
+    payload: dict[str, Any],
+    key: str,
+    item: dict[str, Any],
+    driver: Driver,
+    *,
+    label: str = "Recipe",
+    database: str | None = None,
+) -> str:
+    """
+    Resolve recipe ID to PostgreSQL UUID. Never returns title or elementId.
+    When UUID is not in payload, performs Neo4j lookup by elementId or title/name.
+    """
+    uid = _resolve_id(payload, key)
+    if _is_uuid(uid):
+        return uid
+    # Try lookup: use elementId (connected_id or key) or title
+    connected_id = item.get("connected_id") or (key if _looks_like_element_id(key) else None)
+    title = payload.get("title") or payload.get("r.title") or (payload.get("payload") or {}).get("title")
+    name = payload.get("name") or (payload.get("payload") or {}).get("name")
+    looked_up = _lookup_uuid_from_neo4j(
+        driver,
+        element_id=connected_id or (key if _looks_like_element_id(key) else None),
+        label=label,
+        title=title or (key if not _looks_like_element_id(key) else None),
+        name=name,
+        database=database,
+    )
+    if looked_up:
+        return looked_up
+    # Last resort: return uid (will be logged; frontend should handle invalid UUID)
+    logger.warning(
+        "Could not resolve UUID for item; node may lack id property",
+        extra={"key": key[:80], "title": (title or name or "")[:80]},
+    )
+    return uid
 
 
 def _merge_results_with_profile(
@@ -432,18 +593,26 @@ def _merge_results_with_profile(
     entities: dict[str, Any],
     profile: dict[str, Any],
     *,
+    driver: Driver,
+    database: str | None = None,
+    label: str = "Recipe",
     limit: int = 20,
 ) -> list[RecommendationResult]:
     """
     Build RecommendationResult list from raw fused RRF results for personalized endpoints.
     Used by /recommend/feed and /recommend/meal-candidates (bypasses OrchestratorResult).
+
+    Always returns results with PostgreSQL UUID. When UUID is not in payload,
+    performs Neo4j lookup by elementId or title. Never skips recipes.
     """
     out: list[RecommendationResult] = []
-    for item in fused[:limit]:
+    for item in fused:
+        if len(out) >= limit:
+            break
         payload = item.get("payload", {}) or {}
-        key     = item.get("key", "")
-        title   = item.get("title") or payload.get("title") or payload.get("name") or key
-        rec_id  = _resolve_id(payload, key)
+        key = item.get("key", "")
+        title = item.get("title") or payload.get("title") or payload.get("name") or key
+        rec_id = _resolve_id_with_lookup(payload, key, item, driver, label=label, database=database)
 
         out.append(
             RecommendationResult(
@@ -451,10 +620,10 @@ def _merge_results_with_profile(
                 score=float(item.get("rrf_score", 0.0)),
                 reasons=_build_reasons(item, entities, profile),
                 metadata={
-                    "title":     title,
-                    "label":     item.get("label", ""),
-                    "sources":   item.get("sources", []),
-                    "id_source": "uuid" if payload.get("id") else "title_key",
+                    "title": title,
+                    "label": item.get("label", ""),
+                    "sources": item.get("sources", []),
+                    "id_source": "uuid" if _is_uuid(rec_id) else "lookup",
                 },
             )
         )
@@ -463,27 +632,29 @@ def _merge_results_with_profile(
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def _merge_results(orch: OrchestratorResult, *, limit: int = 20) -> list[RecommendationResult]:
+def _merge_results(
+    orch: OrchestratorResult,
+    *,
+    driver: Driver,
+    database: str | None = None,
+    label: str = "Recipe",
+    limit: int = 20,
+) -> list[RecommendationResult]:
     """
     Merge fused RRF results into a ranked list for API response.
     Uses OrchestratorResult.fused_results (already RRF-fused by apply_rrf()).
 
-    ID resolution priority:
-      1. payload["id"]      — UUID written by fusion.py from r.id (Cypher results)
-      2. payload["r.id"]    — raw Cypher column fallback
-      3. key                — fusion key: UUID if Cypher ran, normalized title if semantic-only
-    The Express backend uses this ID to hydrate full recipe data from PostgreSQL.
-    When only semantic results are present (no Cypher match), the key is a normalized
-    title — Express should handle this as a title-based lookup until Cypher gaps are fixed.
+    Always returns PostgreSQL UUID. When not in payload, performs Neo4j lookup.
+    Never returns title or elementId as id.
     """
     fused = orch.fused_results[:limit]
     out: list[RecommendationResult] = []
 
     for item in fused:
         payload = item.get("payload", {}) or {}
-        key     = item.get("key", "")
-        title   = item.get("title") or payload.get("title") or payload.get("name") or key
-        rec_id  = _resolve_id(payload, key)
+        key = item.get("key", "")
+        title = item.get("title") or payload.get("title") or payload.get("name") or key
+        rec_id = _resolve_id_with_lookup(payload, key, item, driver, label=label, database=database)
 
         out.append(
             RecommendationResult(
@@ -491,10 +662,10 @@ def _merge_results(orch: OrchestratorResult, *, limit: int = 20) -> list[Recomme
                 score=float(item.get("rrf_score", 0.0)),
                 reasons=_build_reasons(item, orch.entities, profile=None),
                 metadata={
-                    "title":     title,
-                    "label":     item.get("label", ""),
-                    "sources":   item.get("sources", []),
-                    "id_source": "uuid" if payload.get("id") else "title_key",
+                    "title": title,
+                    "label": item.get("label", ""),
+                    "sources": item.get("sources", []),
+                    "id_source": "uuid" if _is_uuid(rec_id) else "lookup",
                 },
             )
         )
@@ -554,13 +725,23 @@ async def search_hybrid(req: SearchRequest):
         database=database,
     )
 
-    recommendations = _merge_results(result, limit=req.limit)
+    recommendations = _merge_results(
+        result,
+        driver=_driver,
+        database=database,
+        label="Recipe",
+        limit=req.limit,
+    )
+
+    zero_explanation = result.fallback_message if not recommendations else None
 
     return SearchResponse(
         results=recommendations,
         intent=result.intent,
         entities=result.entities,
         retrieval_time_ms=(time.time() - start) * 1000,
+        zero_results_explanation=zero_explanation,
+        confidence=result.confidence,
     )
 
 
@@ -658,18 +839,34 @@ async def recommend_feed(req: FeedRequest):
         max_items=req.limit,
     )
 
+    # ── Hard constraints: allergens/exclude_ingredient, course, calories ───
+    fused = apply_hard_constraints(
+        fused, entities, "find_recipe", _driver, database=database,
+    )
+
     # ── Post-filter: remove recipes eaten in the last 14 days ─────────────
     recent = {t.lower() for t in profile["recent_recipes"]}
     if recent:
         fused = [f for f in fused if (f.get("title") or "").lower() not in recent]
 
-    recommendations = _merge_results_with_profile(fused, entities, profile, limit=req.limit)
+    recommendations = _merge_results_with_profile(
+        fused, entities, profile,
+        driver=_driver,
+        database=database,
+        label="Recipe",
+        limit=req.limit,
+    )
+
+    zero_explanation = None
+    if not recommendations:
+        zero_explanation = build_zero_results_message(entities, "find_recipe")
 
     return SearchResponse(
         results=recommendations,
         intent="find_recipe",
         entities=entities,
         retrieval_time_ms=(time.time() - start) * 1000,
+        zero_results_explanation=zero_explanation,
     )
 
 
@@ -764,14 +961,19 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
         max_items=req.limit,
     )
 
+    # ── Hard constraints: allergens/exclude_ingredient, course, calories ───
+    fused = apply_hard_constraints(
+        fused, entities, "find_recipe", _driver, database=database,
+    )
+
     # ── Post-filter: exclude recently eaten + meal_history + exclude_ids ───
     exclude_ids = {rid.strip().lower() for rid in (req.meal_history or []) + (req.exclude_ids or []) if rid}
     recent_titles = {t.lower() for t in profile["recent_recipes"] or []}
 
     def _should_exclude(item: dict[str, Any]) -> bool:
-        payload = item.get("payload") or {}
+        payload = item.get("payload", {}) or {}
         key = item.get("key", "")
-        rec_id = _resolve_id(payload, key)
+        rec_id = _resolve_id_with_lookup(payload, key, item, _driver, label="Recipe", database=database)
         title = (payload.get("title") or payload.get("name") or key or "").lower()
         if rec_id and str(rec_id).lower() in exclude_ids:
             return True
@@ -782,7 +984,13 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
     fused = [f for f in fused if not _should_exclude(f)]
 
     # ── Map to MealCandidateItem format ────────────────────────────────────
-    recs = _merge_results_with_profile(fused, entities, profile, limit=req.limit)
+    recs = _merge_results_with_profile(
+        fused, entities, profile,
+        driver=_driver,
+        database=database,
+        label="Recipe",
+        limit=req.limit,
+    )
     candidates = [
         MealCandidateItem(
             recipe_id=r.id,
@@ -793,10 +1001,116 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
         for r in recs
     ]
 
+    zero_explanation = None
+    if not candidates:
+        zero_explanation = build_zero_results_message(entities, "find_recipe")
+
     return MealCandidateResponse(
         candidates=candidates,
         retrieval_time_ms=(time.time() - start) * 1000,
+        zero_results_explanation=zero_explanation,
     )
+
+
+@app.post("/substitutions/ingredient", response_model=IngredientSubstitutionResponse, dependencies=[Depends(verify_api_key)])
+async def substitutions_ingredient(req: IngredientSubstitutionRequest):
+    """
+    Get ingredient substitution suggestions.
+
+    Flow: Graph (CAN_SUBSTITUTE) → Semantic retrieval → Allergen filter → Diet filter
+    → Nutrition enrichment → LLM fallback if no candidates.
+    """
+    database = os.getenv("NEO4J_DATABASE")
+    result = run_ingredient_substitution(
+        _driver,
+        cfg=_cfg,
+        embedder=_embedder,
+        ingredient_id=req.ingredient_id,
+        ingredient_name=req.ingredient_name,
+        customer_allergens=req.customer_allergens or [],
+        customer_diets=req.customer_diets or [],
+        limit=req.limit,
+        database=database,
+        debug=req.debug,
+    )
+    substitutions = [
+        IngredientSubstitutionItem(
+            ingredient_id=s.get("ingredient_id", ""),
+            name=s.get("name", ""),
+            reason=s.get("reason", ""),
+            source=s.get("source", "unknown"),
+            nutritionComparison=s.get("nutritionComparison"),
+            allergenSafe=s.get("allergenSafe", True),
+        )
+        for s in result.get("substitutions", [])
+    ]
+    return IngredientSubstitutionResponse(
+        substitutions=substitutions,
+        debug_info=result.get("debug_info") if req.debug else None,
+    )
+
+
+@app.post("/recommend/products", response_model=ProductsResponse, dependencies=[Depends(verify_api_key)])
+async def recommend_products(req: ProductsRequest):
+    """
+    Match products to ingredients for grocery list (allergen-safe).
+    Returns empty when Product nodes or CONTAINS_INGREDIENT not available.
+    """
+    database = os.getenv("NEO4J_DATABASE")
+    result = run_recommend_products(
+        _driver,
+        ingredient_ids=req.ingredient_ids,
+        customer_allergens=req.customer_allergens or [],
+        database=database,
+    )
+    products = [
+        ProductMatchItem(
+            ingredient_id=p.get("ingredient_id", ""),
+            product_id=p.get("product_id", ""),
+            product_name=p.get("product_name", ""),
+            brand=p.get("brand", ""),
+            price=p.get("price"),
+            currency=p.get("currency", "USD"),
+            weight_g=p.get("weight_g"),
+            category=p.get("category", ""),
+            image_url=p.get("image_url", ""),
+            match_reason=p.get("match_reason", ""),
+        )
+        for p in result.get("products", [])
+    ]
+    return ProductsResponse(products=products)
+
+
+@app.post("/recommend/alternatives", response_model=AlternativesResponse, dependencies=[Depends(verify_api_key)])
+async def recommend_alternatives(req: AlternativesRequest):
+    """
+    Find alternative products for a scanned product (allergen-safe, cheaper).
+    Uses CAN_SUBSTITUTE or same-category fallback.
+    Returns empty when Product data not available.
+    """
+    database = os.getenv("NEO4J_DATABASE")
+    result = run_recommend_alternatives(
+        _driver,
+        product_id=req.product_id,
+        customer_allergens=req.customer_allergens or [],
+        limit=req.limit,
+        database=database,
+    )
+    alternatives = [
+        AlternativeItem(
+            product_id=a.get("product_id", ""),
+            name=a.get("name", ""),
+            brand=a.get("brand", ""),
+            price=a.get("price"),
+            image_url=a.get("image_url", ""),
+            reason=a.get("reason", ""),
+            savings=a.get("savings"),
+            allergen_safe=a.get("allergen_safe", True),
+            category=a.get("category", ""),
+        )
+        for a in result.get("alternatives", [])
+    ]
+    return AlternativesResponse(alternatives=alternatives)
 
 
 @app.post("/chat/process", response_model=ChatProcessResponse, dependencies=[Depends(verify_api_key)])
@@ -1002,7 +1316,13 @@ async def chat_process(req: ChatProcessRequest):
                 "recipes_for_cuisine",
                 "recipes_by_nutrient",
             ):
-                recs = _merge_results(orch_result, limit=5)
+                recs = _merge_results(
+                    orch_result,
+                    driver=_driver,
+                    database=database,
+                    label="Recipe",
+                    limit=5,
+                )
                 recipes_out = [
                     ChatRecipeItem(
                         id=r.id,
@@ -1023,6 +1343,7 @@ async def chat_process(req: ChatProcessRequest):
                 action_to_execute=None,
                 recipes=recipes_out,
                 nutrition_data=None,
+                confidence=orch_result.confidence,
             )
         except Exception as e:
             logger.exception("Chat retrieval/generation failed: %s", e)

@@ -1,0 +1,52 @@
+[
+    {
+        "category": "Recipe discovery (safety: allergen)",
+        "expected_intent": "find_recipe",
+        "query": "Nut-free recipes"
+    },
+    {
+        "category": "Recipe discovery (safety: allergen)",
+        "expected_intent": "find_recipe",
+        "query": "Shellfish-free recipes"
+    },
+    {
+        "category": "Recipe discovery (safety: diet)",
+        "expected_intent": "find_recipe",
+        "query": "Vegan dessert recipes"
+    },
+    {
+        "category": "Recipe discovery (safety: diet + course + calories)",
+        "expected_intent": "find_recipe",
+        "query": "vegan lunch under 600 cal"
+    },
+    {
+        "category": "Recipe discovery",
+        "expected_intent": "find_recipe",
+        "query": "High-protein breakfast"
+    },
+    {
+        "category": "Recipe discovery",
+        "expected_intent": "recipes_for_cuisine",
+        "query": "Italian pasta recipes"
+    },
+    {
+        "category": "Nutritional information",
+        "expected_intent": "get_nutritional_info",
+        "query": "How much protein in quinoa?"
+    },
+    {
+        "category": "Diet & compliance",
+        "expected_intent": "check_diet_compliance",
+        "query": "Is honey vegan?"
+    },
+    {
+        "category": "Allergen safety",
+        "expected_intent": "find_recipe",
+        "query": "Peanut-free dinner ideas"
+    },
+    {
+        "category": "Clarification & general",
+        "expected_intent": "out_of_scope",
+        "query": "Weather today"
+    }
+]

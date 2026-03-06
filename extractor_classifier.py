@@ -1,10 +1,15 @@
 import json
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
+
+from rag_pipeline.nlu.intents import VALID_INTENTS
 from openai import OpenAI
 
 try:
@@ -19,7 +24,10 @@ except ImportError:
 
 # ── Compact zero-shot prompt — used only when keyword filter returns None ──────
 # Stripped of all examples and verbose descriptions (~212 tokens vs ~1,497 before)
-SYSTEM_PROMPT = """NLU. Return JSON with exactly two keys: "intent" and "entities". No markdown, no extra text.
+SYSTEM_PROMPT = """NLU. Return JSON with keys: "intent", "entities", and "confidence". No markdown, no extra text.
+
+Required: "intent", "entities", "confidence" (0.0–1.0)
+confidence: 1.0 when very sure, 0.5–0.9 when somewhat unsure, <0.5 when guessing. Lower confidence for short/ambiguous queries (e.g. "recipes" alone, vague phrasing).
 
 INTENTS (pick one): find_recipe | find_recipe_by_pantry | similar_recipes | recipes_for_cuisine | recipes_by_nutrient | rank_results | get_nutritional_info | nutrient_in_foods | nutrient_category | compare_foods | check_diet_compliance | check_substitution | get_substitution_suggestion | similar_ingredients | ingredient_in_recipes | ingredient_nutrients | find_product | product_nutrients | cuisine_recipes | cuisine_hierarchy | cross_reactive_allergens | general_nutrition | out_of_scope | greeting | help | farewell | plan_meals | show_meal_plan | log_meal | meal_history | nutrition_summary | swap_meal | grocery_list | set_preference | dietary_advice
 
@@ -28,6 +36,12 @@ ENTITIES (only if present): include_ingredient[]|exclude_ingredient[]|diet[]|cou
 diet values: Vegan|Vegetarian|Gluten-Free|Keto|Paleo|Dairy-Free|Nut-Free|High-Protein|Low-Fat|Low-Carb
 course values: breakfast|lunch|dinner|dessert|appetizer|main_dish|side_dish|salad|soup|snack
 criterion values: protein_to_calorie_ratio|lowest_fat|lowest_calories"""
+
+
+def _keyword_result(intent: str, entities: dict[str, Any]) -> dict[str, Any]:
+    """Build keyword-extractor result with confidence 1.0 (rules are deterministic)."""
+    return {"intent": intent, "entities": entities, "confidence": 1.0}
+
 
 # ── Keyword lookup tables ──────────────────────────────────────────────────────
 
@@ -134,6 +148,7 @@ _COURSE_MAP: dict[str, str] = {
     "lunch": "lunch",
     "dinner": "dinner",
     "dessert": "dessert",
+    "desserts": "dessert",
     "snack": "snack",
     "snacks": "snack",
     "appetizer": "appetizer",
@@ -260,27 +275,27 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
     )
     if sim_recipe_early:
         ref = sim_recipe_early.group(1).strip()
-        return {"intent": "similar_recipes", "entities": {"recipe_reference": ref}}
+        return _keyword_result("similar_recipes", {"recipe_reference": ref})
 
     sim_ingr_early = re.search(
         r"(?:ingredients?\s+like\s+|similar\s+ingredients?\s+to\s+)(.+?)(?:\?|$)", q
     )
     if sim_ingr_early:
         ingr = sim_ingr_early.group(1).strip()
-        return {"intent": "similar_ingredients", "entities": {"ingredient": ingr}}
+        return _keyword_result("similar_ingredients", {"ingredient": ingr})
 
     # ── out_of_scope: no food/nutrition words at all ───────────────────────────
     if not words & _FOOD_WORDS:
-        return {"intent": "out_of_scope", "entities": {}}
+        return _keyword_result("out_of_scope", {})
 
     # ── cross_reactive_allergens ───────────────────────────────────────────────
     if "cross-reactive" in q or "cross reactive" in q or "cross-reactivity" in q:
         allergen = _extract_after(q, ["cross-reactive with", "cross reactive with",
                                       "cross-reactivity with", "reactive with"])
-        entities: dict[str, Any] = {}
+        entities = {}
         if allergen:
             entities["allergen"] = allergen
-        return {"intent": "cross_reactive_allergens", "entities": entities}
+        return _keyword_result("cross_reactive_allergens", entities)
 
     # ── rank_results ───────────────────────────────────────────────────────────
     if re.search(r"\b(rank|sort|order)\s+by\b", q):
@@ -294,7 +309,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         entities = {}
         if criterion:
             entities["criterion"] = criterion
-        return {"intent": "rank_results", "entities": entities}
+        return _keyword_result("rank_results", entities)
 
     # ── cuisine_hierarchy ──────────────────────────────────────────────────────
     if re.search(r"\b(types?|subtypes?|kinds?|categories|taxonomy|hierarchy)\s+of\b.*(cuisine|food)", q) \
@@ -303,7 +318,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         entities = {}
         if cuisine:
             entities["cuisine"] = cuisine
-        return {"intent": "cuisine_hierarchy", "entities": entities}
+        return _keyword_result("cuisine_hierarchy", entities)
 
     # ── compare_foods ──────────────────────────────────────────────────────────
     # "X vs Y" — stop before nutrition/protein/carb/? to avoid capturing trailing words
@@ -330,7 +345,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
                         break
             if nutrient:
                 entities["nutrient"] = nutrient
-            return {"intent": "compare_foods", "entities": entities}
+            return _keyword_result("compare_foods", entities)
 
     # ── check_substitution: "can I substitute X with Y" / "use X instead of Y" ─
     sub_with = re.search(
@@ -347,10 +362,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
             orig = instead_of.group(2).strip()
             # Strip leading "use " if present
             sub = re.sub(r"^use\s+", "", sub).strip()
-        return {
-            "intent": "check_substitution",
-            "entities": {"original_ingredient": orig, "substitute_ingredient": sub},
-        }
+        return _keyword_result("check_substitution", {"original_ingredient": orig, "substitute_ingredient": sub})
 
     # ── get_substitution_suggestion: "alternatives to X" / "what can I replace X with" ─
     alt_match = re.search(
@@ -364,7 +376,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         diets = _extract_diets(q)
         if diets:
             entities["diet"] = diets
-        return {"intent": "get_substitution_suggestion", "entities": entities}
+        return _keyword_result("get_substitution_suggestion", entities)
 
     # ── check_diet_compliance: "is X vegan/keto/..." / "can vegans eat X" ──────
     compliance_match = re.search(
@@ -386,7 +398,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
             entities["ingredient"] = ingredient
         if diets:
             entities["diet"] = diets
-        return {"intent": "check_diet_compliance", "entities": entities}
+        return _keyword_result("check_diet_compliance", entities)
 
     # ── find_recipe_by_pantry: "I have X,Y,Z what can I cook/make" ────────────
     pantry_match = re.search(
@@ -401,7 +413,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         # Split on commas, "and", "or"
         items = [i.strip() for i in re.split(r",\s*|\s+and\s+|\s+or\s+", raw) if i.strip()]
         if len(items) >= 2:
-            return {"intent": "find_recipe_by_pantry", "entities": {"pantry_ingredients": items}}
+            return _keyword_result("find_recipe_by_pantry", {"pantry_ingredients": items})
 
     # ── similar_ingredients: "alternatives to X" (ingredient context) ────────
     # Note: "recipes like X" / "something like X" already handled before out_of_scope check.
@@ -410,11 +422,11 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
     )
     if sim_ingr:
         ingr = sim_ingr.group(1).strip()
-        return {"intent": "similar_ingredients", "entities": {"ingredient": ingr}}
+        return _keyword_result("similar_ingredients", {"ingredient": ingr})
 
     # ── nutrient_category: "types of vitamins/minerals/macronutrients" ─────────
     if re.search(r"\b(macronutrients?|micronutrients?|nutrient\s+categor|types?\s+of\s+(?:vitamins?|minerals?|nutrients?)|what\s+are\s+(?:vitamins?|minerals?|macronutrients?|micronutrients?))\b", q):
-        return {"intent": "nutrient_category", "entities": {}}
+        return _keyword_result("nutrient_category", {})
 
     # ── nutrient_in_foods: "foods high/rich in X" / "sources of X" ────────────
     nutrient_in_foods = re.search(
@@ -424,7 +436,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
     if nutrient_in_foods:
         nword = nutrient_in_foods.group(1).strip()
         nutrient = _NUTRIENT_MAP.get(nword, nword)
-        return {"intent": "nutrient_in_foods", "entities": {"nutrient": nutrient}}
+        return _keyword_result("nutrient_in_foods", {"nutrient": nutrient})
 
     # ── get_nutritional_info: "how much X in Y" / "calories in X" / "nutrition of X" ─
     how_much = re.search(
@@ -440,10 +452,10 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         entities = {"ingredient": ingredient}
         if nutrient:
             entities["nutrient"] = nutrient
-        return {"intent": "get_nutritional_info", "entities": entities}
+        return _keyword_result("get_nutritional_info", entities)
     if calories_in:
         ingredient = calories_in.group(1).strip()
-        return {"intent": "get_nutritional_info", "entities": {"ingredient": ingredient}}
+        return _keyword_result("get_nutritional_info", {"ingredient": ingredient})
     if x_content:
         nword = x_content.group(1).strip()
         ingredient = x_content.group(2).strip()
@@ -451,7 +463,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         entities = {"ingredient": ingredient}
         if nutrient:
             entities["nutrient"] = nutrient
-        return {"intent": "get_nutritional_info", "entities": entities}
+        return _keyword_result("get_nutritional_info", entities)
 
     # ── ingredient_nutrients: "nutrients in X" / "what nutrients does X have" ──
     ingr_nutrients = re.search(
@@ -460,7 +472,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
     )
     if ingr_nutrients:
         ingredient = ingr_nutrients.group(1).strip()
-        return {"intent": "ingredient_nutrients", "entities": {"ingredient": ingredient}}
+        return _keyword_result("ingredient_nutrients", {"ingredient": ingredient})
 
     # ── product_nutrients: "nutrition in <product>" when product type word present ─
     prod_nutrition = re.search(
@@ -469,7 +481,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
     if prod_nutrition:
         candidate = prod_nutrition.group(1).strip()
         if any(pt in candidate for pt in _PRODUCT_TYPES):
-            return {"intent": "product_nutrients", "entities": {"product": candidate}}
+            return _keyword_result("product_nutrients", {"product": candidate})
 
     # ── ingredient_in_recipes: "recipes with/containing/using X" ──────────────
     ingr_in_recipe = re.search(
@@ -480,7 +492,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         ingredient = ingr_in_recipe.group(1).strip()
         # Exclude if it looks like a diet/course modifier (those go to find_recipe)
         if ingredient not in _DIET_MAP and ingredient not in _COURSE_MAP:
-            return {"intent": "ingredient_in_recipes", "entities": {"ingredient": ingredient}}
+            return _keyword_result("ingredient_in_recipes", {"ingredient": ingredient})
 
     # ── find_product: diet modifier + product type word, but NOT when recipe triggers present ─
     # e.g. "gluten-free bread" → find_product, but "gluten-free pasta dishes" → find_recipe
@@ -488,7 +500,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
     if diets and words & _PRODUCT_TYPES and not (words & _RECIPE_TRIGGERS):
         product_word = next(w for w in words if w in _PRODUCT_TYPES)
         product = f"{' '.join(d.lower() for d in diets)} {product_word}".strip()
-        return {"intent": "find_product", "entities": {"product": product, "diet": diets}}
+        return _keyword_result("find_product", {"product": product, "diet": diets})
 
     # ── recipes_for_cuisine / cuisine_recipes ──────────────────────────────────
     cuisine = _extract_cuisine(q)
@@ -498,7 +510,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         include = _extract_include_ingredients(q, exclude_words={cuisine.lower()})
         if include:
             entities["include_ingredient"] = include
-        return {"intent": "recipes_for_cuisine", "entities": entities}
+        return _keyword_result("recipes_for_cuisine", entities)
 
     # ── general_nutrition: "what is X" / "explain X" / "define X" ─────────────
     # Only when X is a nutrition concept, not a food item
@@ -513,7 +525,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
             "omega 3", "cholesterol", "saturated fat", "trans fat", "sodium",
         }
         if concept in nutrition_concepts or any(nc in concept for nc in nutrition_concepts):
-            return {"intent": "general_nutrition", "entities": {"nutrient": concept}}
+            return _keyword_result("general_nutrition", {"nutrient": concept})
 
     # ── recipes_by_nutrient: "high-protein recipes" / "low-fat dinner" ─────────
     # Fires when the primary signal is a nutrient modifier (high/low + nutrient)
@@ -550,7 +562,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
                 entities["course"] = course
             if non_nutrient_diets:
                 entities["diet"] = non_nutrient_diets
-            return {"intent": "recipes_by_nutrient", "entities": entities}
+            return _keyword_result("recipes_by_nutrient", entities)
 
     # ── find_recipe: diet and/or course keyword + recipe trigger ──────────────
     # Only fire when we have at least one clear signal (diet OR course OR health condition)
@@ -561,28 +573,32 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
     all_diets = diets + [d for d in health_diets if d not in diets]
     course = _extract_course(q)
     has_recipe_trigger = bool(words & _RECIPE_TRIGGERS)
+    exclude_ingredients = _extract_exclude_ingredients(q)
     has_food_context = any(w in q for w in ["recipe", "recipes", "meal", "meals", "dish", "dishes",
                                              "food", "foods", "dinner", "lunch", "breakfast",
+                                             "dessert", "desserts", "appetizer", "soup", "salad",
                                              "snack", "cook", "make", "prepare", "eat", "eating",
                                              "healthy", "ideas", "patient", "patients"])
 
-    # Health condition with no diet mapping → let LLM handle it
+    # Health condition with no diet mapping → let LLM handle it (unless we extracted exclude_ingredient)
     has_health_word = bool(words & _HEALTH_WORDS)
-    health_maps_empty = has_health_word and health_diets == [] and not diets
+    health_maps_empty = has_health_word and health_diets == [] and not diets and not exclude_ingredients
 
     if health_maps_empty:
         return None  # e.g. "food allergy" or "oral allergy" — LLM handles specifics
 
-    if (all_diets or course) and (has_recipe_trigger or has_food_context):
+    if (all_diets or course or exclude_ingredients) and (has_recipe_trigger or has_food_context):
         entities = {}
         if all_diets:
             entities["diet"] = all_diets
         if course:
             entities["course"] = course
+        if exclude_ingredients:
+            entities["exclude_ingredient"] = exclude_ingredients
         include = _extract_include_ingredients(q)
         if include:
             entities["include_ingredient"] = include
-        return {"intent": "find_recipe", "entities": entities}
+        return _keyword_result("find_recipe", entities)
 
     # ── Ambiguous / complex → fall through to LLM ─────────────────────────────
     return None
@@ -624,6 +640,75 @@ def _extract_after(q: str, phrases: list[str]) -> str | None:
             if rest:
                 return rest.split()[0] if " " in rest else rest
     return None
+
+
+def _extract_exclude_ingredients(q: str) -> list[str]:
+    """
+    Extract ingredients to exclude (allergens, avoidances) from patterns like:
+    - "without strawberries", "without X and Y"
+    - "no nuts", "no X or Y"
+    - "avoid dairy", "avoid X"
+    - "allergic to peanuts", "allergy to X"
+    - "don't want strawberries"
+    - "free of nuts" (but not diet labels like nut-free, gluten-free)
+    - "excluding X"
+    Returns a deduplicated list of ingredient names.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _add(ing: str) -> None:
+        ing = ing.strip().rstrip(".,?!")
+        if ing and len(ing) > 1 and ing not in seen:
+            # Skip diet labels (nut-free, gluten-free are diets, not ingredient exclusions)
+            if ing in _DIET_MAP or ing.replace("-", " ") in _DIET_MAP:
+                return
+            seen.add(ing)
+            found.append(ing)
+
+    # "without X" / "without X and Y"
+    for m in re.finditer(r"\bwithout\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
+        _add(m.group(1))
+        if m.group(2):
+            _add(m.group(2))
+
+    # "no X" / "no X or Y"
+    for m in re.finditer(r"\bno\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
+        _add(m.group(1))
+        if m.group(2):
+            _add(m.group(2))
+
+    # "avoid X"
+    for m in re.finditer(r"\bavoid(?:ing)?\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
+        _add(m.group(1))
+        if m.group(2):
+            _add(m.group(2))
+
+    # "allergic to X" / "allergy to X"
+    for m in re.finditer(r"\ballerg(?:ic|y)\s+to\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
+        _add(m.group(1))
+        if m.group(2):
+            _add(m.group(2))
+
+    # "don't want X" / "do not want X"
+    for m in re.finditer(r"\b(?:don't|dont|do\s+not)\s+want\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
+        _add(m.group(1))
+        if m.group(2):
+            _add(m.group(2))
+
+    # "free of X" (but not "nut-free", "gluten-free" which are diets)
+    for m in re.finditer(r"\bfree\s+of\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
+        _add(m.group(1))
+        if m.group(2):
+            _add(m.group(2))
+
+    # "excluding X"
+    for m in re.finditer(r"\bexcluding\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
+        _add(m.group(1))
+        if m.group(2):
+            _add(m.group(2))
+
+    return found
 
 
 def _extract_include_ingredients(q: str, exclude_words: set[str] | None = None) -> list[str]:
@@ -850,46 +935,8 @@ def sanity_check(output_json):
     if not isinstance(output_json["intent"], str):
         return False, "Intent is not a string"
 
-    valid_intents = {
-        "find_recipe",
-        "find_recipe_by_pantry",
-        "similar_recipes",
-        "recipes_for_cuisine",
-        "recipes_by_nutrient",
-        "rank_results",
-        "get_nutritional_info",
-        "nutrient_in_foods",
-        "nutrient_category",
-        "compare_foods",
-        "check_diet_compliance",
-        "check_substitution",
-        "get_substitution_suggestion",
-        "similar_ingredients",
-        "ingredient_in_recipes",
-        "ingredient_nutrients",
-        "find_product",
-        "product_nutrients",
-        "cuisine_recipes",
-        "cuisine_hierarchy",
-        "cross_reactive_allergens",
-        "general_nutrition",
-        "out_of_scope",
-        # Chatbot intents (PRD-16)
-        "greeting",
-        "help",
-        "farewell",
-        "plan_meals",
-        "show_meal_plan",
-        "log_meal",
-        "meal_history",
-        "nutrition_summary",
-        "swap_meal",
-        "grocery_list",
-        "set_preference",
-        "dietary_advice",
-    }
-    if output_json["intent"] not in valid_intents:
-        return False, f"Unknown intent: '{output_json['intent']}'. Valid: {sorted(valid_intents)}"
+    if output_json["intent"] not in VALID_INTENTS:
+        return False, f"Unknown intent: '{output_json['intent']}'. Valid: {sorted(VALID_INTENTS)}"
 
     if not isinstance(output_json["entities"], dict):
         return False, "Entities is not a dictionary"
@@ -922,6 +969,16 @@ def sanity_check(output_json):
         foods = entities.get("ingredients", [])
         if not isinstance(foods, list) or len(foods) < 2:
             return False, "compare_foods requires at least 2 items in 'ingredients'"
+
+    # --- Step 7: optional confidence validation (warn and strip if invalid, don't fail) ---
+    conf = output_json.get("confidence")
+    if conf is not None:
+        if not isinstance(conf, (int, float)):
+            logger.warning("sanity_check: confidence must be a number, ignoring value %r", conf)
+            output_json.pop("confidence", None)
+        elif not (0 <= conf <= 1):
+            logger.warning("sanity_check: confidence must be 0–1, ignoring value %r", conf)
+            output_json.pop("confidence", None)
 
     return True
 

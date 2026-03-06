@@ -148,10 +148,12 @@ intent_extraction:
   on_parse_failure: abort
   fallback_intent: find_recipe
   fallback_entities: {}
+  # When confidence < threshold, use fallback_intent and fallback_entities (0.0–1.0)
+  confidence_threshold: 0.7
   max_retries: 1
-  retry_user_message: "Return only valid JSON with keys 'intent' and 'entities'. No markdown."
-  # Entity heuristics: add missing entities from query keywords (set entity_enrichment_enabled: true to use)
-  entity_enrichment_enabled: false
+  retry_user_message: "Return only valid JSON with keys 'intent', 'entities', and 'confidence' (0–1, required). No markdown."
+  # Entity heuristics: add missing entities from query keywords (exclude_ingredient, diet, course)
+  entity_enrichment_enabled: true
   entity_fallbacks:
     diet_keywords:
       gluten-free: [Gluten-Free]
