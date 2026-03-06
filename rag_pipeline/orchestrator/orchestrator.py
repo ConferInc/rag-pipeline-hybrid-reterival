@@ -23,6 +23,7 @@ from rag_pipeline.embeddings.base import QueryEmbedder
 from rag_pipeline.orchestrator.constraint_filter import apply_hard_constraints, build_zero_results_message
 from rag_pipeline.orchestrator.cypher_runner import run_cypher_retrieval
 from rag_pipeline.orchestrator.entity_enrichment import enrich_entities
+from rag_pipeline.orchestrator.entity_validation import validate_entity_compatibility
 from rag_pipeline.orchestrator.profile_enrichment import merge_profile_into_entities
 from rag_pipeline.retrieval.service import SemanticRetrievalRequest, retrieve_semantic
 from rag_pipeline.retrieval.structural import (
@@ -49,15 +50,23 @@ def _run_semantic(
     semantic_min_score: float,
     database: str | None,
     config_path: str,
+    confidence: float | None = None,
 ) -> list[Any]:
     """Run semantic retrieval (sync worker for asyncio.to_thread)."""
     semantic_label = intent_semantic_labels.get(intent, "Recipe")
-    broaden = intent_cfg.get("broaden_on_low_confidence", False)
+    broaden_on_low = intent_cfg.get("broaden_on_low_confidence", False)
     broaden_max_words = intent_cfg.get("broaden_max_word_count", 3)
+    confidence_threshold = intent_cfg.get("confidence_threshold", 0.7)
     broaden_labels_list: list[str] = intent_cfg.get("broaden_labels") or ["Recipe", "Ingredient"]
 
+    # Step 6: Broaden when low confidence OR (no confidence and short query)
+    broaden = broaden_on_low and (
+        (confidence is not None and confidence < confidence_threshold)
+        or (confidence is None and len(user_query.split()) <= broaden_max_words)
+    )
+
     labels_to_search: list[str]
-    if broaden and len(user_query.split()) <= broaden_max_words:
+    if broaden:
         labels_to_search = broaden_labels_list if broaden_labels_list else [semantic_label]
     else:
         labels_to_search = [semantic_label]
@@ -165,6 +174,8 @@ class OrchestratorResult:
     # The prompt builder injects this as [NO RESULTS] so the LLM explains
     # why nothing was found and suggests what to relax.
     fallback_message: str | None = None
+    # Intent extraction confidence (0–1). 1.0 for keyword rules, LLM may return lower.
+    confidence: float | None = None
 
 
 async def orchestrate(
@@ -257,6 +268,26 @@ async def orchestrate(
                 return result
             result.intent = parsed["intent"]
             result.entities = parsed["entities"]
+            result.confidence = parsed.get("confidence")
+            if result.confidence is None:
+                result.confidence = 0.5  # LLM omitted confidence — assume uncertain
+
+            # Step 4: If confidence < threshold, use fallback intent/entities
+            confidence_threshold = intent_cfg.get("confidence_threshold", 0.7)
+            conf = result.confidence
+            if conf is not None and conf < confidence_threshold:
+                result.intent = intent_cfg.get("fallback_intent", "find_recipe")
+                result.entities = dict(intent_cfg.get("fallback_entities", {}))
+                logger.info(
+                    "Low confidence, using fallback intent",
+                    extra={
+                        "component": "orchestrator",
+                        "query": query_truncated,
+                        "confidence": conf,
+                        "threshold": confidence_threshold,
+                        "fallback_intent": result.intent,
+                    },
+                )
 
         # Entity enrichment: add missing diet/course from query keywords (when enabled)
         result.entities = enrich_entities(user_query, result.entities, intent_cfg)
@@ -277,6 +308,9 @@ async def orchestrate(
                     "profile_conditions": customer_profile.get("health_conditions"),
                 },
             )
+
+        # Entity validation: strip include_ingredient items that conflict with diet
+        result.entities = validate_entity_compatibility(result.entities)
 
         t_extract_ms = (time.perf_counter() - t_extract) * 1000
         entity_keys = list(result.entities.keys()) if result.entities else []
@@ -356,6 +390,7 @@ async def orchestrate(
         semantic_min_score,
         database,
         config_path,
+        result.confidence,
     )
     structural_task = (
         _empty_structural()

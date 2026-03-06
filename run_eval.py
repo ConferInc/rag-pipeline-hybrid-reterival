@@ -18,6 +18,7 @@ from rag_pipeline.generation.generator import generate_response
 
 # Import our LLM Judge helper
 from eval_llm_judge import evaluate_generation_llm_judge
+from rag_pipeline.orchestrator.constraint_filter import check_safety_compliance
 
 def run_evaluation(queries_file: str, output_file: str):
     """
@@ -125,7 +126,18 @@ def run_evaluation(queries_file: str, output_file: str):
                     )
                 else:
                     evaluate_scores = {"relevance": 0.0, "faithfulness": 0.0}
-                    
+
+                # Step E: Safety compliance (allergens, diet, course, calories)
+                safety_result = check_safety_compliance(
+                    orch_result.fused_results,
+                    orch_result.entities,
+                    orch_result.intent,
+                    driver,
+                    database=neo_settings.database,
+                )
+                safety_score = safety_result["score"]
+                safety_violations = safety_result.get("violations", [])
+
                 # Record
                 record = {
                     "query": query,
@@ -135,18 +147,26 @@ def run_evaluation(queries_file: str, output_file: str):
                     "context_items_count": len(retrieved_context),
                     "generated_response": generated_response,
                     "evaluation_scores": evaluate_scores,
+                    "safety_compliance_score": safety_score,
+                    "safety_violations": safety_violations,
                     "pipeline_errors": orch_result.errors
                 }
-                
+
                 # Optionally print immediate results
-                print(f"   => Rel: {evaluate_scores.get('relevance', 0.0):.2f} | Faith: {evaluate_scores.get('faithfulness', 0.0):.2f} | Intent: {orch_result.intent}")
+                print(
+                    f"   => Rel: {evaluate_scores.get('relevance', 0.0):.2f} | "
+                    f"Faith: {evaluate_scores.get('faithfulness', 0.0):.2f} | "
+                    f"Safety: {safety_score:.2f} | Intent: {orch_result.intent}"
+                )
 
             except Exception as e:
                 print(f"   => Pipeline failed for query '{query}': {e}")
                 record = {
                     "query": query,
                     "expected_intent": expected_intent,
-                    "error": str(e)
+                    "error": str(e),
+                    "safety_compliance_score": None,
+                    "safety_violations": [],
                 }
                 
             results.append(record)
@@ -165,8 +185,12 @@ def run_evaluation(queries_file: str, output_file: str):
     if valid_results:
         avg_rel = sum(r["evaluation_scores"].get("relevance", 0.0) for r in valid_results) / len(valid_results)
         avg_faith = sum(r["evaluation_scores"].get("faithfulness", 0.0) for r in valid_results) / len(valid_results)
+        safety_scores = [r["safety_compliance_score"] for r in results if r.get("safety_compliance_score") is not None]
+        avg_safety = sum(safety_scores) / len(safety_scores) if safety_scores else None
         print(f"Overall Relevance Average: {avg_rel:.2f}")
         print(f"Overall Faithfulness Average: {avg_faith:.2f}")
+        if avg_safety is not None:
+            print(f"Overall Safety Compliance Average: {avg_safety:.2f}")
 
 
 if __name__ == "__main__":

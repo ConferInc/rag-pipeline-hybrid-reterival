@@ -8,9 +8,19 @@ using normalized title as the fusion key.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _is_uuid(val: Any) -> bool:
+    """Return True if val looks like a UUID."""
+    if not val or not isinstance(val, str):
+        return False
+    return bool(
+        re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", val.lower())
+    )
 
 
 def _normalize_title(value: Any) -> str:
@@ -22,23 +32,33 @@ def _normalize_title(value: Any) -> str:
 
 
 def _get_key_from_semantic(r: Any) -> str | None:
-    """Extract normalized title from semantic RetrievalResult."""
+    """
+    Extract fusion key from semantic RetrievalResult.
+    Prefers PostgreSQL UUID (id) when available; falls back to title/name for dedup.
+    """
     payload = getattr(r, "payload", {}) or {}
+    uid = payload.get("id") or payload.get("r.id")
+    if uid and _is_uuid(str(uid)):
+        return str(uid)
     key = _normalize_title(payload.get("title") or payload.get("name") or payload.get("code"))
     return key if key else None
 
 
 def _get_key_from_structural(item: dict[str, Any]) -> str | None:
-    """Extract normalized title from structural expanded_context item."""
+    """
+    Extract fusion key from structural expanded_context item.
+    Prefers PostgreSQL UUID (id) when available; never uses elementId as key.
+    Falls back to title/name only when no UUID.
+    """
     payload = item.get("payload", {}) or {}
+    uid = payload.get("id") or payload.get("r.id")
+    if uid and _is_uuid(str(uid)):
+        return str(uid)
     key = _normalize_title(
         payload.get("title") or payload.get("name") or payload.get("code")
         or item.get("title") or item.get("name") or item.get("code")
     )
-    if key:
-        return key
-    cid = item.get("connected_id")
-    return _normalize_title(cid) if cid else None
+    return key if key else None
 
 
 def _get_key_from_cypher(row: dict[str, Any], intent: str) -> str | None:
