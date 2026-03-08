@@ -150,7 +150,7 @@ class FeedRequest(BaseModel):
     """Personalized recipe feed — no user query needed, driven by customer profile."""
     customer_id: str = Field(..., description="B2C customer UUID (required for personalization)")
     meal_type: str | None = Field(None, description="Optional meal type hint: breakfast/lunch/dinner/snack")
-    limit: int = Field(20, ge=1, le=50)
+    limit: int = Field(50, ge=1, le=50)
 
 
 class MealCandidateRequest(BaseModel):
