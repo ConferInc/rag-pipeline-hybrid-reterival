@@ -134,26 +134,40 @@ def _build_find_recipe(entities: dict) -> tuple[str, dict]:
             "EXISTS { "
             "MATCH (r)-[:HAS_NUTRITION]->(rnv_cal:NutritionValue)"
             "-[:OF_NUTRIENT]->(nd_cal:NutrientDefinition) "
-            "WHERE nd_cal.nutrient_name = 'Energy' "
+            "WHERE nd_cal.nutrient_name IN ['Energy', 'Calories/Energy'] "
             "AND rnv_cal.amount <= $cal_upper_limit }"
         )
         params["cal_upper_limit"] = cal_limit
 
-    # ── Nutrient threshold — via NutritionValue ───────────────────────────────
+    # ── Nutrient threshold — percent_calories_* for protein/fat/carbs ─────────
+    # Extractor passes percentage values; Recipe has percent_calories_protein/fat/carbs.
     threshold = entities.get("nutrient_threshold")
     if threshold and isinstance(threshold, dict):
-        nutrient = threshold.get("nutrient", "Protein")
+        nutrient = (threshold.get("nutrient") or "Protein").lower()
         op_sym = _op(threshold.get("operator", "gt"))
         value = threshold.get("value", 0)
-        where_parts.append(
-            "EXISTS { "
-            "MATCH (r)-[:HAS_NUTRITION]->(rnv_nt:NutritionValue)"
-            "-[:OF_NUTRIENT]->(nd_nt:NutrientDefinition) "
-            "WHERE nd_nt.nutrient_name = $threshold_nutrient "
-            f"AND rnv_nt.amount {op_sym} $threshold_value }}"
-        )
-        params["threshold_nutrient"] = nutrient
-        params["threshold_value"] = value
+        if "protein" in nutrient:
+            prop = "r.percent_calories_protein"
+        elif "fat" in nutrient:
+            prop = "r.percent_calories_fat"
+        elif "carb" in nutrient:
+            prop = "r.percent_calories_carbs"
+        else:
+            # Fiber, sodium, etc.: use HAS_NUTRITION (grams/mg)
+            prop = None
+        if prop:
+            where_parts.append(f"{prop} IS NOT NULL AND {prop} {op_sym} $threshold_value")
+            params["threshold_value"] = value
+        else:
+            where_parts.append(
+                "EXISTS { "
+                "MATCH (r)-[:HAS_NUTRITION]->(rnv_nt:NutritionValue)"
+                "-[:OF_NUTRIENT]->(nd_nt:NutrientDefinition) "
+                "WHERE nd_nt.nutrient_name = $threshold_nutrient "
+                f"AND rnv_nt.amount {op_sym} $threshold_value }}"
+            )
+            params["threshold_nutrient"] = threshold.get("nutrient", "Protein")
+            params["threshold_value"] = value
 
     # ── Assemble WHERE ────────────────────────────────────────────────────────
     if where_parts:
@@ -325,8 +339,8 @@ def _build_check_diet_compliance(entities: dict) -> tuple[str, dict]:
     diet        List[str]  – Dietary_Preferences.name (first entry used)
 
     Graph relationships used:
-      (Dietary_Preferences) -[:FORBIDS]-> (Ingredient)
-      (Dietary_Preferences) -[:ALLOWS]->  (Ingredient)
+      (Dietary_Preferences) -[:FORBIDDEN]-> (Ingredient)
+      (Dietary_Preferences) -[:ALLOWS]->   (Ingredient)  # if present
     """
     ingredient = entities.get("ingredient", "")
     diets = entities.get("diet", [])
@@ -338,7 +352,7 @@ def _build_check_diet_compliance(entities: dict) -> tuple[str, dict]:
             "MATCH (ing:Ingredient)\n"
             "WHERE toLower(ing.name) = toLower($ingredient_name)\n"
             "MATCH (diet:Dietary_Preferences {name: $diet_name})\n"
-            "OPTIONAL MATCH (diet)-[forbidden:FORBIDS]->(ing)\n"
+            "OPTIONAL MATCH (diet)-[forbidden:FORBIDDEN]->(ing)\n"
             "OPTIONAL MATCH (diet)-[allowed:ALLOWS]->(ing)\n"
             "RETURN\n"
             "  ing.name AS ingredient,\n"
@@ -404,8 +418,8 @@ def _build_get_substitution_suggestion(entities: dict) -> tuple[str, dict]:
     diet        List[str]  – optional diet context (first entry used)
 
     Graph relationships:
-      (Ingredient) -[:SUBSTITUTE_FOR]->    (Ingredient)
-      (Dietary_Preferences) -[:FORBIDS]->  (Ingredient)
+      (Ingredient) -[:SUBSTITUTE_FOR]->     (Ingredient)
+      (Dietary_Preferences) -[:FORBIDDEN]-> (Ingredient)
     """
     ingredient = entities.get("ingredient", "")
     diets = entities.get("diet", [])
@@ -422,7 +436,7 @@ def _build_get_substitution_suggestion(entities: dict) -> tuple[str, dict]:
         cypher_lines.extend([
             "MATCH (diet:Dietary_Preferences {name: $diet_context})",
             "WHERE NOT EXISTS {",
-            "  MATCH (diet)-[:FORBIDS]->(candidate)",
+            "  MATCH (diet)-[:FORBIDDEN]->(candidate)",
             "}",
         ])
         params["diet_context"] = diet_context
@@ -465,7 +479,8 @@ def _build_rank_results(entities: dict) -> tuple[str, dict]:
             "MATCH (r:Recipe)\n"
             "WHERE r.id IN $recipe_ids\n"
             "MATCH (r)-[:HAS_NUTRITION]->(rnv:NutritionValue)"
-            "-[:OF_NUTRIENT]->(nd:NutrientDefinition {nutrient_name: 'Energy'})\n"
+            "-[:OF_NUTRIENT]->(nd:NutrientDefinition)\n"
+            "WHERE nd.nutrient_name IN ['Energy', 'Calories/Energy']\n"
             "RETURN r.id, r.title, rnv.amount AS calories, rnv.unit\n"
             "ORDER BY calories ASC"
         )

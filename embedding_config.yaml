@@ -1,6 +1,43 @@
 # Config for embedding generation (initial setup + ongoing)
 # Used by GraphSAGE training and semantic embedding workers
 
+# Neo4j schema (actual nodes and relationships in database) — used for reference
+# Recipe calories: (Recipe)-[:HAS_NUTRITION]->(NutritionValue)-[:OF_NUTRIENT]->(NutrientDefinition {nutrient_name: 'Calories/Energy'})
+# Diet compliance: (Dietary_Preferences)-[:FORBIDDEN]->(Ingredient)
+neo4j_schema:
+  node_labels:
+    - Recipe
+    - Ingredient
+    - NutritionValue
+    - NutrientDefinition
+    - Cuisine
+    - Product
+    - B2C_Customer
+    - Dietary_Preferences
+    - Allergens
+    - B2C_Customer_Health_Conditions
+    - B2C_Customer_Health_Profiles
+    - Household
+    - MealLog
+    - MealLogItem
+    - MealPlan
+    - MealPlanItem
+  relationship_types:
+    - HAS_NUTRITION       # Recipe->NutritionValue, Ingredient->NutritionValue
+    - OF_NUTRIENT         # NutritionValue->NutrientDefinition
+    - USES_INGREDIENT     # Recipe->Ingredient
+    - FORBIDDEN           # Dietary_Preferences->Ingredient (diet compliance)
+    - FOLLOWS_DIET        # B2C_Customer->Dietary_Preferences
+    - IS_ALLERGIC         # B2C_Customer->Allergens
+    - HAS_PROFILE
+    - HAS_CONDITION
+    - BELONGS_TO
+    - VIEWED
+    - SAVED
+    - RATED
+    - BELONGS_TO_CUSINE
+    - CONTAINS_ITEM       # MealLog->MealLogItem, MealPlan->MealPlanItem
+
 # Embedding cache: avoids repeat API calls for duplicate/similar user queries
 embedding_cache:
   enabled: true
@@ -49,6 +86,9 @@ graph_sage:
     - TRIED
     - USES_INGREDIENT
     - BELONGS_TO_CUSINE
+    - HAS_NUTRITION       # Recipe/Ingredient->NutritionValue (calorie filter)
+    - OF_NUTRIENT         # NutritionValue->NutrientDefinition
+    - FORBIDDEN           # Dietary_Preferences->Ingredient (diet filter)
   # Numeric properties to use as GraphSAGE features (must exist on all projected nodes)
   # Add your node numeric properties here
   feature_properties: []

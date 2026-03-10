@@ -20,8 +20,10 @@ from typing import Any
 
 import yaml
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from neo4j import Driver
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -51,6 +53,7 @@ from chatbot.chatbot_cypher import (
     run_nutrition_summary,
     run_show_meal_plan,
 )
+from chatbot.context_expander import expand_query_with_context
 from chatbot.nlu import extract_hybrid
 from chatbot.response_generator import (
     TEMPLATE_INTENTS,
@@ -61,8 +64,14 @@ from chatbot.response_generator import (
 from chatbot.session import get_or_create_session, cleanup_expired
 from .ingredient_substitution import run_ingredient_substitution
 from .product_recommendation import run_recommend_products, run_recommend_alternatives
+from .notification_generator import generate_notification
+from .rate_limit import check_rate_limit
+from .b2b import router as b2b_router
 
 logger = logging.getLogger(__name__)
+
+# Config for security/abuse controls
+_MAX_BODY_KB = int(os.getenv("MAX_REQUEST_BODY_KB", "64"))
 
 # ── Startup / Shutdown ─────────────────────────────────────────────────────
 
@@ -79,13 +88,19 @@ async def lifespan(app: FastAPI):
     global _driver, _cfg, _embedder
 
     neo_settings = neo4j_settings_from_env()
-    _driver = create_neo4j_driver(neo_settings)
+    neo_timeout = os.getenv("NEO4J_CONNECTION_TIMEOUT")
+    _driver = create_neo4j_driver(
+        neo_settings,
+        connection_timeout=float(neo_timeout) if neo_timeout else 10.0,
+    )
     config_path = os.getenv("EMBEDDING_CONFIG", "embedding_config.yaml")
     _cfg = load_embedding_config(config_path)
+    llm_timeout = float(os.getenv("LLM_TIMEOUT", "30"))
     base_embedder = OpenAIQueryEmbedder(
         client=OpenAI(
             base_url=os.getenv("OPENAI_BASE_URL"),
             api_key=os.getenv("OPENAI_API_KEY"),
+            timeout=llm_timeout,
         ),
         model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
     )
@@ -124,6 +139,47 @@ app.add_middleware(
 )
 
 
+async def _request_body_size_middleware(request: Request, call_next):
+    """Reject bodies larger than MAX_REQUEST_BODY_KB before processing."""
+    if request.method == "POST":
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > _MAX_BODY_KB * 1024:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "Your message is too long. Please shorten it and try again."},
+            )
+    return await call_next(request)
+
+
+app.middleware("http")(_request_body_size_middleware)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Return user-friendly messages for security/validation errors."""
+    _USER_FRIENDLY = {
+        401: "Authentication failed. Please try again or sign in.",
+        429: "You've sent too many requests. Please wait a minute and try again.",
+    }
+    detail = _USER_FRIENDLY.get(exc.status_code, exc.detail)
+    if exc.status_code == 429:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": detail},
+            headers={"Retry-After": "60", **(exc.headers or {})},
+        )
+    return JSONResponse(status_code=exc.status_code, content={"detail": detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Return user-friendly message for validation errors (e.g. input too long)."""
+    return JSONResponse(
+        status_code=422,
+        content={"detail": "Your input is invalid or too long. Please check and try again."},
+    )
+
+
 # ── Auth ───────────────────────────────────────────────────────────────────
 
 async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
@@ -133,7 +189,14 @@ async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
     """
     expected = os.getenv("RAG_API_KEY")
     if not expected or x_api_key != expected:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication failed. Please try again or sign in.",
+        )
+
+
+# B2B routes (vendor-scoped, same X-API-Key auth)
+app.include_router(b2b_router, dependencies=[Depends(verify_api_key)])
 
 
 # ── Request/Response Schemas ───────────────────────────────────────────────
@@ -230,6 +293,14 @@ class ProductsRequest(BaseModel):
     """Request for POST /recommend/products (grocery list)."""
     ingredient_ids: list[str] = Field(..., description="Ingredient UUIDs to match products for")
     customer_allergens: list[str] = Field(default_factory=list, description="Allergen IDs/names for safety filter")
+    quality_preferences: list[str] | None = Field(
+        default=None,
+        description="Quality toggles e.g. organic, non_gmo, halal, kosher (hard filter)",
+    )
+    preferred_brands: list[str] | None = Field(
+        default=None,
+        description="Preferred brand names (soft boost in ranking)",
+    )
 
 
 class ProductMatchItem(BaseModel):
@@ -244,11 +315,32 @@ class ProductMatchItem(BaseModel):
     category: str = ""
     image_url: str = ""
     match_reason: str = ""
+    preference_matched: bool = False
 
 
 class ProductsResponse(BaseModel):
     """Response from POST /recommend/products."""
     products: list[ProductMatchItem]
+
+
+# ── Notification generation (PRD-29) ────────────────────────────────────────
+
+class NotificationGenerateRequest(BaseModel):
+    """Request for POST /notifications/generate (PRD-29)."""
+    customer_id: str = Field(..., description="B2C customer UUID")
+    trigger_type: str = Field(..., description="e.g. missed_breakfast, suggest_breakfast")
+    meal_log_summary: dict[str, Any] = Field(default_factory=dict)
+    health_profile: dict[str, Any] = Field(default_factory=dict)
+    timezone: str = Field("UTC", description="IANA timezone")
+
+
+class NotificationGenerateResponse(BaseModel):
+    """Response from POST /notifications/generate."""
+    title: str
+    body: str
+    action_url: str
+    icon: str
+    type: str = Field(..., description="meal | nutrition | grocery | budget | family | system")
 
 
 class AlternativesRequest(BaseModel):
@@ -280,7 +372,7 @@ class AlternativesResponse(BaseModel):
 
 class ChatProcessRequest(BaseModel):
     """Chatbot message from Express (POST /chat/process)."""
-    message: str = Field(..., min_length=1, max_length=500, description="User message")
+    message: str = Field(..., min_length=1, max_length=1000, description="User message")
     customer_id: str = Field(..., description="B2C customer UUID")
     session_id: str | None = Field(None, description="Existing session UUID (null for new session)")
     display_name: str | None = Field(None, description="Customer name from auth/PostgreSQL if Neo4j has none")
@@ -688,7 +780,11 @@ async def health():
     """Health check — load balancers use this to verify the service is alive."""
     try:
         _driver.verify_connectivity()
-        return {"status": "ok", "neo4j": "connected"}
+        payload: dict[str, Any] = {"status": "ok", "neo4j": "connected"}
+        pg_sync = os.getenv("PG_SYNC_LAST_RUN")
+        if pg_sync:
+            payload["pg_sync_last_run"] = pg_sync
+        return payload
     except Exception as e:
         return {"status": "degraded", "neo4j": str(e)}
 
@@ -704,7 +800,9 @@ async def search_hybrid(req: SearchRequest):
     constraints are always enforced without the user having to repeat them.
     Express backend hydrates recipe IDs with full data from PostgreSQL.
     """
-    start    = time.time()
+    identity = (req.customer_id or "anonymous").strip() or "anonymous"
+    check_rate_limit(identity)
+    start = time.time()
     database = os.getenv("NEO4J_DATABASE")
 
     # Fetch profile once if the user is logged in; None for guest/anonymous searches.
@@ -734,12 +832,16 @@ async def search_hybrid(req: SearchRequest):
     )
 
     zero_explanation = result.fallback_message if not recommendations else None
-
+    latency_ms = (time.time() - start) * 1000
+    logger.info(
+        "search_hybrid complete",
+        extra={"endpoint": "search_hybrid", "identity": f"{identity[:8]}..." if len(identity) > 8 else identity, "intent": result.intent, "latency_ms": round(latency_ms)},
+    )
     return SearchResponse(
         results=recommendations,
         intent=result.intent,
         entities=result.entities,
-        retrieval_time_ms=(time.time() - start) * 1000,
+        retrieval_time_ms=latency_ms,
         zero_results_explanation=zero_explanation,
         confidence=result.confidence,
     )
@@ -763,7 +865,8 @@ async def recommend_feed(req: FeedRequest):
     NOTE: allergen exclusion maps allergen names → exclude_ingredient. This works when
     allergen names match Ingredient node names. Full fix requires FORBIDS relationships.
     """
-    start    = time.time()
+    check_rate_limit((req.customer_id or "").strip() or "anonymous")
+    start = time.time()
     database = os.getenv("NEO4J_DATABASE")
 
     profile = fetch_customer_profile(_driver, req.customer_id, database)
@@ -860,12 +963,14 @@ async def recommend_feed(req: FeedRequest):
     zero_explanation = None
     if not recommendations:
         zero_explanation = build_zero_results_message(entities, "find_recipe")
-
+    latency_ms = (time.time() - start) * 1000
+    identity = (req.customer_id or "").strip() or "anonymous"
+    logger.info("recommend_feed complete", extra={"endpoint": "recommend_feed", "identity": f"{identity[:8]}..." if len(identity) > 8 else identity, "latency_ms": round(latency_ms)})
     return SearchResponse(
         results=recommendations,
         intent="find_recipe",
         entities=entities,
-        retrieval_time_ms=(time.time() - start) * 1000,
+        retrieval_time_ms=latency_ms,
         zero_results_explanation=zero_explanation,
     )
 
@@ -885,6 +990,8 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
       3. Post-filter: exclude recent_recipes, meal_history, exclude_ids
       4. Return candidates in format expected by meal plan LLM
     """
+    identity = (req.customer_id or "").strip() or "anonymous"
+    check_rate_limit(identity)
     start = time.time()
     database = os.getenv("NEO4J_DATABASE")
 
@@ -1004,10 +1111,11 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
     zero_explanation = None
     if not candidates:
         zero_explanation = build_zero_results_message(entities, "find_recipe")
-
+    latency_ms = (time.time() - start) * 1000
+    logger.info("recommend_meal_candidates complete", extra={"endpoint": "recommend_meal_candidates", "identity": f"{identity[:8]}..." if len(identity) > 8 else identity, "latency_ms": round(latency_ms)})
     return MealCandidateResponse(
         candidates=candidates,
-        retrieval_time_ms=(time.time() - start) * 1000,
+        retrieval_time_ms=latency_ms,
         zero_results_explanation=zero_explanation,
     )
 
@@ -1020,6 +1128,8 @@ async def substitutions_ingredient(req: IngredientSubstitutionRequest):
     Flow: Graph (CAN_SUBSTITUTE) → Semantic retrieval → Allergen filter → Diet filter
     → Nutrition enrichment → LLM fallback if no candidates.
     """
+    check_rate_limit("anonymous")
+    start = time.time()
     database = os.getenv("NEO4J_DATABASE")
     result = run_ingredient_substitution(
         _driver,
@@ -1044,6 +1154,8 @@ async def substitutions_ingredient(req: IngredientSubstitutionRequest):
         )
         for s in result.get("substitutions", [])
     ]
+    latency_ms = (time.time() - start) * 1000
+    logger.info("substitutions_ingredient complete", extra={"endpoint": "substitutions_ingredient", "identity": "anonymous", "latency_ms": round(latency_ms)})
     return IngredientSubstitutionResponse(
         substitutions=substitutions,
         debug_info=result.get("debug_info") if req.debug else None,
@@ -1054,13 +1166,18 @@ async def substitutions_ingredient(req: IngredientSubstitutionRequest):
 async def recommend_products(req: ProductsRequest):
     """
     Match products to ingredients for grocery list (allergen-safe).
+    Supports quality_preferences (certification hard filter) and preferred_brands (soft boost).
     Returns empty when Product nodes or CONTAINS_INGREDIENT not available.
     """
+    check_rate_limit("anonymous")
+    start = time.time()
     database = os.getenv("NEO4J_DATABASE")
     result = run_recommend_products(
         _driver,
         ingredient_ids=req.ingredient_ids,
         customer_allergens=req.customer_allergens or [],
+        quality_preferences=req.quality_preferences,
+        preferred_brands=req.preferred_brands,
         database=database,
     )
     products = [
@@ -1075,9 +1192,11 @@ async def recommend_products(req: ProductsRequest):
             category=p.get("category", ""),
             image_url=p.get("image_url", ""),
             match_reason=p.get("match_reason", ""),
+            preference_matched=p.get("preference_matched", True),
         )
         for p in result.get("products", [])
     ]
+    logger.info("recommend_products complete", extra={"endpoint": "recommend_products", "identity": "anonymous", "latency_ms": round((time.time() - start) * 1000)})
     return ProductsResponse(products=products)
 
 
@@ -1088,6 +1207,8 @@ async def recommend_alternatives(req: AlternativesRequest):
     Uses CAN_SUBSTITUTE or same-category fallback.
     Returns empty when Product data not available.
     """
+    check_rate_limit("anonymous")
+    start = time.time()
     database = os.getenv("NEO4J_DATABASE")
     result = run_recommend_alternatives(
         _driver,
@@ -1110,7 +1231,34 @@ async def recommend_alternatives(req: AlternativesRequest):
         )
         for a in result.get("alternatives", [])
     ]
+    logger.info("recommend_alternatives complete", extra={"endpoint": "recommend_alternatives", "identity": "anonymous", "latency_ms": round((time.time() - start) * 1000)})
     return AlternativesResponse(alternatives=alternatives)
+
+
+@app.post("/notifications/generate", response_model=NotificationGenerateResponse, dependencies=[Depends(verify_api_key)])
+async def notifications_generate(req: NotificationGenerateRequest):
+    """
+    Generate notification copy for PRD-29 auto-notifications.
+    Template-based (no LLM). Backend passes trigger_type, meal_log_summary, health_profile.
+    For suggest_breakfast/suggest_lunch, meal_log_summary may include suggested_recipe: { id, title }.
+    """
+    check_rate_limit("anonymous")
+    start = time.time()
+    result = generate_notification(
+        trigger_type=req.trigger_type,
+        meal_log_summary=req.meal_log_summary,
+        health_profile=req.health_profile,
+        timezone=req.timezone,
+    )
+    logger.info(
+        "notifications_generate complete",
+        extra={
+            "endpoint": "notifications_generate",
+            "trigger_type": req.trigger_type,
+            "latency_ms": round((time.time() - start) * 1000),
+        },
+    )
+    return NotificationGenerateResponse(**result)
 
 
 @app.post("/chat/process", response_model=ChatProcessResponse, dependencies=[Depends(verify_api_key)])
@@ -1121,6 +1269,9 @@ async def chat_process(req: ChatProcessRequest):
     Called by Express POST /api/v1/chat. Session is created/reused for multi-turn context.
     NLU and response generation will be wired in Phase 3; currently returns a stub response.
     """
+    identity = (req.customer_id or req.session_id or "anonymous").strip() or "anonymous"
+    check_rate_limit(identity)
+    start = time.time()
     # Get or create session and record user message
     session = get_or_create_session(req.customer_id, req.session_id)
     session.add_message("user", req.message.strip())
@@ -1177,8 +1328,16 @@ async def chat_process(req: ChatProcessRequest):
         session.pending_action_payload = None
         session.pending_action = None
 
+    # Expand follow-up queries using conversation context (e.g. "Can I use soy then?" -> full query)
+    history_pairs = [
+        (m.role, m.content)
+        for m in session.history[:-1]
+        if m.role in ("user", "assistant")
+    ]
+    effective_msg = expand_query_with_context(msg, history_pairs) if history_pairs else msg
+
     # NLU: intent + entities (rules first, LLM fallback)
-    nlu_result = extract_hybrid(msg)
+    nlu_result = extract_hybrid(effective_msg)
 
     # Action orchestrator: WRITE intents need confirmation
     orch = route_intent(nlu_result.intent, nlu_result.entities)
@@ -1282,7 +1441,7 @@ async def chat_process(req: ChatProcessRequest):
                 _driver,
                 cfg=_cfg,
                 embedder=_embedder,
-                user_query=msg,
+                user_query=effective_msg,
                 customer_node_id=req.customer_id,
                 customer_profile=profile,
                 top_k=10,
@@ -1299,7 +1458,7 @@ async def chat_process(req: ChatProcessRequest):
 
             _response = generate_chat_response(
                 orch_result,
-                msg,
+                effective_msg,
                 history_text,
                 customer_profile=profile,
                 temperature=0.3,
@@ -1332,6 +1491,8 @@ async def chat_process(req: ChatProcessRequest):
                     for r in recs
                 ]
 
+            latency_ms = (time.time() - start) * 1000
+            logger.info("chat_process complete", extra={"endpoint": "chat_process", "identity": f"{identity[:8]}..." if len(identity) > 8 else identity, "intent": nlu_result.intent, "latency_ms": round(latency_ms)})
             return ChatProcessResponse(
                 response=_response,
                 intent=nlu_result.intent,

@@ -9,7 +9,8 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-from rag_pipeline.nlu.intents import VALID_INTENTS
+from entity_codes import CONDITION_KEYWORDS, normalize_to_allergen
+from rag_pipeline.nlu.intents import VALID_INTENTS, VALID_INTENTS_WITH_B2B
 from openai import OpenAI
 
 try:
@@ -36,6 +37,34 @@ ENTITIES (only if present): include_ingredient[]|exclude_ingredient[]|diet[]|cou
 diet values: Vegan|Vegetarian|Gluten-Free|Keto|Paleo|Dairy-Free|Nut-Free|High-Protein|Low-Fat|Low-Carb
 course values: breakfast|lunch|dinner|dessert|appetizer|main_dish|side_dish|salad|soup|snack
 criterion values: protein_to_calorie_ratio|lowest_fat|lowest_calories"""
+
+# ── B2B-specific system prompt for LLM fallback ───────────────────────────────
+SYSTEM_PROMPT_B2B = """NLU for B2B vendor platform. Return JSON with keys: "intent", "entities", and "confidence". No markdown, no extra text.
+
+Required: "intent", "entities", "confidence" (0.0–1.0)
+
+INTENTS (pick one): b2b_products_for_condition | b2b_products_allergen_free | b2b_products_for_diet | b2b_customers_for_product | b2b_customers_with_condition | b2b_customer_recommendations | b2b_analytics | b2b_product_compliance | b2b_product_nutrition | b2b_generate_report
+
+ENTITIES (only if present): allergens[] | health_conditions[] | diet[] | product_name | customer_name | exclude_ingredient[]
+
+Extract user phrases as-is; normalization handles any format (spaces, dashes, mixed case).
+allergens/health_conditions/diet: map to canonical codes below.
+allergens: seeds, other_legumes, egg, corn, sesame, buckwheat, alpha_gal_syndrome, tree_nuts, fish, spices_herbs, peanut, insect, soy, oral_allergy_syndrome, celery, wheat_gluten_cereals, gelatin, molluscs, shellfish, milk_dairy
+health_conditions: food_allergy_other, diabetics_type_2, hyperlipidemia, kidney_disease, liver_disease, non_celiac_gluten_sensitivity, type_1_diabetics, celiac_diseases, hypertension, lactose_intolerance, irritable_bowel_syndrome, gout, heart_disease, oral_allergy_syndrome, gerd
+diet: kosher, sesame_free, vegan, egg_free, renal_kidney_support, carnivore, flexitarian, halal, hindu_no_beef, high_protein, hyperlipidemia, low_carb, diabetes_friendly, alpha_gal_syndrome, oral_allergy_syndrome, low_fat, vegetarian_lacto_ovo, fish_free, whole_foods, low_fodmap, corn_free, shellfish_free, paleo, non_celiac_gluten_sensitivity, ketogenic, legume_free, mediterranean, pescatarian, dairy_free, strict_gluten_free, heart_healthy, peanut_tree_nut_free, soy_free, jain_vegetarian"""
+
+# Entity-only extraction prompt (used when rules miss allergens/diets/conditions)
+ENTITY_PROMPT_B2B = """Extract entities from the B2B query for intent "{intent}". Return JSON with only "entities" key. No markdown.
+
+Query: "{query}"
+
+Return format: {{"entities": {{"allergens": [], "health_conditions": [], "diet": [], "product_name": "", "customer_name": ""}}}}
+Extract whatever the user said (any phrasing) and map to these codes. Normalization handles spaces, dashes, mixed case.
+
+allergens: seeds, other_legumes, egg, corn, sesame, buckwheat, alpha_gal_syndrome, tree_nuts, fish, spices_herbs, peanut, insect, soy, oral_allergy_syndrome, celery, wheat_gluten_cereals, gelatin, molluscs, shellfish, milk_dairy
+health_conditions: food_allergy_other, diabetics_type_2, hyperlipidemia, kidney_disease, liver_disease, non_celiac_gluten_sensitivity, type_1_diabetics, celiac_diseases, hypertension, lactose_intolerance, irritable_bowel_syndrome, gout, heart_disease, oral_allergy_syndrome, gerd
+diet: kosher, sesame_free, vegan, egg_free, renal_kidney_support, carnivore, flexitarian, halal, hindu_no_beef, high_protein, hyperlipidemia, low_carb, diabetes_friendly, alpha_gal_syndrome, oral_allergy_syndrome, low_fat, vegetarian_lacto_ovo, fish_free, whole_foods, low_fodmap, corn_free, shellfish_free, paleo, non_celiac_gluten_sensitivity, ketogenic, legume_free, mediterranean, pescatarian, dairy_free, strict_gluten_free, heart_healthy, peanut_tree_nut_free, soy_free, jain_vegetarian
+product_name, customer_name: plain text if present"""
 
 
 def _keyword_result(intent: str, entities: dict[str, Any]) -> dict[str, Any]:
@@ -121,11 +150,13 @@ _HEALTH_WORDS: set[str] = {
     "reflux", "heartburn", "allergy", "allergic", "condition", "patient",
     "patients", "disease", "syndrome", "intolerance", "intolerant",
     "sensitive", "sensitivity",
-}
+} | set(CONDITION_KEYWORDS.keys())
 
 _DIET_MAP: dict[str, str] = {
     "vegan": "Vegan",
     "vegetarian": "Vegetarian",
+    "veggie": "Vegetarian",
+    "veg": "Vegetarian",
     "keto": "Keto",
     "ketogenic": "Keto",
     "paleo": "Paleo",
@@ -133,8 +164,10 @@ _DIET_MAP: dict[str, str] = {
     "gluten free": "Gluten-Free",
     "dairy-free": "Dairy-Free",
     "dairy free": "Dairy-Free",
+    "no dairy": "Dairy-Free",
     "nut-free": "Nut-Free",
     "nut free": "Nut-Free",
+    "no nuts": "Nut-Free",
     "high-protein": "High-Protein",
     "high protein": "High-Protein",
     "low-fat": "Low-Fat",
@@ -145,6 +178,7 @@ _DIET_MAP: dict[str, str] = {
 
 _COURSE_MAP: dict[str, str] = {
     "breakfast": "breakfast",
+    "brakfast": "breakfast",
     "lunch": "lunch",
     "dinner": "dinner",
     "dessert": "dessert",
@@ -223,6 +257,7 @@ _FOOD_WORDS: set[str] = (
         "glycemic", "antioxidants", "probiotics", "prebiotics", "cholesterol",
         "alternatives", "alternative", "similar", "compare", "comparison",
         "vitamin", "vitamins", "mineral", "minerals", "omega",
+        "hungry", "hunger", "crave", "craving", "starving",
     }
 )
 
@@ -262,8 +297,53 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
     q = text.lower().strip()
     words = set(re.findall(r"[a-z][\w\-]*", q))
 
-    # ── Queries with numeric thresholds → always fall through to LLM ──────────
-    # Numbers imply cal_upper_limit or nutrient_threshold which require parsing.
+    # ── Calorie upper limit: "below/under X kcal" / "recipes under 120 calories" ─
+    # Must run before generic numeric fallthrough so we extract cal_upper_limit.
+    cal_limit_match = re.search(
+        r"\b(?:below|under|less\s+than|max|maximum|at\s+most)\s+(\d+)\s*(?:kcal|cal|calories?)\b",
+        q,
+    )
+    if cal_limit_match and (words & _RECIPE_TRIGGERS or any(w in q for w in ["recipe", "recipes", "meal", "meals", "dish", "food"])):
+        cal_val = int(cal_limit_match.group(1))
+        entities: dict[str, Any] = {"cal_upper_limit": cal_val}
+        course = _extract_course(q)
+        if course:
+            entities["course"] = course
+        diets = _extract_diets(q)
+        if diets:
+            entities["diet"] = diets
+        exclude_ingredients = _extract_exclude_ingredients(q)
+        if exclude_ingredients:
+            entities["exclude_ingredient"] = exclude_ingredients
+        # Also extract nutrient threshold for "high protein under 100 kcal"
+        nutrient_recipe = re.search(
+            r"(?:high|low|rich\s+in)\s*[-\s]?([a-z]+)\s+(?:recipe|recipes|meal|meals|dish|dishes|food|foods|dinner|lunch|breakfast|snack)?",
+            q,
+        )
+        if nutrient_recipe:
+            nword = nutrient_recipe.group(1).strip()
+            nutrient = _NUTRIENT_MAP.get(nword)
+            is_low = "low" in (nutrient_recipe.group(0).split()[0] if nutrient_recipe else "")
+            op = "lt" if is_low else "gt"
+            nutrient_name_for_graph = nutrient or "Protein"
+            if "protein" in (nword or ""):
+                default_val = 10 if is_low else 25
+            elif "fat" in (nword or ""):
+                default_val = 30 if is_low else 50
+            elif "carb" in (nword or ""):
+                default_val = 20 if is_low else 40
+            elif "fiber" in (nword or ""):
+                default_val = 2 if is_low else 5
+            else:
+                default_val = 20 if is_low else 25
+            entities["nutrient_threshold"] = {
+                "nutrient": nutrient_name_for_graph,
+                "operator": op,
+                "value": default_val,
+            }
+        return _keyword_result("find_recipe", entities)
+
+    # ── Queries with other numeric thresholds → fall through to LLM ───────────
     if re.search(r"\b\d+\s*(?:cal|kcal|g|mg|calories?|grams?)\b", q):
         return None
 
@@ -413,7 +493,11 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         # Split on commas, "and", "or"
         items = [i.strip() for i in re.split(r",\s*|\s+and\s+|\s+or\s+", raw) if i.strip()]
         if len(items) >= 2:
-            return _keyword_result("find_recipe_by_pantry", {"pantry_ingredients": items})
+            entities = {"pantry_ingredients": items}
+            excludes = _extract_exclude_ingredients(q)
+            if excludes:
+                entities["exclude_ingredient"] = excludes
+            return _keyword_result("find_recipe_by_pantry", entities)
 
     # ── similar_ingredients: "alternatives to X" (ingredient context) ────────
     # Note: "recipes like X" / "something like X" already handled before out_of_scope check.
@@ -506,6 +590,12 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
     cuisine = _extract_cuisine(q)
     if cuisine and (words & _RECIPE_TRIGGERS or any(w in q for w in ["food", "dish", "dishes", "cuisine"])):
         entities = {"cuisine": cuisine}
+        course = _extract_course(q)
+        if course:
+            entities["course"] = course
+        diets = _extract_diets(q)
+        if diets:
+            entities["diet"] = diets
         # Pick up any ingredient mentioned alongside cuisine
         include = _extract_include_ingredients(q, exclude_words={cuisine.lower()})
         if include:
@@ -556,12 +646,37 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
             pass  # fall through to find_recipe
         else:
             entities = {}
-            if nutrient:
-                entities["nutrient"] = nutrient
+            # Build nutrient_threshold for Cypher/constraint filter
+            # "high"/"rich in" -> gt (>=), "low" -> lt (<=)
+            # Recipe uses percent_calories_* for protein/fat/carbs; others use grams via HAS_NUTRITION
+            is_low = "low" in (nutrient_recipe.group(0).split()[0] if nutrient_recipe else "")
+            op = "lt" if is_low else "gt"
+            nutrient_name_for_graph = nutrient or "Protein"
+            if "protein" in (nword or ""):
+                default_val = 10 if is_low else 25  # % of calories from protein
+            elif "fat" in (nword or ""):
+                default_val = 30 if is_low else 50  # low fat <= 30%, high fat >= 50%
+            elif "carb" in (nword or ""):
+                default_val = 20 if is_low else 40  # % of calories
+            elif "fiber" in (nword or ""):
+                default_val = 2 if is_low else 5   # grams
+            else:
+                default_val = 20 if is_low else 25
+            entities["nutrient_threshold"] = {
+                "nutrient": nutrient_name_for_graph,
+                "operator": op,
+                "value": default_val,
+            }
             if course:
                 entities["course"] = course
             if non_nutrient_diets:
                 entities["diet"] = non_nutrient_diets
+            include = _extract_include_ingredients(q)
+            if include:
+                entities["include_ingredient"] = include
+            exclude_ingredients = _extract_exclude_ingredients(q)
+            if exclude_ingredients:
+                entities["exclude_ingredient"] = exclude_ingredients
             return _keyword_result("recipes_by_nutrient", entities)
 
     # ── find_recipe: diet and/or course keyword + recipe trigger ──────────────
@@ -578,7 +693,8 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
                                              "food", "foods", "dinner", "lunch", "breakfast",
                                              "dessert", "desserts", "appetizer", "soup", "salad",
                                              "snack", "cook", "make", "prepare", "eat", "eating",
-                                             "healthy", "ideas", "patient", "patients"])
+                                             "healthy", "ideas", "patient", "patients",
+                                             "hungry", "hunger", "crave", "craving", "starving"])
 
     # Health condition with no diet mapping → let LLM handle it (unless we extracted exclude_ingredient)
     has_health_word = bool(words & _HEALTH_WORDS)
@@ -659,12 +775,17 @@ def _extract_exclude_ingredients(q: str) -> list[str]:
 
     def _add(ing: str) -> None:
         ing = ing.strip().rstrip(".,?!")
-        if ing and len(ing) > 1 and ing not in seen:
+        if ing and len(ing) > 1:
+            low = ing.lower()
             # Skip diet labels (nut-free, gluten-free are diets, not ingredient exclusions)
-            if ing in _DIET_MAP or ing.replace("-", " ") in _DIET_MAP:
+            if low in _DIET_MAP or low.replace("-", " ") in _DIET_MAP:
                 return
-            seen.add(ing)
-            found.append(ing)
+            # Normalize to allergen code when possible; else keep raw
+            code = normalize_to_allergen(ing)
+            val = code if code else ing.replace(" ", "_")
+            if val not in seen:
+                seen.add(val)
+                found.append(val)
 
     # "without X" / "without X and Y"
     for m in re.finditer(r"\bwithout\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
@@ -730,9 +851,11 @@ def _extract_include_ingredients(q: str, exclude_words: set[str] | None = None) 
 
 
 def _get_client() -> OpenAI:
+    timeout = float(os.environ.get("LLM_TIMEOUT", "30"))
     return OpenAI(
         base_url=os.environ.get("OPENAI_BASE_URL"),
         api_key=os.environ.get("OPENAI_API_KEY"),
+        timeout=timeout,
     )
 
 
@@ -803,6 +926,92 @@ def extract_intent(
         response = _call()
 
     return response.choices[0].message.content
+
+
+def extract_intent_b2b(
+    text: str,
+    *,
+    model: str | None = None,
+    config_path: str | Path = "embedding_config.yaml",
+) -> str:
+    """
+    Extract B2B intent + entities. Uses B2B-specific system prompt.
+    No keyword pre-filter — goes straight to LLM (call from extract_hybrid_b2b
+    after rule patterns have been tried).
+    """
+    client = _get_client()
+    model = model or os.environ.get("INTENT_MODEL", "gpt-4o-mini")
+
+    def _call():
+        return client.chat.completions.create(
+            model=model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_B2B},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+        )
+
+    retry_cfg = _load_llm_retry_config(config_path)
+    if with_retry and retry_cfg:
+        response = with_retry(
+            _call,
+            max_attempts=retry_cfg.get("max_attempts", 3),
+            initial_delay_ms=float(retry_cfg.get("initial_delay_ms", 1000)),
+            max_delay_ms=float(retry_cfg.get("max_delay_ms", 30000)),
+            jitter=retry_cfg.get("jitter", True),
+        )
+    else:
+        response = _call()
+
+    return response.choices[0].message.content
+
+
+def extract_entities_only_b2b(
+    text: str,
+    intent: str,
+    *,
+    model: str | None = None,
+    config_path: str | Path = "embedding_config.yaml",
+) -> dict[str, Any] | None:
+    """
+    Entity-only LLM extraction when rule-based extraction misses allergens/diets/conditions.
+    Returns parsed entities dict or None on failure. Caller normalizes and merges.
+    """
+    client = _get_client()
+    model = model or os.environ.get("INTENT_MODEL", "gpt-4o-mini")
+    prompt = ENTITY_PROMPT_B2B.format(intent=intent, query=text)
+
+    def _call():
+        return client.chat.completions.create(
+            model=model,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+        )
+
+    try:
+        retry_cfg = _load_llm_retry_config(config_path)
+        if with_retry and retry_cfg:
+            response = with_retry(
+                _call,
+                max_attempts=retry_cfg.get("max_attempts", 2),
+                initial_delay_ms=float(retry_cfg.get("initial_delay_ms", 1000)),
+                max_delay_ms=float(retry_cfg.get("max_delay_ms", 10000)),
+                jitter=retry_cfg.get("jitter", True),
+            )
+        else:
+            response = _call()
+        raw = response.choices[0].message.content
+        parsed = parse_extractor_output(raw) if isinstance(raw, str) else raw
+        if parsed and isinstance(parsed.get("entities"), dict):
+            return parsed["entities"]
+    except Exception as e:
+        logger.warning("extract_entities_only_b2b failed: %s", e)
+    return None
 
 
 RETRY_USER_MESSAGE = "Return only valid JSON with keys 'intent' and 'entities'. No markdown."
@@ -980,6 +1189,25 @@ def sanity_check(output_json):
             logger.warning("sanity_check: confidence must be 0–1, ignoring value %r", conf)
             output_json.pop("confidence", None)
 
+    return True
+
+
+def sanity_check_b2b(output_json) -> bool | tuple[bool, str]:
+    """
+    Validates B2B extractor output. Uses VALID_INTENTS_WITH_B2B so B2B intents pass.
+    Returns True on success, or (False, reason_string) on failure.
+    """
+    required_keys = {"intent", "entities"}
+    if not isinstance(output_json, dict):
+        return False, "Output is not a dictionary"
+    if not required_keys.issubset(output_json.keys()):
+        return False, "Missing required top-level keys: 'intent' and/or 'entities'"
+    if not isinstance(output_json["intent"], str):
+        return False, "Intent is not a string"
+    if output_json["intent"] not in VALID_INTENTS_WITH_B2B:
+        return False, f"Unknown intent: '{output_json['intent']}'. Valid B2B intents included."
+    if not isinstance(output_json["entities"], dict):
+        return False, "Entities is not a dictionary"
     return True
 
 

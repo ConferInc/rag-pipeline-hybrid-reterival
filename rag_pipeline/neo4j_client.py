@@ -34,6 +34,13 @@ def neo4j_settings_from_env(
     return Neo4jSettings(uri=str(uri), username=str(username), password=str(password), database=database)
 
 
-def create_neo4j_driver(settings: Neo4jSettings) -> Driver:
-    return GraphDatabase.driver(settings.uri, auth=(settings.username, settings.password))
+def create_neo4j_driver(
+    settings: Neo4jSettings,
+    *,
+    connection_timeout: float | None = None,
+) -> Driver:
+    kwargs: dict = {}
+    if connection_timeout is not None:
+        kwargs["connection_timeout"] = connection_timeout
+    return GraphDatabase.driver(settings.uri, auth=(settings.username, settings.password), **kwargs)
 

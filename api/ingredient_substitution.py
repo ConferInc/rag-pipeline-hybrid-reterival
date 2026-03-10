@@ -187,7 +187,7 @@ def filter_diet_violating_ingredients(
     diets: list[str],
     database: str | None = None,
 ) -> set[str]:
-    """Return set of ingredient IDs forbidden by customer's diets (FORBIDS)."""
+    """Return set of ingredient IDs forbidden by customer's diets (FORBIDDEN)."""
     if not ingredient_ids or not diets:
         return set()
     diets_clean = [d for d in diets if d and isinstance(d, str)]
@@ -198,7 +198,7 @@ def filter_diet_violating_ingredients(
     UNWIND $ingredient_ids AS iid
     MATCH (i:Ingredient)
     WHERE i.id = iid OR elementId(i) = iid
-    MATCH (dp:Dietary_Preferences)-[:FORBIDS]->(i)
+    MATCH (dp:Dietary_Preferences)-[:FORBIDDEN]->(i)
     WHERE dp.name IN $diets
     RETURN DISTINCT i.id AS flagged_id
     """

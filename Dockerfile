@@ -25,6 +25,7 @@ COPY rag_pipeline/    ./rag_pipeline/
 COPY chatbot/         ./chatbot/
 COPY cypher_query_generator.py  .
 COPY extractor_classifier.py    .
+COPY entity_codes.py            .
 COPY embedding_config.yaml      .
 
 # Switch to non-root user
