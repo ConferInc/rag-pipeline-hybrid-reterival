@@ -102,3 +102,35 @@ CHATBOT_DATA_INTENTS: frozenset[str] = frozenset({
     "meal_history",
     "nutrition_summary",
 })
+
+# ── B2B intents (vendor-scoped product/customer queries) ──────────────────────
+
+B2B_INTENTS: frozenset[str] = frozenset({
+    "b2b_products_for_condition",
+    "b2b_products_allergen_free",
+    "b2b_products_for_diet",
+    "b2b_customers_for_product",
+    "b2b_customers_with_condition",
+    "b2b_customer_recommendations",
+    "b2b_analytics",
+    "b2b_product_compliance",
+    "b2b_product_nutrition",
+    "b2b_generate_report",
+})
+
+# B2B intents that run Cypher retrieval (route to b2b_cypher)
+B2B_DATA_INTENTS: frozenset[str] = frozenset({
+    "b2b_products_for_condition",
+    "b2b_products_allergen_free",
+    "b2b_products_for_diet",
+    "b2b_customers_for_product",
+    "b2b_customers_with_condition",
+    "b2b_customer_recommendations",
+    "b2b_analytics",
+    "b2b_product_compliance",
+    "b2b_product_nutrition",
+    "b2b_generate_report",
+})
+
+# All valid intents including B2B (for sanity_check when in B2B context)
+VALID_INTENTS_WITH_B2B: frozenset[str] = VALID_INTENTS | B2B_INTENTS

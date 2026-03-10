@@ -61,9 +61,11 @@ def generate_response(
     Returns:
         LLM response text
     """
+    timeout = float(os.environ.get("LLM_TIMEOUT", "30"))
     client = OpenAI(
         base_url=os.environ.get("OPENAI_BASE_URL"),
         api_key=os.environ.get("OPENAI_API_KEY"),
+        timeout=timeout,
     )
 
     gen_cfg = _load_generation_config(config_path)

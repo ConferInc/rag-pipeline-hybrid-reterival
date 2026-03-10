@@ -2,6 +2,7 @@
 Product recommendations for grocery list and scanner alternatives.
 
 POST /recommend/products — Match products to ingredients (allergen-safe)
+  Supports quality_preferences (certification hard filter) and preferred_brands (soft boost).
 POST /recommend/alternatives — Alternative products for a scanned product
 
 Returns empty when Product nodes or CONTAINS_INGREDIENT do not exist.
@@ -15,6 +16,20 @@ from typing import Any
 from neo4j import Driver
 
 logger = logging.getLogger(__name__)
+
+# PRD-30: Map household preference types to Neo4j Certification codes
+QUALITY_TO_CERTIFICATION: dict[str, str] = {
+    "organic": "USDA_ORGANIC",
+    "non_gmo": "NON_GMO_PROJECT",
+    "halal": "HALAL",
+    "kosher": "KOSHER",
+    "no_msg": "NO_MSG",
+    "grass_fed": "GRASS_FED",
+    "hormone_free": "HORMONE_FREE",
+    "pesticide_free": "PESTICIDE_FREE",
+}
+
+BRAND_BOOST = 0.2
 
 
 def _product_data_available(driver: Driver, database: str | None = None) -> bool:
@@ -79,15 +94,69 @@ def _filter_allergen_unsafe_product_ids(
         return set()
 
 
+def _map_quality_to_cert_codes(quality_preferences: list[str] | None) -> list[str]:
+    """Map quality preference strings to Neo4j Certification codes. Skips unknown types."""
+    if not quality_preferences:
+        return []
+    codes: list[str] = []
+    for q in quality_preferences:
+        if q and isinstance(q, str):
+            key = q.lower().strip()
+            if key in QUALITY_TO_CERTIFICATION:
+                codes.append(QUALITY_TO_CERTIFICATION[key])
+            else:
+                logger.debug("Unknown quality preference '%s', skipping", q)
+    return codes
+
+
+def _filter_products_by_certification(
+    driver: Driver,
+    product_ids: list[str],
+    quality_codes: list[str],
+    database: str | None = None,
+) -> set[str]:
+    """
+    Return product IDs that have ALL requested certifications (AND logic).
+    Uses Product-[:HAS_CERTIFICATION]->Certification. Returns empty on error.
+    """
+    if not product_ids or not quality_codes:
+        return set()
+    try:
+        cypher = """
+        UNWIND $product_ids AS pid
+        MATCH (p:Product)
+        WHERE p.id = pid OR elementId(p) = pid
+        OPTIONAL MATCH (p)-[:HAS_CERTIFICATION]->(c:Certification)
+        WHERE c.code IN $quality_codes
+        WITH p, [x IN collect(DISTINCT c.code) WHERE x IS NOT NULL] AS certs
+        WHERE ALL(code IN $quality_codes WHERE code IN certs)
+        RETURN coalesce(p.id, elementId(p)) AS product_id
+        """
+        with driver.session(database=database) as session:
+            rows = session.run(
+                cypher,
+                product_ids=product_ids,
+                quality_codes=quality_codes,
+            )
+            return {str(row["product_id"]) for row in rows if row["product_id"]}
+    except Exception as e:
+        logger.warning("_filter_products_by_certification failed: %s", e)
+        return set()
+
+
 def run_recommend_products(
     driver: Driver,
     *,
     ingredient_ids: list[str],
     customer_allergens: list[str] | None = None,
+    quality_preferences: list[str] | None = None,
+    preferred_brands: list[str] | None = None,
     database: str | None = None,
 ) -> dict[str, Any]:
     """
     Match products to ingredients, allergen-safe.
+    Supports quality_preferences (certification hard filter, two-phase) and
+    preferred_brands (soft boost). Fallback to best available when no certified products.
     Returns {products: [...]}. Empty when Product/CONTAINS_INGREDIENT not available.
     """
     products: list[dict[str, Any]] = []
@@ -98,8 +167,13 @@ def run_recommend_products(
         return {"products": products}
 
     allergens = list(customer_allergens or [])
+    quality_codes = _map_quality_to_cert_codes(quality_preferences)
+    brands = [b for b in (preferred_brands or []) if b and isinstance(b, str)]
+    brands_lower = [b.lower().strip() for b in brands]
+    has_quality_prefs = bool(quality_codes)
+    has_brand_prefs = bool(brands_lower)
 
-    # Find products that contain each ingredient
+    # Phase 1: Find products that contain each ingredient
     cypher = """
     UNWIND $ingredient_ids AS iid
     MATCH (i:Ingredient)<-[:CONTAINS_INGREDIENT]-(p:Product)
@@ -146,15 +220,62 @@ def run_recommend_products(
         unsafe = _filter_allergen_unsafe_product_ids(driver, product_ids, allergens, database)
         candidates = [c for c in candidates if c["product_id"] not in unsafe]
 
-    # Pick best product per ingredient (cheapest)
+    if not candidates:
+        return {"products": []}
+
+    preference_matched = True
+
+    # Phase 2: Certification filter (hard constraint, two-phase)
+    if has_quality_prefs:
+        product_ids = list({c["product_id"] for c in candidates})
+        certified_ids = _filter_products_by_certification(
+            driver, product_ids, quality_codes, database
+        )
+        certified_candidates = [c for c in candidates if c["product_id"] in certified_ids]
+        if certified_candidates:
+            candidates = certified_candidates
+        else:
+            # Fallback: no certified products, use best available (GP-7)
+            preference_matched = False
+            logger.debug(
+                "No products with certifications %s; returning best available",
+                quality_codes,
+            )
+
+    # Apply brand boost (soft) and select best per ingredient
+    for c in candidates:
+        brand_val = (c.get("brand") or "").strip()
+        is_preferred_brand = (
+            brand_val.lower() in brands_lower
+            if brands_lower
+            else False
+        )
+        base_price = c.get("price") or 999999.0
+        score = 1.0 / (float(base_price) + 0.01)
+        if is_preferred_brand:
+            score += BRAND_BOOST
+        c["_score"] = score
+
     by_ingredient: dict[str, dict] = {}
     for c in candidates:
         iid = c["ingredient_id"]
-        if iid not in by_ingredient or (c.get("price") or 999999) < (by_ingredient[iid].get("price") or 999999):
+        if iid not in by_ingredient or c["_score"] > by_ingredient[iid]["_score"]:
             by_ingredient[iid] = c
 
     for c in by_ingredient.values():
-        c["match_reason"] = "Allergen-safe, best price" if allergens else "Best price in category"
+        del c["_score"]
+        if preference_matched:
+            if has_quality_prefs and has_brand_prefs:
+                c["match_reason"] = "Matches quality preferences, best price"
+            elif has_quality_prefs:
+                c["match_reason"] = "Matches quality preferences, best price"
+            elif has_brand_prefs:
+                c["match_reason"] = "Preferred brand, best price"
+            else:
+                c["match_reason"] = "Allergen-safe, best price" if allergens else "Best price in category"
+        else:
+            c["match_reason"] = "Best available; no certified products found"
+        c["preference_matched"] = preference_matched
         products.append(c)
 
     return {"products": products}
