@@ -812,6 +812,12 @@ async def search_hybrid(req: SearchRequest):
         else None
     )
 
+    # Run rules-based NLU first so we avoid LLM when rules match (vegan recipes,
+    # recipes below 200 kcal, etc.). When extract_hybrid matches, pass intent/entities
+    # to orchestrate to skip LLM extraction — fixes search when LLM fails or returns
+    # invalid output.
+    nlu_result = extract_hybrid(req.query)
+
     result = await orchestrate(
         _driver,
         cfg=_cfg,
@@ -821,6 +827,8 @@ async def search_hybrid(req: SearchRequest):
         customer_profile=customer_profile,
         top_k=req.limit,
         database=database,
+        intent_override=nlu_result.intent,
+        entities_override=nlu_result.entities,
     )
 
     recommendations = _merge_results(
@@ -1336,8 +1344,9 @@ async def chat_process(req: ChatProcessRequest):
     ]
     effective_msg = expand_query_with_context(msg, history_pairs) if history_pairs else msg
 
-    # NLU: intent + entities (rules first, LLM fallback)
-    nlu_result = extract_hybrid(effective_msg)
+    # NLU: intent + entities (rules first, LLM fallback). Pass history for session-based
+    # intent continuation (e.g. "more options?" after substitution -> get_substitution_suggestion)
+    nlu_result = extract_hybrid(effective_msg, context={"history": history_pairs})
 
     # Action orchestrator: WRITE intents need confirmation
     orch = route_intent(nlu_result.intent, nlu_result.entities)
@@ -1437,15 +1446,27 @@ async def chat_process(req: ChatProcessRequest):
             database = os.getenv("NEO4J_DATABASE")
             profile = fetch_customer_profile(_driver, req.customer_id, database)
 
+            # For substitution follow-ups, use synthesized query if effective_msg is
+            # still vague (orchestrator re-extracts intent; "some more options?" is unclear)
+            orch_query = effective_msg
+            if nlu_result.intent == "get_substitution_suggestion":
+                ing = nlu_result.entities.get("ingredient")
+                if ing and len(effective_msg.split()) <= 15 and ing.lower() not in effective_msg.lower():
+                    orch_query = f"What are more substitutes for {ing}?"
+
+            # Pass intent/entities from chat NLU — skip LLM extraction in orchestrator.
+            # Avoids duplicate LLM calls and failures when LLM is down (chat rules still work).
             orch_result = await orchestrate(
                 _driver,
                 cfg=_cfg,
                 embedder=_embedder,
-                user_query=effective_msg,
+                user_query=orch_query,
                 customer_node_id=req.customer_id,
                 customer_profile=profile,
                 top_k=10,
                 database=database,
+                intent_override=nlu_result.intent,
+                entities_override=nlu_result.entities,
             )
 
             # Build conversation history from session (exclude current user message)
@@ -1458,7 +1479,7 @@ async def chat_process(req: ChatProcessRequest):
 
             _response = generate_chat_response(
                 orch_result,
-                effective_msg,
+                orch_query,
                 history_text,
                 customer_profile=profile,
                 temperature=0.3,

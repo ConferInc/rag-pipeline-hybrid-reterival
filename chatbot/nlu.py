@@ -69,6 +69,19 @@ _COURSE_KEYWORDS: dict[str, str] = {
     "noon": "lunch",
 }
 
+# Phrases that mean "give me more substitution options" — only used when history
+# shows a recent substitution turn (see extract_hybrid context handling)
+SUBSTITUTION_FOLLOW_UP_PATTERN = re.compile(
+    r"\b(more\s+(options?|substitutes?|alternatives?)|"
+    r"other\s+(options?|alternatives?|substitutes?)|"
+    r"some\s+more\s+(options?|alternatives?|substitutes?)?|"
+    r"(any|any\s+other)\s+(more\s+)?(options?|alternatives?|substitutes?)|"
+    r"alternatives?\s*\??|"
+    r"something\s+else|"
+    r"anything\s+else)\b",
+    re.I,
+)
+
 # Order matters: more specific patterns first
 RULE_PATTERNS: dict[str, str] = {
     # Conversational (no entities)
@@ -91,6 +104,12 @@ RULE_PATTERNS: dict[str, str] = {
     "set_preference": r"(i('?m| am) now|switch to|change to|set my diet)\b.*(keto|vegan|vegetarian|paleo|gluten)",
     # Out of domain
     "out_of_scope": r"\b(weather|news|stock|joke|code|program|politics|sports)\b",
+    # Substitution follow-up (explicit "more substitutes for X" even without history)
+    "get_substitution_suggestion": (
+        r"(more|other|additional)\s+(substitutes?|alternatives?|options?)\s+(?:for|to)\s+\w+"
+        r"|alternatives?\s+(?:to|for)\s+\w+"
+        r"|(?:some\s+)?more\s+(substitutes?|alternatives?)\b"
+    ),
 }
 
 # ── B2B patterns (vendor-scoped product/customer queries) ─────────────────────
@@ -408,6 +427,53 @@ def extract_hybrid_b2b(message: str, context: dict[str, Any] | None = None) -> N
     )
 
 
+def _last_turn_was_substitution(history: list[tuple[str, str]]) -> bool:
+    """True if the last assistant message is a substitution result."""
+    for role, content in reversed(history):
+        if role == "assistant":
+            c = content.lower()
+            return any(
+                kw in c
+                for kw in (
+                    "substitute",
+                    "alternatives",
+                    "instead of",
+                    "you can use",
+                    "replace",
+                )
+            )
+    return False
+
+
+def _extract_ingredient_from_substitution_context(
+    history: list[tuple[str, str]],
+) -> str | None:
+    """
+    Extract the original ingredient from recent substitution turns.
+    Looks for "alternatives to X", "substitutes for X", "for X you can use", etc.
+    """
+    # Scan last few turns for ingredient mention
+    text_parts: list[str] = []
+    for role, content in history[-4:]:
+        text_parts.append(content)
+    combined = " ".join(text_parts).lower()
+
+    # "alternatives to X" / "substitutes for X" / "replace X with"
+    for pat in (
+        r"alternatives?\s+(?:to|for)\s+([a-z][a-z\s]{1,30}?)(?:\?|\.|$|\s+(?:in|for)\b)",
+        r"substitutes?\s+for\s+([a-z][a-z\s]{1,30}?)(?:\?|\.|$|\s+(?:in|for)\b)",
+        r"(?:for|as\s+a\s+substitute\s+for)\s+([a-z][a-z\s]{1,30}?)(?:\s+you\s+can|\s+try|,|\.|$)",
+        r"replace\s+([a-z][a-z\s]{1,20}?)\s+with",
+        r"instead\s+of\s+([a-z][a-z\s]{1,20}?)(?:\s|,|\.|$)",
+    ):
+        m = re.search(pat, combined, re.I)
+        if m:
+            ing = m.group(1).strip()
+            if len(ing) >= 2 and len(ing) <= 40 and ing not in ("the", "a", "it"):
+                return ing
+    return None
+
+
 def extract_hybrid(message: str, context: dict[str, Any] | None = None) -> NLUResult:
     """
     Try rule-based extraction first. If no match or entities can't be extracted,
@@ -415,7 +481,9 @@ def extract_hybrid(message: str, context: dict[str, Any] | None = None) -> NLURe
 
     Args:
         message: User message
-        context: Optional context (e.g. session history) — reserved for future use
+        context: Optional context with "history": [(role, content), ...]. When
+                 the last assistant turn was a substitution result and the user
+                 says "more options", "alternatives", etc., forces get_substitution_suggestion.
 
     Returns:
         NLUResult with intent, entities, and source ("rules" | "llm" | "fallback")
@@ -425,6 +493,26 @@ def extract_hybrid(message: str, context: dict[str, Any] | None = None) -> NLURe
         return NLUResult(intent="unclear", entities={}, source="fallback")
 
     low = normalized.lower()
+
+    # Session-based intent continuation: if last assistant was substitution and
+    # user asks for more options/alternatives, force get_substitution_suggestion
+    history = (context or {}).get("history") if context else None
+    if history and isinstance(history, (list, tuple)):
+        hist = [(r, c) for r, c in history if isinstance(r, str) and isinstance(c, str)]
+        if hist and _last_turn_was_substitution(hist) and SUBSTITUTION_FOLLOW_UP_PATTERN.search(low):
+            ingredient = _extract_ingredient_from_substitution_context(hist)
+            entities: dict[str, Any] = {}
+            if ingredient:
+                entities["ingredient"] = ingredient
+            logger.debug(
+                "Session continuation: substitution follow-up",
+                extra={"message": normalized[:50], "ingredient": ingredient},
+            )
+            return NLUResult(
+                intent="get_substitution_suggestion",
+                entities=entities,
+                source="rules",
+            )
 
     # Tier 1: Rule-based matching
     for intent, pattern in RULE_PATTERNS.items():
@@ -529,5 +617,18 @@ def _extract_entities_by_rules(message: str, intent: str) -> dict[str, Any] | No
     # find_recipe_by_pantry: needs ingredients — return None for LLM
     if intent == "find_recipe_by_pantry":
         return None
+
+    # get_substitution_suggestion: try to extract ingredient from "for X" / "to X"
+    if intent == "get_substitution_suggestion":
+        for pat in (
+            r"(?:for|to)\s+([a-z][a-z\s]{1,30}?)(?:\?|\.|$|\s+(?:in|with)\b)",
+            r"alternatives?\s+(?:to|for)\s+([a-z][a-z\s]{1,30}?)(?:\?|\.|$)",
+        ):
+            m = re.search(pat, message, re.I)
+            if m:
+                ing = m.group(1).strip()
+                if 2 <= len(ing) <= 40:
+                    return {"ingredient": ing}
+        return {}
 
     return None
