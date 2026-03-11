@@ -189,6 +189,8 @@ async def orchestrate(
     top_k: int = 5,
     database: str | None = None,
     config_path: str = "embedding_config.yaml",
+    intent_override: str | None = None,
+    entities_override: dict[str, Any] | None = None,
 ) -> OrchestratorResult:
     """
     Run all three retrievals for a user query and return merged results.
@@ -206,6 +208,11 @@ async def orchestrate(
         top_k: Number of results per retrieval
         database: Neo4j database name
         config_path: Path to embedding_config.yaml
+        intent_override: Optional pre-extracted intent (e.g. from chat rules). When set,
+                        skips LLM intent extraction — use when caller already has intent
+                        (e.g. chat handler with rules-based NLU) to avoid LLM calls when
+                        the service is down.
+        entities_override: Optional pre-extracted entities. Used with intent_override.
 
     Returns:
         OrchestratorResult with all three retrieval outputs
@@ -227,121 +234,133 @@ async def orchestrate(
     result = OrchestratorResult(intent="unknown", entities={})
     on_parse_failure = intent_cfg.get("on_parse_failure", "abort")
 
-    try:
-        raw_response: str
-        parsed: dict[str, Any] | None = None
-
-        if on_parse_failure == "retry":
-            max_retries = intent_cfg.get("max_retries", 1)
-            retry_msg = intent_cfg.get("retry_user_message", "Return only valid JSON with keys 'intent' and 'entities'. No markdown.")
-            raw_response, parse_ok = extract_intent_with_retry(
-                user_query,
-                max_retries=max_retries,
-                retry_message=retry_msg,
-                config_path=config_path,
-            )
-            parsed = parse_extractor_output(raw_response) if parse_ok else None
-        else:
-            raw_response = extract_intent(user_query, config_path=config_path)
-            parsed = parse_extractor_output(raw_response)
-
-        if parsed is None:
-            if on_parse_failure == "fallback":
-                result.intent = intent_cfg.get("fallback_intent", "find_recipe")
-                result.entities = dict(intent_cfg.get("fallback_entities", {}))
-                logger.warning("Intent parse failed; using fallback intent=%s", result.intent)
-            else:
-                result.errors.append("Intent extraction error: invalid JSON")
-                return result
-        else:
-            check = sanity_check(parsed)
-            if check is not True:
-                logger.warning(
-                    "Intent extraction failed",
-                    extra={
-                        "component": "orchestrator",
-                        "query": query_truncated,
-                        "error": check[1],
-                    },
-                )
-                result.errors.append(f"Intent extraction failed: {check[1]}")
-                return result
-            result.intent = parsed["intent"]
-            result.entities = parsed["entities"]
-            result.confidence = parsed.get("confidence")
-            if result.confidence is None:
-                result.confidence = 0.5  # LLM omitted confidence — assume uncertain
-
-            # Step 4: If confidence < threshold, use fallback intent/entities
-            confidence_threshold = intent_cfg.get("confidence_threshold", 0.7)
-            conf = result.confidence
-            if conf is not None and conf < confidence_threshold:
-                result.intent = intent_cfg.get("fallback_intent", "find_recipe")
-                result.entities = dict(intent_cfg.get("fallback_entities", {}))
-                logger.info(
-                    "Low confidence, using fallback intent",
-                    extra={
-                        "component": "orchestrator",
-                        "query": query_truncated,
-                        "confidence": conf,
-                        "threshold": confidence_threshold,
-                        "fallback_intent": result.intent,
-                    },
-                )
-
-        # Entity enrichment: add missing diet/course from query keywords (when enabled)
+    # Use pre-extracted intent/entities when provided (avoids LLM when chat rules matched)
+    if intent_override and intent_override.strip():
+        result.intent = intent_override.strip()
+        result.entities = dict(entities_override or {})
+        result.confidence = 1.0
+        logger.debug(
+            "Using intent override (skip LLM)",
+            extra={"component": "orchestrator", "intent": result.intent},
+        )
+        # Still run enrichment (diet/course from query, profile merge, validation)
         result.entities = enrich_entities(user_query, result.entities, intent_cfg)
-
-        # Profile enrichment: silently merge the logged-in customer's stored diets,
-        # allergens, and health conditions into the extracted entities so the Cypher
-        # generator and prompt builder always enforce personalisation constraints even
-        # when the user didn't mention them in this query.
         if customer_profile:
             result.entities = merge_profile_into_entities(result.entities, customer_profile)
-            logger.debug(
-                "Profile enrichment applied",
-                extra={
-                    "component": "orchestrator",
-                    "query": query_truncated,
-                    "profile_diets": customer_profile.get("diets"),
-                    "profile_allergens": customer_profile.get("allergens"),
-                    "profile_conditions": customer_profile.get("health_conditions"),
-                },
-            )
-
-        # Entity validation: strip include_ingredient items that conflict with diet
         result.entities = validate_entity_compatibility(result.entities)
-
         t_extract_ms = (time.perf_counter() - t_extract) * 1000
-        entity_keys = list(result.entities.keys()) if result.entities else []
         logger.debug(
-            "Extraction complete",
+            "Extraction complete (override)",
             extra={
                 "component": "orchestrator",
                 "query": query_truncated,
                 "intent": result.intent,
-                "entity_keys": entity_keys,
+                "entity_keys": list(result.entities.keys()) if result.entities else [],
                 "latency_ms": round(t_extract_ms, 1),
             },
         )
+    else:
+        try:
+            raw_response: str
+            parsed: dict[str, Any] | None = None
 
-    except Exception as e:
-        if on_parse_failure == "fallback":
-            result.intent = intent_cfg.get("fallback_intent", "find_recipe")
-            result.entities = dict(intent_cfg.get("fallback_entities", {}))
-            logger.warning("Intent extraction exception; using fallback: %s", e)
-        else:
-            logger.error(
-                "Intent extraction error",
+            if on_parse_failure == "retry":
+                if on_parse_failure == "fallback":
+                    result.intent = intent_cfg.get("fallback_intent", "find_recipe")
+                    result.entities = dict(intent_cfg.get("fallback_entities", {}))
+                    logger.warning("Intent parse failed; using fallback intent=%s", result.intent)
+                else:
+                    result.errors.append("Intent extraction error: invalid JSON")
+                    return result
+            else:
+                check = sanity_check(parsed)
+                if check is not True:
+                    logger.warning(
+                        "Intent extraction failed",
+                        extra={
+                            "component": "orchestrator",
+                            "query": query_truncated,
+                            "error": check[1],
+                        },
+                    )
+                    result.errors.append(f"Intent extraction failed: {check[1]}")
+                    return result
+                result.intent = parsed["intent"]
+                result.entities = parsed["entities"]
+                result.confidence = parsed.get("confidence")
+                if result.confidence is None:
+                    result.confidence = 0.5  # LLM omitted confidence — assume uncertain
+
+                # Step 4: If confidence < threshold, use fallback intent/entities
+                confidence_threshold = intent_cfg.get("confidence_threshold", 0.7)
+                conf = result.confidence
+                if conf is not None and conf < confidence_threshold:
+                    result.intent = intent_cfg.get("fallback_intent", "find_recipe")
+                    result.entities = dict(intent_cfg.get("fallback_entities", {}))
+                    logger.info(
+                        "Low confidence, using fallback intent",
+                        extra={
+                            "component": "orchestrator",
+                            "query": query_truncated,
+                            "confidence": conf,
+                            "threshold": confidence_threshold,
+                            "fallback_intent": result.intent,
+                        },
+                    )
+
+            # Entity enrichment: add missing diet/course from query keywords (when enabled)
+            result.entities = enrich_entities(user_query, result.entities, intent_cfg)
+
+            # Profile enrichment: silently merge the logged-in customer's stored diets,
+            # allergens, and health conditions into the extracted entities so the Cypher
+            # generator and prompt builder always enforce personalisation constraints even
+            # when the user didn't mention them in this query.
+            if customer_profile:
+                result.entities = merge_profile_into_entities(result.entities, customer_profile)
+                logger.debug(
+                    "Profile enrichment applied",
+                    extra={
+                        "component": "orchestrator",
+                        "query": query_truncated,
+                        "profile_diets": customer_profile.get("diets"),
+                        "profile_allergens": customer_profile.get("allergens"),
+                        "profile_conditions": customer_profile.get("health_conditions"),
+                    },
+                )
+
+            # Entity validation: strip include_ingredient items that conflict with diet
+            result.entities = validate_entity_compatibility(result.entities)
+
+            t_extract_ms = (time.perf_counter() - t_extract) * 1000
+            entity_keys = list(result.entities.keys()) if result.entities else []
+            logger.debug(
+                "Extraction complete",
                 extra={
                     "component": "orchestrator",
                     "query": query_truncated,
-                    "error": str(e),
+                    "intent": result.intent,
+                    "entity_keys": entity_keys,
+                    "latency_ms": round(t_extract_ms, 1),
                 },
-                exc_info=True,
             )
-            result.errors.append(f"Intent extraction error: {e}")
-            return result
+
+        except Exception as e:
+            if on_parse_failure == "fallback":
+                result.intent = intent_cfg.get("fallback_intent", "find_recipe")
+                result.entities = dict(intent_cfg.get("fallback_entities", {}))
+                logger.warning("Intent extraction exception; using fallback: %s", e)
+            else:
+                logger.error(
+                    "Intent extraction error",
+                    extra={
+                        "component": "orchestrator",
+                        "query": query_truncated,
+                        "error": str(e),
+                    },
+                    exc_info=True,
+                )
+                result.errors.append(f"Intent extraction error: {e}")
+                return result
 
     # ── Step 2–4: Parallel retrieval (semantic, structural, cypher) ────────────
     # Run all three paths concurrently via asyncio.to_thread. Structural is skipped
