@@ -29,15 +29,18 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from rag_pipeline.augmentation.fusion import apply_rrf
+from rag_pipeline.augmentation.response_sanitizer import sanitize_response
 from rag_pipeline.config import load_embedding_config
 from rag_pipeline.embeddings.caching_embedder import CachingQueryEmbedder
 from rag_pipeline.embeddings.openai_embedder import OpenAIQueryEmbedder
 from rag_pipeline.neo4j_client import create_neo4j_driver, neo4j_settings_from_env
+from rag_pipeline.profile import resolve_profile_for_recommendation
 from rag_pipeline.nlu.intents import CHATBOT_DATA_INTENTS, DATA_INTENTS_NEEDING_RETRIEVAL
 from rag_pipeline.orchestrator.constraint_filter import apply_hard_constraints, build_zero_results_message
 from rag_pipeline.orchestrator.cypher_runner import run_cypher_retrieval
 from rag_pipeline.orchestrator.orchestrator import orchestrate, OrchestratorResult
 from rag_pipeline.retrieval.service import retrieve_semantic, SemanticRetrievalRequest
+from rag_pipeline.retrieval.similar_constraint import retrieve_recipes_from_similar_constraint_users
 from rag_pipeline.retrieval.structural import get_seed_embedding, structural_search_with_expansion
 
 from chatbot.action_orchestrator import (
@@ -80,12 +83,13 @@ load_dotenv()
 _driver = None
 _cfg = None
 _embedder = None
+_response_validation_cfg: dict[str, Any] = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize Neo4j driver + embedder on startup, close on shutdown."""
-    global _driver, _cfg, _embedder
+    global _driver, _cfg, _embedder, _response_validation_cfg
 
     neo_settings = neo4j_settings_from_env()
     neo_timeout = os.getenv("NEO4J_CONNECTION_TIMEOUT")
@@ -108,8 +112,10 @@ async def lifespan(app: FastAPI):
         with open(Path(config_path)) as f:
             raw_cfg = yaml.safe_load(f)
         cache_cfg = (raw_cfg or {}).get("embedding_cache", {}) or {}
+        _response_validation_cfg = (raw_cfg or {}).get("response_validation", {}) or {}
     except Exception:
         cache_cfg = {}
+        _response_validation_cfg = {}
     if cache_cfg.get("enabled", False):
         _embedder = CachingQueryEmbedder(
             base_embedder,
@@ -207,6 +213,12 @@ class SearchRequest(BaseModel):
     customer_id: str | None = Field(None, description="B2C customer UUID (for personalization)")
     filters: dict[str, Any] = Field(default_factory=dict, description="Structured filters")
     limit: int = Field(20, ge=1, le=50)
+    household_id: str | None = Field(None, description="Household UUID for family-scoped profile resolution")
+    scope: str | None = Field(None, description="Profile scope: individual | couple | family")
+    member_profile: dict[str, Any] | None = Field(
+        None,
+        description="Pre-built profile: {diets: [], allergens: [], health_conditions: [], ...}. Used when provided.",
+    )
 
 
 class FeedRequest(BaseModel):
@@ -214,18 +226,30 @@ class FeedRequest(BaseModel):
     customer_id: str = Field(..., description="B2C customer UUID (required for personalization)")
     meal_type: str | None = Field(None, description="Optional meal type hint: breakfast/lunch/dinner/snack")
     limit: int = Field(50, ge=1, le=50)
+    household_id: str | None = Field(None, description="Household UUID for family-scoped profile resolution")
+    scope: str | None = Field(None, description="Profile scope: individual | couple | family")
+    member_profile: dict[str, Any] | None = Field(
+        None,
+        description="Pre-built profile: {diets: [], allergens: [], health_conditions: [], health_goal, ...}. Used when provided.",
+    )
 
 
 class MealCandidateRequest(BaseModel):
     """
     Pre-scored recipe candidates for meal plan generation.
-    Single customer only — uses profile from customer_id.
+    Supports household scope: individual (self), couple (both primary adults), family (all members).
     """
     customer_id: str = Field(..., description="B2C customer UUID")
     meal_history: list[str] = Field(default_factory=list, description="Recipe IDs to exclude (e.g. from PostgreSQL meal_logs)")
     meal_type: str | None = Field(None, description="Optional: breakfast/lunch/dinner/snack")
     exclude_ids: list[str] = Field(default_factory=list, description="Additional recipe IDs to exclude (e.g. for swap)")
     limit: int = Field(50, ge=1, le=100)
+    household_id: str | None = Field(None, description="Household UUID for family-scoped profile resolution")
+    scope: str | None = Field(None, description="Profile scope: individual | couple | family")
+    member_profile: dict[str, Any] | None = Field(
+        None,
+        description="Pre-built profile: {diets: [], allergens: [], health_conditions: [], ...}. Used when provided.",
+    )
 
 
 class MealCandidateItem(BaseModel):
@@ -376,6 +400,11 @@ class ChatProcessRequest(BaseModel):
     customer_id: str = Field(..., description="B2C customer UUID")
     session_id: str | None = Field(None, description="Existing session UUID (null for new session)")
     display_name: str | None = Field(None, description="Customer name from auth/PostgreSQL if Neo4j has none")
+    household_id: str | None = Field(None, description="Household UUID for family-scoped profile resolution")
+    member_profile: dict[str, Any] | None = Field(
+        None,
+        description="Pre-built profile: {diets: [], allergens: [], health_conditions: [], ...}. Used when provided.",
+    )
 
 
 class ChatRecipeItem(BaseModel):
@@ -488,6 +517,72 @@ def fetch_customer_profile(
             "diets": [], "allergens": [], "health_conditions": [],
             "health_goal": None, "activity_level": None, "recent_recipes": [],
         }
+
+
+def _member_profile_to_profile(member_profile: dict[str, Any]) -> dict[str, Any]:
+    """Convert member_profile dict from request to fetch_customer_profile shape."""
+    return {
+        "display_name": member_profile.get("display_name"),
+        "diets": list(member_profile.get("diets") or []),
+        "allergens": list(member_profile.get("allergens") or []),
+        "health_conditions": list(member_profile.get("health_conditions") or []),
+        "health_goal": member_profile.get("health_goal"),
+        "activity_level": member_profile.get("activity_level"),
+        "recent_recipes": list(member_profile.get("recent_recipes") or []),
+    }
+
+
+def _is_aggregated_profile(
+    *,
+    scope: str | None = None,
+    family_scope: str | None = None,
+    target_member_role: str | None = None,
+) -> bool:
+    """True when profile is aggregated (family/couple) — use similar-constraint retrieval."""
+    if scope:
+        s = (scope or "").strip().lower()
+        if s in ("family", "couple"):
+            return True
+    if (family_scope or "").strip().lower() == "family":
+        return True
+    if (target_member_role or "").strip():
+        return True
+    return False
+
+
+def _resolve_profile(
+    driver: Driver,
+    customer_id: str,
+    database: str | None,
+    *,
+    household_id: str | None = None,
+    scope: str | None = None,
+    family_scope: str | None = None,
+    target_member_role: str | None = None,
+    member_profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Resolve profile for recommendations. Uses member_profile when provided;
+    else resolve_profile_for_recommendation with scope / NLU entities.
+    """
+    if member_profile and isinstance(member_profile, dict):
+        return _member_profile_to_profile(member_profile)
+    fs = family_scope
+    tm = target_member_role
+    if scope:
+        s = (scope or "").strip().lower()
+        if s == "family":
+            fs = "family"
+        elif s == "couple":
+            tm = "primary_adult"
+    return resolve_profile_for_recommendation(
+        driver,
+        customer_id,
+        household_id=household_id,
+        family_scope=fs,
+        target_member_role=tm,
+        database=database,
+    )
 
 
 _GOAL_WORDS: dict[str, str] = {
@@ -805,19 +900,28 @@ async def search_hybrid(req: SearchRequest):
     start = time.time()
     database = os.getenv("NEO4J_DATABASE")
 
-    # Fetch profile once if the user is logged in; None for guest/anonymous searches.
-    customer_profile = (
-        fetch_customer_profile(_driver, req.customer_id, database)
-        if req.customer_id
-        else None
-    )
-
-    # Run rules-based NLU first so we avoid LLM when rules match (vegan recipes,
-    # recipes below 200 kcal, etc.). When extract_hybrid matches, pass intent/entities
-    # to orchestrate to skip LLM extraction — fixes search when LLM fails or returns
-    # invalid output.
+    # Run NLU first (needed for family_scope / target_member_role from query)
     nlu_result = extract_hybrid(req.query)
 
+    # Resolve profile: member_profile > request scope > NLU entities > single customer
+    customer_profile = None
+    if req.customer_id:
+        customer_profile = _resolve_profile(
+            _driver,
+            req.customer_id,
+            database,
+            household_id=req.household_id,
+            scope=req.scope,
+            member_profile=req.member_profile,
+            family_scope=nlu_result.entities.get("family_scope"),
+            target_member_role=nlu_result.entities.get("target_member_role"),
+        )
+
+    is_aggregated = _is_aggregated_profile(
+        scope=req.scope,
+        family_scope=nlu_result.entities.get("family_scope"),
+        target_member_role=nlu_result.entities.get("target_member_role"),
+    )
     result = await orchestrate(
         _driver,
         cfg=_cfg,
@@ -825,6 +929,7 @@ async def search_hybrid(req: SearchRequest):
         user_query=req.query,
         customer_node_id=req.customer_id,
         customer_profile=customer_profile,
+        is_aggregated_profile=is_aggregated,
         top_k=req.limit,
         database=database,
         intent_override=nlu_result.intent,
@@ -877,7 +982,14 @@ async def recommend_feed(req: FeedRequest):
     start = time.time()
     database = os.getenv("NEO4J_DATABASE")
 
-    profile = fetch_customer_profile(_driver, req.customer_id, database)
+    profile = _resolve_profile(
+        _driver,
+        req.customer_id,
+        database,
+        household_id=req.household_id,
+        scope=req.scope,
+        member_profile=req.member_profile,
+    )
 
     entities: dict[str, Any] = {
         "diet":               profile["diets"],
@@ -905,29 +1017,40 @@ async def recommend_feed(req: FeedRequest):
     except Exception as e:
         logger.warning("recommend_feed: semantic retrieval failed: %s", e)
 
-    # ── Structural retrieval ──────────────────────────────────────────────
+    # ── Structural or similar-constraint retrieval ─────────────────────────
     structural_results: dict[str, Any] = {}
+    is_aggregated = _is_aggregated_profile(scope=req.scope)
     try:
-        seed_emb = get_seed_embedding(
-            _driver,
-            cfg=_cfg,
-            label="B2C_Customer",
-            node_id=req.customer_id,
-            database=database,
-        )
-        if seed_emb:
-            structural_results = structural_search_with_expansion(
+        if is_aggregated:
+            structural_results = retrieve_recipes_from_similar_constraint_users(
+                _driver,
+                diets=profile["diets"],
+                allergens=profile["allergens"],
+                health_conditions=profile["health_conditions"],
+                top_k=req.limit,
+                database=database,
+            )
+        else:
+            seed_emb = get_seed_embedding(
                 _driver,
                 cfg=_cfg,
                 label="B2C_Customer",
-                seed_vector=seed_emb,
-                top_k=req.limit,
-                allowed_labels=["Recipe"],
-                allowed_relationships=["SAVED", "VIEWED"],
+                node_id=req.customer_id,
                 database=database,
             )
+            if seed_emb:
+                structural_results = structural_search_with_expansion(
+                    _driver,
+                    cfg=_cfg,
+                    label="B2C_Customer",
+                    seed_vector=seed_emb,
+                    top_k=req.limit,
+                    allowed_labels=["Recipe"],
+                    allowed_relationships=["SAVED", "VIEWED"],
+                    database=database,
+                )
     except Exception as e:
-        logger.warning("recommend_feed: structural retrieval failed: %s", e)
+        logger.warning("recommend_feed: structural/similar-constraint retrieval failed: %s", e)
 
     # ── Cypher retrieval ──────────────────────────────────────────────────
     cypher_results: list[dict[str, Any]] = []
@@ -1003,7 +1126,14 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
     start = time.time()
     database = os.getenv("NEO4J_DATABASE")
 
-    profile = fetch_customer_profile(_driver, req.customer_id, database)
+    profile = _resolve_profile(
+        _driver,
+        req.customer_id,
+        database,
+        household_id=req.household_id,
+        scope=req.scope,
+        member_profile=req.member_profile,
+    )
 
     entities: dict[str, Any] = {
         "diet": profile["diets"],
@@ -1031,29 +1161,40 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
     except Exception as e:
         logger.warning("recommend_meal_candidates: semantic retrieval failed: %s", e)
 
-    # ── Structural retrieval ──────────────────────────────────────────────
+    # ── Structural or similar-constraint retrieval ─────────────────────────
     structural_results: dict[str, Any] = {}
+    is_aggregated = _is_aggregated_profile(scope=req.scope)
     try:
-        seed_emb = get_seed_embedding(
-            _driver,
-            cfg=_cfg,
-            label="B2C_Customer",
-            node_id=req.customer_id,
-            database=database,
-        )
-        if seed_emb:
-            structural_results = structural_search_with_expansion(
+        if is_aggregated:
+            structural_results = retrieve_recipes_from_similar_constraint_users(
+                _driver,
+                diets=profile["diets"],
+                allergens=profile["allergens"],
+                health_conditions=profile["health_conditions"],
+                top_k=req.limit,
+                database=database,
+            )
+        else:
+            seed_emb = get_seed_embedding(
                 _driver,
                 cfg=_cfg,
                 label="B2C_Customer",
-                seed_vector=seed_emb,
-                top_k=req.limit,
-                allowed_labels=["Recipe"],
-                allowed_relationships=["SAVED", "VIEWED"],
+                node_id=req.customer_id,
                 database=database,
             )
+            if seed_emb:
+                structural_results = structural_search_with_expansion(
+                    _driver,
+                    cfg=_cfg,
+                    label="B2C_Customer",
+                    seed_vector=seed_emb,
+                    top_k=req.limit,
+                    allowed_labels=["Recipe"],
+                    allowed_relationships=["SAVED", "VIEWED"],
+                    database=database,
+                )
     except Exception as e:
-        logger.warning("recommend_meal_candidates: structural retrieval failed: %s", e)
+        logger.warning("recommend_meal_candidates: structural/similar-constraint retrieval failed: %s", e)
 
     # ── Cypher retrieval ──────────────────────────────────────────────────
     cypher_results: list[dict[str, Any]] = []
@@ -1419,7 +1560,15 @@ async def chat_process(req: ChatProcessRequest):
     # Template intents — canned response, no retrieval/LLM (fetch profile for personalization)
     if nlu_result.intent in TEMPLATE_INTENTS:
         database = os.getenv("NEO4J_DATABASE")
-        profile = fetch_customer_profile(_driver, req.customer_id, database)
+        profile = _resolve_profile(
+            _driver,
+            req.customer_id,
+            database,
+            household_id=req.household_id,
+            member_profile=req.member_profile,
+            family_scope=nlu_result.entities.get("family_scope"),
+            target_member_role=nlu_result.entities.get("target_member_role"),
+        )
         display_name = profile.get("display_name") or req.display_name
         _response = get_template_response(
             nlu_result.intent,
@@ -1444,7 +1593,15 @@ async def chat_process(req: ChatProcessRequest):
     if nlu_result.intent in DATA_INTENTS_NEEDING_RETRIEVAL:
         try:
             database = os.getenv("NEO4J_DATABASE")
-            profile = fetch_customer_profile(_driver, req.customer_id, database)
+            profile = _resolve_profile(
+                _driver,
+                req.customer_id,
+                database,
+                household_id=req.household_id,
+                member_profile=req.member_profile,
+                family_scope=nlu_result.entities.get("family_scope"),
+                target_member_role=nlu_result.entities.get("target_member_role"),
+            )
 
             # For substitution follow-ups, use synthesized query if effective_msg is
             # still vague (orchestrator re-extracts intent; "some more options?" is unclear)
@@ -1456,6 +1613,10 @@ async def chat_process(req: ChatProcessRequest):
 
             # Pass intent/entities from chat NLU — skip LLM extraction in orchestrator.
             # Avoids duplicate LLM calls and failures when LLM is down (chat rules still work).
+            is_aggregated = _is_aggregated_profile(
+                family_scope=nlu_result.entities.get("family_scope"),
+                target_member_role=nlu_result.entities.get("target_member_role"),
+            )
             orch_result = await orchestrate(
                 _driver,
                 cfg=_cfg,
@@ -1463,6 +1624,7 @@ async def chat_process(req: ChatProcessRequest):
                 user_query=orch_query,
                 customer_node_id=req.customer_id,
                 customer_profile=profile,
+                is_aggregated_profile=is_aggregated,
                 top_k=10,
                 database=database,
                 intent_override=nlu_result.intent,
@@ -1485,6 +1647,13 @@ async def chat_process(req: ChatProcessRequest):
                 temperature=0.3,
                 max_fused=10,
             )
+            if _response_validation_cfg.get("enabled", False):
+                _response = sanitize_response(
+                    _response,
+                    profile,
+                    intent=nlu_result.intent,
+                    config=_response_validation_cfg,
+                )
             session.add_message("assistant", _response)
 
             # Map fused results to ChatRecipeItem for recipe intents

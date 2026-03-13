@@ -11,11 +11,56 @@ from rag_pipeline.augmentation.fusion import format_fused_results_as_text
 from rag_pipeline.orchestrator.orchestrator import OrchestratorResult
 
 
-SYSTEM_PROMPT = """You are a Nutrition assistant. Recommend recipes and answer food/nutrition questions using ONLY the context below.
+SYSTEM_PROMPT_BASE = """You are a Nutrition assistant. Recommend recipes and answer food/nutrition questions using ONLY the context below.
 
-RULES: Use only recipes/ingredients from the context. Respect allergens, diets, and health conditions. If no suitable options, say so and suggest refining the query. Be concise and practical.
+RULES: Use only recipes/ingredients from the context. If no suitable options in the context, say "I don't have matching recipes in my database" and suggest refining the query. Do NOT invent recipes or ingredients. Be concise and practical.
 
 PERSONALIZATION: When [USER PROFILE] is provided: use the customer's name when greeting; respect diets, allergens, and health conditions; tailor suggestions to their health goal and activity level; reference recent meals when avoiding repetition helps."""
+
+# Backward compatibility for cli.py and other consumers
+SYSTEM_PROMPT = SYSTEM_PROMPT_BASE
+
+
+def _build_constraint_instructions(profile: dict[str, Any]) -> str:
+    """
+    Build explicit constraint instructions for the LLM when profile has allergens,
+    diets, or health conditions. Reduces hallucination of non-compliant ingredients.
+    """
+    lines: list[str] = []
+
+    allergens = profile.get("allergens") or []
+    if allergens:
+        lines.append(f"NEVER suggest or mention these allergens: {', '.join(allergens)}. Never include them in recipes or substitutes.")
+
+    diets = profile.get("diets") or []
+    if diets:
+        diet_rules: list[str] = []
+        for d in diets:
+            d_lower = (d or "").strip().lower()
+            if "vegan" in d_lower:
+                diet_rules.append("Vegan: no meat, fish, poultry, dairy, eggs, honey, or other animal products")
+            elif "vegetarian" in d_lower:
+                diet_rules.append("Vegetarian: no meat, fish, poultry")
+            elif "keto" in d_lower or "ketogenic" in d_lower:
+                diet_rules.append("Keto: no grains, sugar, high-carb ingredients (bread, pasta, rice)")
+            elif "paleo" in d_lower:
+                diet_rules.append("Paleo: no grains, legumes, dairy, refined sugar")
+            elif "gluten" in d_lower:
+                diet_rules.append("Gluten-Free: no wheat, barley, rye, or gluten-containing ingredients")
+            elif "dairy" in d_lower:
+                diet_rules.append("Dairy-Free: no milk, cheese, butter, yogurt, cream")
+            elif "nut" in d_lower:
+                diet_rules.append("Nut-Free: no peanuts, tree nuts")
+            else:
+                diet_rules.append(f"{d}: comply with standard {d} guidelines")
+        if diet_rules:
+            lines.append(f"ONLY suggest ingredients compliant with: {'; '.join(diet_rules)}")
+
+    conditions = profile.get("health_conditions") or []
+    if conditions:
+        lines.append(f"Consider these health conditions: {', '.join(conditions)}. Avoid or warn about ingredients that could worsen them (e.g. high-sodium for hypertension, high-sugar for diabetes).")
+
+    return " ".join(lines) if lines else ""
 
 
 # Max recent recipes in profile to limit token cost
@@ -94,7 +139,13 @@ def build_augmented_prompt(
     """
     sections: list[str] = []
 
-    sections.append(f"[SYSTEM]\n{SYSTEM_PROMPT}")
+    # Build system prompt: base + optional constraint instructions
+    system_prompt = SYSTEM_PROMPT_BASE
+    if customer_profile:
+        constraint_instructions = _build_constraint_instructions(customer_profile)
+        if constraint_instructions:
+            system_prompt = f"{system_prompt}\n\nHARD CONSTRAINTS: {constraint_instructions}"
+    sections.append(f"[SYSTEM]\n{system_prompt}")
 
     # ── Customer profile (injected right after system prompt) ──────────────────
     if customer_profile:
