@@ -82,6 +82,37 @@ SUBSTITUTION_FOLLOW_UP_PATTERN = re.compile(
     re.I,
 )
 
+# ── Phase 2: Family scope & target member (role-based, no member_id) ───────────
+# family_scope: "self" | "family" — who the query is for (household-wide vs self)
+# target_member_role: "primary_adult" | "child" | "dependent" — which role's profile to use
+# Note: We use role_type only; resolution to customer_id happens via household lookup.
+
+# Entire household: "for my family", "everyone can eat", etc.
+FAMILY_SCOPE_PATTERN = re.compile(
+    r"\b("
+    r"my family|the family|whole family|our family|"
+    r"everyone|all of us|the household|"
+    r"safe for everyone|everyone can eat|"
+    r"family.?friendly|kid.?friendly|"
+    r"the whole house|cook for all"
+    r")\b",
+    re.I,
+)
+
+# Self: "for me", "for myself"
+FAMILY_SCOPE_SELF_PATTERN = re.compile(r"\b(for\s+(me|myself)|recommend\s+(to\s+)?me)\b", re.I)
+
+# Target member by role — maps natural language to role_type (primary_adult, child, dependent)
+# Order matters: more specific patterns first
+TARGET_MEMBER_ROLE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    # primary_adult: the other adult in the household
+    (re.compile(r"\b(for|to)\s+(my\s+)?(wife|husband|spouse|partner)\b", re.I), "primary_adult"),
+    # child: kids, children, daughter, son
+    (re.compile(r"\b(for|to)\s+(my\s+)?(kids?|children|daughter|son|child)\b", re.I), "child"),
+    # dependent: teen, dependent (less common in natural language)
+    (re.compile(r"\b(for|to)\s+(my\s+)?(teen|dependent)\b", re.I), "dependent"),
+]
+
 # Order matters: more specific patterns first
 RULE_PATTERNS: dict[str, str] = {
     # Conversational (no entities)
@@ -427,6 +458,37 @@ def extract_hybrid_b2b(message: str, context: dict[str, Any] | None = None) -> N
     )
 
 
+def _extract_family_context(message: str) -> dict[str, Any]:
+    """
+    Extract family_scope and target_member_role from message.
+
+    Returns dict with optional keys:
+      family_scope: "self" | "family" | None
+      target_member_role: "primary_adult" | "child" | "dependent" | None
+
+    Uses role_type only (no member_id). Resolution to customer_id happens via
+    household lookup in the profile layer.
+    """
+    low = message.strip().lower()
+    out: dict[str, Any] = {}
+
+    # family_scope: household-wide vs self
+    if FAMILY_SCOPE_PATTERN.search(low):
+        out["family_scope"] = "family"
+    elif FAMILY_SCOPE_SELF_PATTERN.search(low):
+        out["family_scope"] = "self"
+
+    # target_member_role: which role's profile to use (primary_adult, child, dependent)
+    # Only set if family_scope is not "family" (family = whole household, no single role)
+    if out.get("family_scope") != "family":
+        for pattern, role in TARGET_MEMBER_ROLE_PATTERNS:
+            if pattern.search(low):
+                out["target_member_role"] = role
+                break
+
+    return out
+
+
 def _last_turn_was_substitution(history: list[tuple[str, str]]) -> bool:
     """True if the last assistant message is a substitution result."""
     for role, content in reversed(history):
@@ -514,11 +576,21 @@ def extract_hybrid(message: str, context: dict[str, Any] | None = None) -> NLURe
                 source="rules",
             )
 
+    def _merge_family_ctx(ents: dict[str, Any]) -> dict[str, Any]:
+        """Merge family_scope and target_member_role into entities."""
+        fc = _extract_family_context(message)
+        if not fc:
+            return ents
+        merged = dict(ents)
+        merged.update(fc)
+        return merged
+
     # Tier 1: Rule-based matching
     for intent, pattern in RULE_PATTERNS.items():
         if re.search(pattern, low):
             entities = _extract_entities_by_rules(low, intent)
             if entities is not None:
+                entities = _merge_family_ctx(entities)
                 return NLUResult(intent=intent, entities=entities, source="rules")
 
     # Tier 2: LLM extraction (for complex/ambiguous queries)
@@ -527,16 +599,18 @@ def extract_hybrid(message: str, context: dict[str, Any] | None = None) -> NLURe
         parsed = json.loads(raw) if isinstance(raw, str) else raw
         check = sanity_check(parsed)
         if check is True:
+            entities = _merge_family_ctx(parsed.get("entities", {}))
             return NLUResult(
                 intent=parsed["intent"],
-                entities=parsed.get("entities", {}),
+                entities=entities,
                 source="llm",
             )
     except Exception:
         pass
 
     # Fallback: treat as generic recipe search
-    return NLUResult(intent="find_recipe", entities={"dish": message}, source="fallback")
+    entities = _merge_family_ctx({"dish": message})
+    return NLUResult(intent="find_recipe", entities=entities, source="fallback")
 
 
 def _extract_entities_by_rules(message: str, intent: str) -> dict[str, Any] | None:

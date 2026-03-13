@@ -240,12 +240,14 @@ generation:
   max_tokens: 1024               # Lower = less cost; 512-1024 usually enough for recipe answers
   temperature: 0.5               # 0-0.5 = more deterministic, 0.5-0.7 = slightly creative
 
-# Response post-validation (forbidden items: allergens, excluded ingredients)
+# Response post-validation: sanitize LLM output for allergen/diet compliance
+# Runs after generation for recipe/ingredient-suggesting intents
 response_validation:
-  enabled: false
-  action: warn  # warn | truncate | reject
-  forbidden_extra_terms: []  # Additional terms beyond exclude_ingredient
-  warn_disclaimer: "\n\n_Please verify allergens and dietary restrictions before consuming._"
+  enabled: true
+  redact_allergens: true
+  redact_diet: true
+  append_disclaimer: true
+  warn_disclaimer: "\n\n_Please verify ingredients against your dietary needs and allergens._"
   reject_fallback_message: "I couldn't safely generate a recommendation. Please verify any dietary restrictions or allergens."
   truncate_fallback_message: "Some content was removed for safety. Please double-check allergens and dietary restrictions."
 

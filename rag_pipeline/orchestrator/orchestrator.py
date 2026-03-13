@@ -26,6 +26,7 @@ from rag_pipeline.orchestrator.entity_enrichment import enrich_entities
 from rag_pipeline.orchestrator.entity_validation import validate_entity_compatibility
 from rag_pipeline.orchestrator.profile_enrichment import merge_profile_into_entities
 from rag_pipeline.retrieval.service import SemanticRetrievalRequest, retrieve_semantic
+from rag_pipeline.retrieval.similar_constraint import retrieve_recipes_from_similar_constraint_users
 from rag_pipeline.retrieval.structural import (
     get_seed_embedding,
     structural_search_with_expansion,
@@ -94,6 +95,27 @@ def _run_semantic(
         return []
 
     return [r for r in results if getattr(r, "score_raw", 1.0) >= semantic_min_score]
+
+
+def _run_similar_constraint(
+    driver: Driver,
+    profile: dict[str, Any],
+    top_k: int,
+    database: str | None,
+) -> dict[str, Any]:
+    """Run similar-constraint retrieval for aggregated profiles (sync worker for asyncio.to_thread)."""
+    try:
+        return retrieve_recipes_from_similar_constraint_users(
+            driver,
+            diets=profile.get("diets"),
+            allergens=profile.get("allergens"),
+            health_conditions=profile.get("health_conditions"),
+            top_k=top_k,
+            database=database,
+        )
+    except Exception as e:
+        logger.warning("Similar-constraint retrieval failed: %s", e)
+        return {}
 
 
 def _run_structural(
@@ -186,6 +208,7 @@ async def orchestrate(
     user_query: str,
     customer_node_id: str | None = None,
     customer_profile: dict[str, Any] | None = None,
+    is_aggregated_profile: bool = False,
     top_k: int = 5,
     database: str | None = None,
     config_path: str = "embedding_config.yaml",
@@ -205,6 +228,8 @@ async def orchestrate(
                           the customer's stored diets, allergens, and health conditions are
                           merged into the extracted entities before Cypher retrieval so that
                           personalisation constraints are always enforced silently.
+        is_aggregated_profile: When True (family/couple scope), use similar-constraint retrieval
+                              instead of structural retrieval.
         top_k: Number of results per retrieval
         database: Neo4j database name
         config_path: Path to embedding_config.yaml
@@ -383,9 +408,18 @@ async def orchestrate(
     async def _empty_structural() -> dict[str, Any]:
         return {}
 
-    skip_structural = (
-        result.intent not in STRUCTURAL_INTENTS or not customer_node_id
+    use_similar_constraint = (
+        is_aggregated_profile
+        and customer_profile
+        and result.intent in STRUCTURAL_INTENTS
     )
+    use_structural = (
+        not use_similar_constraint
+        and customer_node_id
+        and result.intent in STRUCTURAL_INTENTS
+    )
+    skip_structural = not use_similar_constraint and not use_structural
+
     if skip_structural:
         logger.debug(
             "Skipping structural retrieval",
@@ -393,6 +427,7 @@ async def orchestrate(
                 "component": "orchestrator",
                 "intent": result.intent,
                 "has_customer": bool(customer_node_id),
+                "is_aggregated": is_aggregated_profile,
             },
         )
 
@@ -414,16 +449,26 @@ async def orchestrate(
     structural_task = (
         _empty_structural()
         if skip_structural
-        else asyncio.to_thread(
-            _run_structural,
-            driver,
-            cfg,
-            customer_node_id,
-            result.intent,
-            intent_structural,
-            top_k,
-            structural_min_score,
-            database,
+        else (
+            asyncio.to_thread(
+                _run_similar_constraint,
+                driver,
+                customer_profile,
+                top_k,
+                database,
+            )
+            if use_similar_constraint
+            else asyncio.to_thread(
+                _run_structural,
+                driver,
+                cfg,
+                customer_node_id,
+                result.intent,
+                intent_structural,
+                top_k,
+                structural_min_score,
+                database,
+            )
         )
     )
     cypher_task = asyncio.to_thread(
