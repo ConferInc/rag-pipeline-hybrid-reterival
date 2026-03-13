@@ -103,6 +103,12 @@ def _build_profile_section(profile: dict[str, Any]) -> str:
         capped = recent[: _PROFILE_RECENT_RECIPES_CAP]
         lines.append(f"Recent meals: {', '.join(capped)}")
 
+    household_type = profile.get("household_type")
+    if household_type and isinstance(household_type, str):
+        ht = household_type.strip().lower()
+        if ht in ("individual", "couple", "family"):
+            lines.append(f"Household type: {ht}")
+
     return "\n".join(lines) if lines else ""
 
 

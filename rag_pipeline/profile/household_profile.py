@@ -32,6 +32,9 @@ _PROFILE_KEYS = [
 ]
 
 
+VALID_HOUSEHOLD_TYPES = frozenset({"individual", "couple", "family"})
+
+
 def _empty_profile() -> dict[str, Any]:
     """Return an empty profile dict with the expected shape."""
     return {
@@ -42,7 +45,41 @@ def _empty_profile() -> dict[str, Any]:
         "health_goal": None,
         "activity_level": None,
         "recent_recipes": [],
+        "household_type": None,
     }
+
+
+def get_household_type(
+    driver: Driver,
+    household_id: str,
+    database: str | None = None,
+) -> str | None:
+    """
+    Get household_type (individual | couple | family) for a household from Neo4j.
+
+    Returns None if household not found or household_type is missing/invalid.
+    """
+    if not household_id or not isinstance(household_id, str):
+        return None
+    cypher = """
+    MATCH (h:Household)
+    WHERE h.id = $household_id
+    RETURN h.household_type AS household_type
+    LIMIT 1
+    """
+    try:
+        with driver.session(database=database) as session:
+            record = session.run(cypher, household_id=household_id).single()
+            if not record:
+                return None
+            raw = record.get("household_type")
+            if not raw:
+                return None
+            ht = str(raw).strip().lower()
+            return ht if ht in VALID_HOUSEHOLD_TYPES else None
+    except Exception as e:
+        logger.warning("get_household_type failed: %s", e)
+        return None
 
 
 def _record_to_profile(record: dict[str, Any]) -> dict[str, Any]:
@@ -364,19 +401,31 @@ def resolve_profile_for_recommendation(
     _family_values = frozenset(("family", "everyone", "all"))
     scope = (family_scope or "").strip().lower()
 
+    def _with_household_type(profile: dict[str, Any], hh_id: str | None) -> dict[str, Any]:
+        if hh_id:
+            profile["household_type"] = get_household_type(driver, hh_id, database)
+        else:
+            profile["household_type"] = None
+        return profile
+
     # Explicit self
     if scope == "self":
-        return _fetch_single_customer_profile(driver, customer_id, database)
+        profile = _fetch_single_customer_profile(driver, customer_id, database)
+        hh_id = get_household_id_for_customer(driver, customer_id, database)
+        return _with_household_type(profile, hh_id)
 
     # Specific member by customer_id
     if member_id:
-        return _fetch_single_customer_profile(driver, member_id, database)
+        profile = _fetch_single_customer_profile(driver, member_id, database)
+        hh_id = get_household_id_for_customer(driver, member_id, database)
+        return _with_household_type(profile, hh_id)
 
     # Target member by role (primary_adult, child, dependent)
     if target_member_role:
         hh_id = household_id or get_household_id_for_customer(driver, customer_id, database)
         if hh_id:
-            return resolve_profile_for_role(driver, hh_id, target_member_role, database)
+            profile = resolve_profile_for_role(driver, hh_id, target_member_role, database)
+            return _with_household_type(profile, hh_id)
         logger.debug(
             "resolve_profile_for_recommendation: no household_id for target_member_role=%s, falling back to customer",
             target_member_role,
@@ -390,16 +439,21 @@ def resolve_profile_for_recommendation(
             logger.debug(
                 "resolve_profile_for_recommendation: no household_id for family_scope, falling back to customer",
             )
-            return _fetch_single_customer_profile(driver, customer_id, database)
+            profile = _fetch_single_customer_profile(driver, customer_id, database)
+            return _with_household_type(profile, None)
         member_profiles, member_meta = fetch_household_profile(driver, hh_id, database)
         if not member_profiles:
             logger.debug(
                 "resolve_profile_for_recommendation: no household members for household_id=%s, falling back to customer",
                 household_id,
             )
-            return _fetch_single_customer_profile(driver, customer_id, database)
+            profile = _fetch_single_customer_profile(driver, customer_id, database)
+            return _with_household_type(profile, None)
         roles = [m.get("role") for m in member_meta]
-        return aggregate_profile(member_profiles, member_roles=roles)
+        profile = aggregate_profile(member_profiles, member_roles=roles)
+        return _with_household_type(profile, hh_id)
 
     # Default: logged-in customer
-    return _fetch_single_customer_profile(driver, customer_id, database)
+    profile = _fetch_single_customer_profile(driver, customer_id, database)
+    hh_id = get_household_id_for_customer(driver, customer_id, database)
+    return _with_household_type(profile, hh_id)
