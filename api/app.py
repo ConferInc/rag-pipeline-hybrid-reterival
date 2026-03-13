@@ -34,7 +34,7 @@ from rag_pipeline.config import load_embedding_config
 from rag_pipeline.embeddings.caching_embedder import CachingQueryEmbedder
 from rag_pipeline.embeddings.openai_embedder import OpenAIQueryEmbedder
 from rag_pipeline.neo4j_client import create_neo4j_driver, neo4j_settings_from_env
-from rag_pipeline.profile import resolve_profile_for_recommendation
+from rag_pipeline.profile import aggregate_profile, get_household_id_for_customer, get_household_type, resolve_profile_for_recommendation
 from rag_pipeline.nlu.intents import CHATBOT_DATA_INTENTS, DATA_INTENTS_NEEDING_RETRIEVAL
 from rag_pipeline.orchestrator.constraint_filter import apply_hard_constraints, build_zero_results_message
 from rag_pipeline.orchestrator.cypher_runner import run_cypher_retrieval
@@ -214,10 +214,13 @@ class SearchRequest(BaseModel):
     filters: dict[str, Any] = Field(default_factory=dict, description="Structured filters")
     limit: int = Field(20, ge=1, le=50)
     household_id: str | None = Field(None, description="Household UUID for family-scoped profile resolution")
-    scope: str | None = Field(None, description="Profile scope: individual | couple | family")
+    scope: str | None = Field(None, description="Profile scope: individual | couple | family (default inferred from household_type)")
+    household_type: str | None = Field(None, description="Household type: individual | couple | family (overrides Neo4j lookup)")
+    member_id: str | None = Field(None, description="Active household member UUID (when different from customer_id)")
+    total_members: int | None = Field(None, description="Number of household members")
     member_profile: dict[str, Any] | None = Field(
         None,
-        description="Pre-built profile: {diets: [], allergens: [], health_conditions: [], ...}. Used when provided.",
+        description="Pre-built profile: {diets: [], allergens: [], health_conditions: [], household_type?, ...}. Primary over Neo4j when provided.",
     )
 
 
@@ -227,10 +230,17 @@ class FeedRequest(BaseModel):
     meal_type: str | None = Field(None, description="Optional meal type hint: breakfast/lunch/dinner/snack")
     limit: int = Field(50, ge=1, le=50)
     household_id: str | None = Field(None, description="Household UUID for family-scoped profile resolution")
-    scope: str | None = Field(None, description="Profile scope: individual | couple | family")
+    scope: str | None = Field(None, description="Profile scope: individual | couple | family (default inferred from household_type)")
+    household_type: str | None = Field(None, description="Household type: individual | couple | family (overrides Neo4j lookup)")
+    member_id: str | None = Field(None, description="Active household member UUID (when different from customer_id)")
+    total_members: int | None = Field(None, description="Number of household members")
+    preferences: dict[str, Any] | None = Field(
+        None,
+        description="B2C preferences: {dietIds, allergenIds, conditionIds, dislikes} (primary over Neo4j when provided)",
+    )
     member_profile: dict[str, Any] | None = Field(
         None,
-        description="Pre-built profile: {diets: [], allergens: [], health_conditions: [], health_goal, ...}. Used when provided.",
+        description="Pre-built profile: {diets, allergens, health_conditions, health_goal, household_type?, ...}. Primary over Neo4j when provided.",
     )
 
 
@@ -238,6 +248,7 @@ class MealCandidateRequest(BaseModel):
     """
     Pre-scored recipe candidates for meal plan generation.
     Supports household scope: individual (self), couple (both primary adults), family (all members).
+    B2C can send members[] (per-member profiles) or member_profile/household_id; Neo4j used as fallback.
     """
     customer_id: str = Field(..., description="B2C customer UUID")
     meal_history: list[str] = Field(default_factory=list, description="Recipe IDs to exclude (e.g. from PostgreSQL meal_logs)")
@@ -245,10 +256,22 @@ class MealCandidateRequest(BaseModel):
     exclude_ids: list[str] = Field(default_factory=list, description="Additional recipe IDs to exclude (e.g. for swap)")
     limit: int = Field(50, ge=1, le=100)
     household_id: str | None = Field(None, description="Household UUID for family-scoped profile resolution")
-    scope: str | None = Field(None, description="Profile scope: individual | couple | family")
+    scope: str | None = Field(None, description="Profile scope: individual | couple | family (default inferred from household_type)")
+    household_type: str | None = Field(None, description="Household type: individual | couple | family (overrides Neo4j lookup)")
+    member_id: str | None = Field(None, description="Active household member UUID")
+    total_members: int | None = Field(None, description="Number of household members")
+    members: list[dict[str, Any]] | None = Field(
+        None,
+        description="Per-member profiles [{allergenIds, dietIds, conditionIds, ...}]. Primary over Neo4j when provided.",
+    )
+    date_range: dict[str, Any] | None = Field(
+        None,
+        description="Meal plan date range: {start: YYYY-MM-DD, end: YYYY-MM-DD}",
+    )
+    meals_per_day: int | None = Field(None, description="Target meals per day (e.g. 3)")
     member_profile: dict[str, Any] | None = Field(
         None,
-        description="Pre-built profile: {diets: [], allergens: [], health_conditions: [], ...}. Used when provided.",
+        description="Pre-built aggregated profile. Primary over Neo4j when provided.",
     )
 
 
@@ -325,6 +348,9 @@ class ProductsRequest(BaseModel):
         default=None,
         description="Preferred brand names (soft boost in ranking)",
     )
+    household_type: str | None = Field(None, description="Household type: individual | couple | family")
+    total_members: int | None = Field(None, description="Number of household members")
+    household_budget: float | None = Field(None, description="Household budget (e.g. USD amount) for product filtering")
 
 
 class ProductMatchItem(BaseModel):
@@ -401,9 +427,12 @@ class ChatProcessRequest(BaseModel):
     session_id: str | None = Field(None, description="Existing session UUID (null for new session)")
     display_name: str | None = Field(None, description="Customer name from auth/PostgreSQL if Neo4j has none")
     household_id: str | None = Field(None, description="Household UUID for family-scoped profile resolution")
+    household_type: str | None = Field(None, description="Household type: individual | couple | family (overrides Neo4j lookup)")
+    member_id: str | None = Field(None, description="Active household member UUID (for profile resolution)")
+    total_members: int | None = Field(None, description="Number of household members")
     member_profile: dict[str, Any] | None = Field(
         None,
-        description="Pre-built profile: {diets: [], allergens: [], health_conditions: [], ...}. Used when provided.",
+        description="Pre-built profile. Primary over Neo4j when provided.",
     )
 
 
@@ -519,8 +548,92 @@ def fetch_customer_profile(
         }
 
 
+def _preferences_to_profile(preferences: dict[str, Any]) -> dict[str, Any]:
+    """
+    Convert B2C preferences dict to profile shape.
+    Supports: dietIds/diets, allergenIds/allergens, conditionIds/health_conditions.
+    B2C may send IDs or names; we use names when present, else IDs (Cypher may match both).
+    """
+    def _list(v: Any) -> list[str]:
+        if not v:
+            return []
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if x and isinstance(x, (str, int))]
+        return []
+
+    diets = _list(preferences.get("diets") or preferences.get("dietNames") or preferences.get("dietIds"))
+    allergens = _list(preferences.get("allergens") or preferences.get("allergenNames") or preferences.get("allergenIds"))
+    conditions = _list(preferences.get("health_conditions") or preferences.get("conditionNames") or preferences.get("conditionIds"))
+    dislikes = _list(preferences.get("dislikes"))
+    # dislikes can be added to exclude_ingredient; for now we merge into allergens-like exclusion
+    exclude = list(set(allergens) | set(dislikes)) if dislikes else allergens
+    ht_raw = preferences.get("household_type")
+    ht = None
+    if ht_raw and isinstance(ht_raw, str):
+        h = ht_raw.strip().lower()
+        if h in ("individual", "couple", "family"):
+            ht = h
+    return {
+        "display_name": None,
+        "diets": diets,
+        "allergens": exclude,
+        "health_conditions": conditions,
+        "health_goal": preferences.get("health_goal") if isinstance(preferences.get("health_goal"), str) else None,
+        "activity_level": preferences.get("activity_level") if isinstance(preferences.get("activity_level"), str) else None,
+        "recent_recipes": [],
+        "household_type": ht,
+    }
+
+
+def _merge_b2c_with_neo4j(b2c: dict[str, Any], neo4j: dict[str, Any]) -> dict[str, Any]:
+    """
+    Merge B2C profile with Neo4j profile. B2C takes precedence when non-empty; Neo4j fills gaps.
+    """
+    result: dict[str, Any] = {}
+    for k in ("display_name", "diets", "allergens", "health_conditions", "health_goal", "activity_level", "recent_recipes", "household_type"):
+        b_val = b2c.get(k)
+        n_val = neo4j.get(k)
+        if k in ("diets", "allergens", "health_conditions", "recent_recipes"):
+            if b_val and isinstance(b_val, list) and len(b_val) > 0:
+                result[k] = list(b_val)
+            elif n_val and isinstance(n_val, list):
+                result[k] = list(n_val)
+            else:
+                result[k] = []
+        elif k == "household_type":
+            result[k] = b_val if (b_val and isinstance(b_val, str)) else (n_val if (n_val and isinstance(n_val, str)) else None)
+        else:
+            result[k] = b_val if (b_val is not None and b_val != "") else n_val
+    return result
+
+
+def _members_to_profiles(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert B2C members[] to list of profile-shaped dicts for aggregate_profile."""
+    profiles: list[dict[str, Any]] = []
+    for m in members:
+        if not isinstance(m, dict):
+            continue
+        prof = {
+            "display_name": m.get("display_name"),
+            "diets": list(m.get("diets") or m.get("dietIds") or []),
+            "allergens": list(m.get("allergens") or m.get("allergenIds") or []),
+            "health_conditions": list(m.get("health_conditions") or m.get("conditionIds") or []),
+            "health_goal": m.get("health_goal"),
+            "activity_level": m.get("activity_level"),
+            "recent_recipes": list(m.get("recent_recipes") or []),
+        }
+        profiles.append(prof)
+    return profiles
+
+
 def _member_profile_to_profile(member_profile: dict[str, Any]) -> dict[str, Any]:
     """Convert member_profile dict from request to fetch_customer_profile shape."""
+    ht_raw = member_profile.get("household_type")
+    ht = None
+    if ht_raw and isinstance(ht_raw, str):
+        h = ht_raw.strip().lower()
+        if h in ("individual", "couple", "family"):
+            ht = h
     return {
         "display_name": member_profile.get("display_name"),
         "diets": list(member_profile.get("diets") or []),
@@ -529,7 +642,32 @@ def _member_profile_to_profile(member_profile: dict[str, Any]) -> dict[str, Any]
         "health_goal": member_profile.get("health_goal"),
         "activity_level": member_profile.get("activity_level"),
         "recent_recipes": list(member_profile.get("recent_recipes") or []),
+        "household_type": ht,
     }
+
+
+def _infer_default_scope(
+    driver: Driver,
+    customer_id: str | None,
+    household_id: str | None,
+    database: str | None,
+    household_type_override: str | None = None,
+) -> str:
+    """
+    Infer default scope from household_type when client did not provide scope.
+    Returns "individual" | "couple" | "family".
+    """
+    if household_type_override and isinstance(household_type_override, str):
+        ht = household_type_override.strip().lower()
+        if ht in ("individual", "couple", "family"):
+            return ht
+    hh_id = household_id
+    if not hh_id and customer_id:
+        hh_id = get_household_id_for_customer(driver, customer_id, database)
+    if not hh_id:
+        return "individual"
+    ht = get_household_type(driver, hh_id, database)
+    return {"individual": "individual", "couple": "couple", "family": "family"}.get(ht or "", "individual")
 
 
 def _is_aggregated_profile(
@@ -560,17 +698,27 @@ def _resolve_profile(
     family_scope: str | None = None,
     target_member_role: str | None = None,
     member_profile: dict[str, Any] | None = None,
+    household_type_override: str | None = None,
+    member_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Resolve profile for recommendations. Uses member_profile when provided;
-    else resolve_profile_for_recommendation with scope / NLU entities.
+    else resolve_profile_for_recommendation with scope / member_id / NLU entities.
+    When scope is missing, infers from household_type (request or Neo4j).
+    member_id overrides which household member's profile to use (B2C override).
     """
     if member_profile and isinstance(member_profile, dict):
         return _member_profile_to_profile(member_profile)
+    effective_scope = (scope or "").strip() or None
+    if not effective_scope:
+        effective_scope = _infer_default_scope(
+            driver, customer_id, household_id, database,
+            household_type_override=household_type_override,
+        )
     fs = family_scope
     tm = target_member_role
-    if scope:
-        s = (scope or "").strip().lower()
+    if effective_scope:
+        s = effective_scope.strip().lower()
         if s == "family":
             fs = "family"
         elif s == "couple":
@@ -579,6 +727,7 @@ def _resolve_profile(
         driver,
         customer_id,
         household_id=household_id,
+        member_id=member_id,
         family_scope=fs,
         target_member_role=tm,
         database=database,
@@ -903,22 +1052,58 @@ async def search_hybrid(req: SearchRequest):
     # Run NLU first (needed for family_scope / target_member_role from query)
     nlu_result = extract_hybrid(req.query)
 
-    # Resolve profile: member_profile > request scope > NLU entities > single customer
+    # Resolve profile: B2C (member_profile) primary, Neo4j fallback via merge
     customer_profile = None
     if req.customer_id:
-        customer_profile = _resolve_profile(
-            _driver,
-            req.customer_id,
-            database,
-            household_id=req.household_id,
-            scope=req.scope,
-            member_profile=req.member_profile,
-            family_scope=nlu_result.entities.get("family_scope"),
-            target_member_role=nlu_result.entities.get("target_member_role"),
-        )
+        effective_scope_for_profile = (req.scope or "").strip() or nlu_result.entities.get("family_scope")
+        if nlu_result.entities.get("target_member_role") and not effective_scope_for_profile:
+            effective_scope_for_profile = "family"
+        if not effective_scope_for_profile:
+            effective_scope_for_profile = _infer_default_scope(
+                _driver, req.customer_id, req.household_id, database,
+                household_type_override=req.household_type,
+            )
+        if req.member_profile and isinstance(req.member_profile, dict):
+            b2c_profile = _member_profile_to_profile(req.member_profile)
+            neo4j_profile = _resolve_profile(
+                _driver,
+                req.customer_id,
+                database,
+                household_id=req.household_id,
+                scope=effective_scope_for_profile,
+                member_id=req.member_id,
+                member_profile=None,
+                family_scope=nlu_result.entities.get("family_scope"),
+                target_member_role=nlu_result.entities.get("target_member_role"),
+                household_type_override=req.household_type,
+            )
+            customer_profile = _merge_b2c_with_neo4j(b2c_profile, neo4j_profile)
+        else:
+            customer_profile = _resolve_profile(
+                _driver,
+                req.customer_id,
+                database,
+                household_id=req.household_id,
+                scope=effective_scope_for_profile,
+                member_profile=None,
+                member_id=req.member_id,
+                family_scope=nlu_result.entities.get("family_scope"),
+                target_member_role=nlu_result.entities.get("target_member_role"),
+                household_type_override=req.household_type,
+            )
 
+    effective_scope = (req.scope or "").strip() or None
+    if not effective_scope:
+        effective_scope = nlu_result.entities.get("family_scope")
+    if not effective_scope and nlu_result.entities.get("target_member_role"):
+        effective_scope = "family"
+    if not effective_scope:
+        effective_scope = _infer_default_scope(
+            _driver, req.customer_id, req.household_id, database,
+            household_type_override=req.household_type,
+        )
     is_aggregated = _is_aggregated_profile(
-        scope=req.scope,
+        scope=effective_scope,
         family_scope=nlu_result.entities.get("family_scope"),
         target_member_role=nlu_result.entities.get("target_member_role"),
     )
@@ -982,14 +1167,41 @@ async def recommend_feed(req: FeedRequest):
     start = time.time()
     database = os.getenv("NEO4J_DATABASE")
 
-    profile = _resolve_profile(
-        _driver,
-        req.customer_id,
-        database,
-        household_id=req.household_id,
-        scope=req.scope,
-        member_profile=req.member_profile,
+    effective_scope = (req.scope or "").strip() or _infer_default_scope(
+        _driver, req.customer_id, req.household_id, database,
+        household_type_override=req.household_type,
     )
+    # B2C primary: member_profile > preferences; merge with Neo4j for gaps (fallback)
+    b2c_profile: dict[str, Any] | None = None
+    if req.member_profile and isinstance(req.member_profile, dict):
+        b2c_profile = _member_profile_to_profile(req.member_profile)
+    elif req.preferences and isinstance(req.preferences, dict):
+        b2c_profile = _preferences_to_profile(req.preferences)
+    if b2c_profile:
+        neo4j_profile = _resolve_profile(
+            _driver,
+            req.customer_id,
+            database,
+            household_id=req.household_id,
+            scope=effective_scope,
+            member_id=req.member_id,
+            household_type_override=req.household_type,
+        )
+        profile = _merge_b2c_with_neo4j(b2c_profile, neo4j_profile)
+        # Apply household_type override from request
+        if req.household_type and req.household_type.strip().lower() in ("individual", "couple", "family"):
+            profile["household_type"] = req.household_type.strip().lower()
+    else:
+        profile = _resolve_profile(
+            _driver,
+            req.customer_id,
+            database,
+            household_id=req.household_id,
+            scope=effective_scope,
+            member_id=req.member_id,
+            member_profile=None,
+            household_type_override=req.household_type,
+        )
 
     entities: dict[str, Any] = {
         "diet":               profile["diets"],
@@ -1019,7 +1231,7 @@ async def recommend_feed(req: FeedRequest):
 
     # ── Structural or similar-constraint retrieval ─────────────────────────
     structural_results: dict[str, Any] = {}
-    is_aggregated = _is_aggregated_profile(scope=req.scope)
+    is_aggregated = _is_aggregated_profile(scope=effective_scope)
     try:
         if is_aggregated:
             structural_results = retrieve_recipes_from_similar_constraint_users(
@@ -1126,14 +1338,58 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
     start = time.time()
     database = os.getenv("NEO4J_DATABASE")
 
-    profile = _resolve_profile(
-        _driver,
-        req.customer_id,
-        database,
-        household_id=req.household_id,
-        scope=req.scope,
-        member_profile=req.member_profile,
+    effective_scope = (req.scope or "").strip() or _infer_default_scope(
+        _driver, req.customer_id, req.household_id, database,
+        household_type_override=req.household_type,
     )
+    # B2C primary: members[] > member_profile; merge with Neo4j for gaps
+    limit = req.limit
+    if req.meals_per_day and isinstance(req.meals_per_day, int) and req.meals_per_day > 0 and req.date_range:
+        # Scale limit by date_range days × meals_per_day for meal plan coverage
+        start_d = req.date_range.get("start") or req.date_range.get("startDate")
+        end_d = req.date_range.get("end") or req.date_range.get("endDate")
+        if start_d and end_d:
+            try:
+                from datetime import datetime
+                d1 = datetime.strptime(str(start_d)[:10], "%Y-%m-%d")
+                d2 = datetime.strptime(str(end_d)[:10], "%Y-%m-%d")
+                days = max(1, (d2 - d1).days + 1)
+                limit = min(req.limit * 2, max(req.limit, days * req.meals_per_day))
+                limit = min(100, max(50, int(limit)))
+            except Exception:
+                pass
+
+    b2c_profile: dict[str, Any] | None = None
+    if req.members and isinstance(req.members, list) and len(req.members) > 0:
+        member_profiles = _members_to_profiles(req.members)
+        b2c_profile = aggregate_profile(member_profiles)
+    elif req.member_profile and isinstance(req.member_profile, dict):
+        b2c_profile = _member_profile_to_profile(req.member_profile)
+    if b2c_profile:
+        neo4j_profile = _resolve_profile(
+            _driver,
+            req.customer_id,
+            database,
+            household_id=req.household_id,
+            scope=effective_scope,
+            member_id=req.member_id,
+            member_profile=None,
+            household_type_override=req.household_type,
+        )
+        profile = _merge_b2c_with_neo4j(b2c_profile, neo4j_profile)
+        if req.household_type and req.household_type.strip().lower() in ("individual", "couple", "family"):
+            profile["household_type"] = req.household_type.strip().lower()
+    else:
+        profile = _resolve_profile(
+            _driver,
+            req.customer_id,
+            database,
+            household_id=req.household_id,
+            scope=effective_scope,
+            member_id=req.member_id,
+            member_profile=None,
+            household_type_override=req.household_type,
+        )
 
     entities: dict[str, Any] = {
         "diet": profile["diets"],
@@ -1153,7 +1409,7 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
             embedder=_embedder,
             request=SemanticRetrievalRequest(
                 query=synthetic_text,
-                top_k=req.limit,
+                top_k=limit,
                 label="Recipe",
             ),
             database=database,
@@ -1163,7 +1419,7 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
 
     # ── Structural or similar-constraint retrieval ─────────────────────────
     structural_results: dict[str, Any] = {}
-    is_aggregated = _is_aggregated_profile(scope=req.scope)
+    is_aggregated = _is_aggregated_profile(scope=effective_scope)
     try:
         if is_aggregated:
             structural_results = retrieve_recipes_from_similar_constraint_users(
@@ -1171,7 +1427,7 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
                 diets=profile["diets"],
                 allergens=profile["allergens"],
                 health_conditions=profile["health_conditions"],
-                top_k=req.limit,
+                top_k=limit,
                 database=database,
             )
         else:
@@ -1188,7 +1444,7 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
                     cfg=_cfg,
                     label="B2C_Customer",
                     seed_vector=seed_emb,
-                    top_k=req.limit,
+                    top_k=limit,
                     allowed_labels=["Recipe"],
                     allowed_relationships=["SAVED", "VIEWED"],
                     database=database,
@@ -1214,7 +1470,7 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
         structural_results,
         cypher_results,
         "find_recipe",
-        max_items=req.limit,
+        max_items=limit,
     )
 
     # ── Hard constraints: allergens/exclude_ingredient, course, calories ───
@@ -1245,7 +1501,7 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
         driver=_driver,
         database=database,
         label="Recipe",
-        limit=req.limit,
+        limit=limit,
     )
     candidates = [
         MealCandidateItem(
@@ -1327,6 +1583,7 @@ async def recommend_products(req: ProductsRequest):
         customer_allergens=req.customer_allergens or [],
         quality_preferences=req.quality_preferences,
         preferred_brands=req.preferred_brands,
+        household_budget=req.household_budget,
         database=database,
     )
     products = [
@@ -1560,15 +1817,32 @@ async def chat_process(req: ChatProcessRequest):
     # Template intents — canned response, no retrieval/LLM (fetch profile for personalization)
     if nlu_result.intent in TEMPLATE_INTENTS:
         database = os.getenv("NEO4J_DATABASE")
-        profile = _resolve_profile(
-            _driver,
-            req.customer_id,
-            database,
-            household_id=req.household_id,
-            member_profile=req.member_profile,
-            family_scope=nlu_result.entities.get("family_scope"),
-            target_member_role=nlu_result.entities.get("target_member_role"),
-        )
+        if req.member_profile and isinstance(req.member_profile, dict):
+            b2c_profile = _member_profile_to_profile(req.member_profile)
+            neo4j_profile = _resolve_profile(
+                _driver,
+                req.customer_id,
+                database,
+                household_id=req.household_id,
+                member_profile=None,
+                member_id=req.member_id,
+                family_scope=nlu_result.entities.get("family_scope"),
+                target_member_role=nlu_result.entities.get("target_member_role"),
+                household_type_override=req.household_type,
+            )
+            profile = _merge_b2c_with_neo4j(b2c_profile, neo4j_profile)
+        else:
+            profile = _resolve_profile(
+                _driver,
+                req.customer_id,
+                database,
+                household_id=req.household_id,
+                member_profile=None,
+                member_id=req.member_id,
+                family_scope=nlu_result.entities.get("family_scope"),
+                target_member_role=nlu_result.entities.get("target_member_role"),
+                household_type_override=req.household_type,
+            )
         display_name = profile.get("display_name") or req.display_name
         _response = get_template_response(
             nlu_result.intent,
@@ -1593,15 +1867,42 @@ async def chat_process(req: ChatProcessRequest):
     if nlu_result.intent in DATA_INTENTS_NEEDING_RETRIEVAL:
         try:
             database = os.getenv("NEO4J_DATABASE")
-            profile = _resolve_profile(
-                _driver,
-                req.customer_id,
-                database,
-                household_id=req.household_id,
-                member_profile=req.member_profile,
-                family_scope=nlu_result.entities.get("family_scope"),
-                target_member_role=nlu_result.entities.get("target_member_role"),
+            chat_scope = nlu_result.entities.get("family_scope") or (
+                "family" if nlu_result.entities.get("target_member_role") else None
             )
+            if not chat_scope:
+                chat_scope = _infer_default_scope(
+                    _driver, req.customer_id, req.household_id, database,
+                    household_type_override=req.household_type,
+                )
+            if req.member_profile and isinstance(req.member_profile, dict):
+                b2c_profile = _member_profile_to_profile(req.member_profile)
+                neo4j_profile = _resolve_profile(
+                    _driver,
+                    req.customer_id,
+                    database,
+                    household_id=req.household_id,
+                    scope=chat_scope,
+                    member_profile=None,
+                    member_id=req.member_id,
+                    family_scope=nlu_result.entities.get("family_scope"),
+                    target_member_role=nlu_result.entities.get("target_member_role"),
+                    household_type_override=req.household_type,
+                )
+                profile = _merge_b2c_with_neo4j(b2c_profile, neo4j_profile)
+            else:
+                profile = _resolve_profile(
+                    _driver,
+                    req.customer_id,
+                    database,
+                    household_id=req.household_id,
+                    scope=chat_scope,
+                    member_profile=None,
+                    member_id=req.member_id,
+                    family_scope=nlu_result.entities.get("family_scope"),
+                    target_member_role=nlu_result.entities.get("target_member_role"),
+                    household_type_override=req.household_type,
+                )
 
             # For substitution follow-ups, use synthesized query if effective_msg is
             # still vague (orchestrator re-extracts intent; "some more options?" is unclear)
@@ -1614,6 +1915,7 @@ async def chat_process(req: ChatProcessRequest):
             # Pass intent/entities from chat NLU — skip LLM extraction in orchestrator.
             # Avoids duplicate LLM calls and failures when LLM is down (chat rules still work).
             is_aggregated = _is_aggregated_profile(
+                scope=chat_scope,
                 family_scope=nlu_result.entities.get("family_scope"),
                 target_member_role=nlu_result.entities.get("target_member_role"),
             )

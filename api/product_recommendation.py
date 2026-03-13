@@ -151,6 +151,7 @@ def run_recommend_products(
     customer_allergens: list[str] | None = None,
     quality_preferences: list[str] | None = None,
     preferred_brands: list[str] | None = None,
+    household_budget: float | None = None,
     database: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -219,6 +220,13 @@ def run_recommend_products(
         product_ids = list({c["product_id"] for c in candidates})
         unsafe = _filter_allergen_unsafe_product_ids(driver, product_ids, allergens, database)
         candidates = [c for c in candidates if c["product_id"] not in unsafe]
+
+    if not candidates:
+        return {"products": []}
+
+    # Filter by household budget when provided (exclude products above budget)
+    if household_budget is not None and household_budget > 0:
+        candidates = [c for c in candidates if (c.get("price") or 0) <= household_budget]
 
     if not candidates:
         return {"products": []}

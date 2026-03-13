@@ -10,6 +10,7 @@ from rag_pipeline.profile.household_profile import (
     aggregate_profile,
     fetch_household_profile,
     get_household_id_for_customer,
+    get_household_type,
     resolve_profile_for_recommendation,
     resolve_profile_for_role,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "aggregate_profile",
     "fetch_household_profile",
     "get_household_id_for_customer",
+    "get_household_type",
     "resolve_profile_for_recommendation",
     "resolve_profile_for_role",
 ]
