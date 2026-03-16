@@ -351,6 +351,10 @@ class ProductsRequest(BaseModel):
     household_type: str | None = Field(None, description="Household type: individual | couple | family")
     total_members: int | None = Field(None, description="Number of household members")
     household_budget: float | None = Field(None, description="Household budget (e.g. USD amount) for product filtering")
+    ingredient_names: dict[str, str] | None = Field(
+        None,
+        description="Map of ingredient_id -> ingredient_name for name-based matching fallback when IDs differ across systems",
+    )
 
 
 class ProductMatchItem(BaseModel):
@@ -1580,6 +1584,7 @@ async def recommend_products(req: ProductsRequest):
     result = run_recommend_products(
         _driver,
         ingredient_ids=req.ingredient_ids,
+        ingredient_names=req.ingredient_names,
         customer_allergens=req.customer_allergens or [],
         quality_preferences=req.quality_preferences,
         preferred_brands=req.preferred_brands,

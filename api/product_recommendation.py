@@ -148,6 +148,7 @@ def run_recommend_products(
     driver: Driver,
     *,
     ingredient_ids: list[str],
+    ingredient_names: dict[str, str] | None = None,
     customer_allergens: list[str] | None = None,
     quality_preferences: list[str] | None = None,
     preferred_brands: list[str] | None = None,
@@ -175,20 +176,43 @@ def run_recommend_products(
     has_brand_prefs = bool(brands_lower)
 
     # Phase 1: Find products that contain each ingredient
-    cypher = """
-    UNWIND $ingredient_ids AS iid
-    MATCH (i:Ingredient)<-[:CONTAINS_INGREDIENT]-(p:Product)
-    WHERE i.id = iid OR elementId(i) = iid
-    WITH i, p
-    ORDER BY coalesce(p.price, 999999) ASC
-    RETURN i.id AS ingredient_id, i.name AS ingredient_name,
-           p.id AS product_id, p.name AS product_name, p.brand AS brand,
-           p.price AS price, p.currency AS currency,
-           p.weight_g AS weight_g, p.category AS category, p.image_url AS image_url
-    """
+    # Build name list for fallback matching when IDs don't match across systems
+    name_map = ingredient_names or {}
+    name_list = [name_map.get(iid, "").lower().strip() for iid in ingredient_ids]
+    has_names = any(n for n in name_list)
+
+    if has_names:
+        # Match by ID first, then fall back to exact name match
+        cypher = """
+        UNWIND range(0, size($ingredient_ids)-1) AS idx
+        WITH $ingredient_ids[idx] AS iid, $ingredient_names[idx] AS iname
+        MATCH (i:Ingredient)<-[:CONTAINS_INGREDIENT]-(p:Product)
+        WHERE i.id = iid OR elementId(i) = iid OR (iname <> '' AND toLower(i.name) = iname)
+        WITH i, p, iid
+        ORDER BY coalesce(p.price, 999999) ASC
+        RETURN iid AS ingredient_id, i.name AS ingredient_name,
+               p.id AS product_id, p.name AS product_name, p.brand AS brand,
+               p.price AS price, p.currency AS currency,
+               p.weight_g AS weight_g, p.category AS category, p.image_url AS image_url
+        """
+    else:
+        cypher = """
+        UNWIND $ingredient_ids AS iid
+        MATCH (i:Ingredient)<-[:CONTAINS_INGREDIENT]-(p:Product)
+        WHERE i.id = iid OR elementId(i) = iid
+        WITH i, p
+        ORDER BY coalesce(p.price, 999999) ASC
+        RETURN i.id AS ingredient_id, i.name AS ingredient_name,
+               p.id AS product_id, p.name AS product_name, p.brand AS brand,
+               p.price AS price, p.currency AS currency,
+               p.weight_g AS weight_g, p.category AS category, p.image_url AS image_url
+        """
     try:
         with driver.session(database=database) as session:
-            rows = session.run(cypher, ingredient_ids=ingredient_ids)
+            params: dict[str, Any] = {"ingredient_ids": ingredient_ids}
+            if has_names:
+                params["ingredient_names"] = name_list
+            rows = session.run(cypher, **params)
             candidates: list[dict[str, Any]] = []
             seen: set[tuple[str, str]] = set()
             for row in rows:
