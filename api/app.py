@@ -824,6 +824,65 @@ def _is_uuid(val: str) -> bool:
     return bool(re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", val.lower()))
 
 
+def _resolve_profile_ids_to_names(
+    driver: Driver,
+    profile: dict[str, Any],
+    database: str | None = None,
+) -> dict[str, Any]:
+    """
+    Resolve diet and allergen IDs (UUIDs) to names in Neo4j so Cypher and semantic
+    retrieval get meaningful values. Non-UUID entries (e.g. names) are kept as-is.
+    """
+    result = dict(profile)
+    diets_in = list(profile.get("diets") or [])
+    allergens_in = list(profile.get("allergens") or [])
+
+    diet_ids = [x for x in diets_in if _is_uuid(str(x))]
+    diet_names_keep = [x for x in diets_in if not _is_uuid(str(x))]
+    allergen_ids = [x for x in allergens_in if _is_uuid(str(x))]
+    allergen_names_keep = [x for x in allergens_in if not _is_uuid(str(x))]
+
+    diet_names_resolved: list[str] = []
+    if diet_ids:
+        cypher_d = """
+        UNWIND $ids AS id
+        MATCH (dp:Dietary_Preferences)
+        WHERE dp.id = id OR toString(elementId(dp)) = id
+        RETURN dp.name AS name
+        """
+        try:
+            with driver.session(database=database) as session:
+                recs = session.run(cypher_d, ids=diet_ids)
+                for rec in recs:
+                    n = rec.get("name")
+                    if n and isinstance(n, str) and n.strip():
+                        diet_names_resolved.append(n.strip())
+        except Exception as e:
+            logger.warning("_resolve_profile_ids_to_names diets lookup failed: %s", e)
+
+    allergen_names_resolved: list[str] = []
+    if allergen_ids:
+        cypher_a = """
+        UNWIND $ids AS id
+        MATCH (a:Allergens)
+        WHERE a.id = id OR toString(elementId(a)) = id
+        RETURN a.name AS name
+        """
+        try:
+            with driver.session(database=database) as session:
+                recs = session.run(cypher_a, ids=allergen_ids)
+                for rec in recs:
+                    n = rec.get("name")
+                    if n and isinstance(n, str) and n.strip():
+                        allergen_names_resolved.append(n.strip())
+        except Exception as e:
+            logger.warning("_resolve_profile_ids_to_names allergens lookup failed: %s", e)
+
+    result["diets"] = diet_names_keep + diet_names_resolved
+    result["allergens"] = allergen_names_keep + allergen_names_resolved
+    return result
+
+
 def _looks_like_element_id(val: str) -> bool:
     """Return True if val looks like Neo4j elementId (e.g. 4:abc123:42)."""
     if not val or not isinstance(val, str):
@@ -1055,6 +1114,12 @@ async def search_hybrid(req: SearchRequest):
 
     # Run NLU first (needed for family_scope / target_member_role from query)
     nlu_result = extract_hybrid(req.query)
+    logger.warning(
+        "search_hybrid NLU query=%s intent=%s entities=%s",
+        req.query,
+        nlu_result.intent,
+        nlu_result.entities,
+    )
 
     # Resolve profile: B2C (member_profile) primary, Neo4j fallback via merge
     customer_profile = None
@@ -1207,6 +1272,9 @@ async def recommend_feed(req: FeedRequest):
             household_type_override=req.household_type,
         )
 
+    # Resolve diet/allergen IDs (UUIDs) to names so Cypher and semantic get meaningful values
+    profile = _resolve_profile_ids_to_names(_driver, profile, database)
+
     entities: dict[str, Any] = {
         "diet":               profile["diets"],
         "exclude_ingredient": profile["allergens"],
@@ -1215,6 +1283,15 @@ async def recommend_feed(req: FeedRequest):
         entities["course"] = req.meal_type
 
     synthetic_text = build_feed_query_text(profile, req.meal_type)
+
+    # DEBUG: feed profile/entities/synthetic (remove after diet debugging)
+    logger.warning(
+        "recommend_feed DEBUG profile.diets=%s profile.allergens=%s entities=%s synthetic_text=%s",
+        profile.get("diets"),
+        profile.get("allergens"),
+        entities,
+        synthetic_text,
+    )
 
     # ── Semantic retrieval ────────────────────────────────────────────────
     semantic_results: list[Any] = []
@@ -1289,9 +1366,32 @@ async def recommend_feed(req: FeedRequest):
         max_items=req.limit,
     )
 
+    # DEBUG: feed fused items sources/title (remove after diet debugging)
+    for i, item in enumerate(fused[:10]):
+        payload = item.get("payload") or {}
+        title = payload.get("title") or payload.get("name") or item.get("key") or ""
+        logger.warning(
+            "recommend_feed DEBUG fused[%s] sources=%s title=%s",
+            i,
+            item.get("sources"),
+            title[:60] if title else "",
+        )
+
     # ── Hard constraints: allergens/exclude_ingredient, course, calories ───
     fused = apply_hard_constraints(
         fused, entities, "find_recipe", _driver, database=database,
+    )
+
+    # DEBUG: feed after hard constraints (remove after diet debugging)
+    after_titles = []
+    for item in fused[:10]:
+        p = item.get("payload") or {}
+        t = p.get("title") or p.get("name") or item.get("key") or ""
+        after_titles.append((t[:50] if t else "") or "(no title)")
+    logger.warning(
+        "recommend_feed DEBUG after_hard_constraints count=%s titles=%s",
+        len(fused),
+        after_titles,
     )
 
     # ── Post-filter: remove recipes eaten in the last 14 days ─────────────
