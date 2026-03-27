@@ -13,6 +13,45 @@ from rag_pipeline.llm_retry import with_retry
 
 logger = logging.getLogger(__name__)
 
+USDA_2025_SYSTEM_CONTEXT = """
+Follow USDA 2025-2030 Dietary Guidelines (Inverted Food Pyramid) when recommending meals:
+
+FOOD GROUP PRIORITIES (highest to lowest):
+1. PROTEIN: Include at every meal. 1.2-1.6 g/kg body weight/day. Varied sources.
+2. DAIRY: 3 servings/day, full-fat encouraged.
+3. VEGETABLES: 2.5+ cups/day, rainbow variety, leafy greens.
+4. FRUITS: 1.5-2 cups/day, whole fruits over juice.
+5. WHOLE GRAINS: 5-6 oz/day, minimize refined carbs.
+
+SOFT GUIDELINES (advisory; gently steer toward these, do not hard-reject meals that exceed them):
+- Added sugars: aim for <10g per meal
+- Sodium: aim for <2,300 mg/day total
+- Processed foods: minimize where possible
+- Non-nutritive sweeteners: minimize where possible
+
+When suggesting meals, ensure each meal contributes to balanced food group coverage.
+Do not suggest meals that are purely one food group (e.g., all carbs, no protein).
+""".strip()
+
+
+def _usda_prompt_enabled() -> bool:
+    """Feature flag for USDA prompt context; default off."""
+    return os.getenv("ENABLE_USDA_2025_PROMPT_CONTEXT", "").strip() == "1"
+
+
+def _inject_usda_system_context(system_content: str, *, include_guidelines: bool = True) -> str:
+    """
+    Add USDA context to system prompt when enabled.
+
+    Kept gated for rollout safety; deduplicates if context is already present
+    from upstream prompt builders.
+    """
+    if not include_guidelines or not _usda_prompt_enabled():
+        return system_content
+    if "USDA 2025-2030 Dietary Guidelines" in system_content:
+        return system_content
+    return f"{system_content}\n\n{USDA_2025_SYSTEM_CONTEXT}".strip()
+
 
 def _load_llm_retry_config(config_path: str | Path = "embedding_config.yaml") -> dict[str, Any]:
     """Load llm_retry config from YAML."""
@@ -78,6 +117,7 @@ def generate_response(
 
     # Split augmented prompt into system and user parts
     system_content, user_content = _split_prompt(augmented_prompt)
+    system_content = _inject_usda_system_context(system_content, include_guidelines=True)
 
     retry_cfg = _load_llm_retry_config(config_path)
     max_attempts = retry_cfg.get("max_attempts", 3)

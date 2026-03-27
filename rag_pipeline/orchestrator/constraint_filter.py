@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 import logging
+import os
 from typing import Any
 
 from neo4j import Driver
@@ -87,26 +88,23 @@ def _filter_course(
 ) -> list[dict[str, Any]]:
     """
     Drop recipes whose meal_type does not match the requested course.
-    Only applied when the payload carries meal_type (Cypher results).
-    Semantic/structural results without meal_type pass through — they are
-    marked 'unverified' in their sources list so the LLM is aware.
+    Uses canonical payload["meal_type"] only.
+    Missing meal_type is treated as contract violation and dropped.
     """
     kept: list[dict[str, Any]] = []
     dropped = 0
     for item in fused:
         payload = item.get("payload") or {}
-        meal_type = (
-            payload.get("r.meal_type") or payload.get("meal_type") or ""
-        ).lower()
+        meal_type_raw = payload.get("meal_type")
+        meal_type = str(meal_type_raw).strip().lower() if meal_type_raw is not None else ""
 
         if not meal_type:
-            # No meal_type in payload (semantic/structural result) — keep but mark
-            item = dict(item)
-            sources = list(item.get("sources", []))
-            if "unverified_course" not in sources:
-                sources.append("unverified_course")
-            item["sources"] = sources
-            kept.append(item)
+            dropped += 1
+            logger.warning(
+                "Course filter dropped recipe due to missing meal_type (contract violation): title=%s required=%s",
+                item.get("title", "?"),
+                course,
+            )
         elif meal_type == course.lower():
             kept.append(item)
         else:
@@ -305,6 +303,7 @@ def _fetch_calorie_violating_ids(
     _CALORIE_NUTRIENT_NAMES = [
         "Energy", "Calories/Energy", "Calories", "Energy (kcal)", "Energy, calories",
     ]
+    cal_names_lc = [n.lower() for n in _CALORIE_NUTRIENT_NAMES]
     _uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
     uuid_ids = [x for x in recipe_ids if x and _uuid_re.match(str(x))]
     elem_ids = [x for x in recipe_ids if x and ":" in str(x) and not _uuid_re.match(str(x))]
@@ -323,14 +322,14 @@ def _fetch_calorie_violating_ids(
             logger.debug("Calorie query failed: %s", e)
         return []
 
-    cal_params = {"cal_limit": cal_f, "cal_names": _CALORIE_NUTRIENT_NAMES}
+    cal_params = {"cal_limit": cal_f, "cal_names_lc": cal_names_lc}
     # 1. Exceeds via HAS_NUTRITION (match by r.id for UUIDs)
     if uuid_ids:
         q_exceed = """
         MATCH (r:Recipe)-[:HAS_NUTRITION]->(nv:NutritionValue)-[:OF_NUTRIENT]->(nd:NutrientDefinition)
         WHERE r.id IN $recipe_ids
-          AND nd.nutrient_name IN $cal_names
-          AND nv.amount > $cal_limit
+          AND toLower(coalesce(nd.nutrient_name, nd.name, "")) IN $cal_names_lc
+          AND toFloat(nv.amount) > $cal_limit
         RETURN r.id AS id, elementId(r) AS elem_id
         """
         for row in _run_rows(q_exceed, {**cal_params, "recipe_ids": uuid_ids}):
@@ -345,8 +344,8 @@ def _fetch_calorie_violating_ids(
         UNWIND $elem_ids AS eid
         MATCH (r:Recipe)-[:HAS_NUTRITION]->(nv:NutritionValue)-[:OF_NUTRIENT]->(nd:NutrientDefinition)
         WHERE elementId(r) = eid
-          AND nd.nutrient_name IN $cal_names
-          AND nv.amount > $cal_limit
+          AND toLower(coalesce(nd.nutrient_name, nd.name, "")) IN $cal_names_lc
+          AND toFloat(nv.amount) > $cal_limit
         RETURN r.id AS id, elementId(r) AS elem_id
         """
         for row in _run_rows(q_exceed_elem, {**cal_params, "elem_ids": elem_ids}):
@@ -360,8 +359,8 @@ def _fetch_calorie_violating_ids(
         q_ok = """
         MATCH (r:Recipe)-[:HAS_NUTRITION]->(nv:NutritionValue)-[:OF_NUTRIENT]->(nd:NutrientDefinition)
         WHERE r.id IN $recipe_ids
-          AND nd.nutrient_name IN $cal_names
-          AND nv.amount <= $cal_limit
+          AND toLower(coalesce(nd.nutrient_name, nd.name, "")) IN $cal_names_lc
+          AND toFloat(nv.amount) <= $cal_limit
         RETURN r.id AS id, elementId(r) AS elem_id
         """
         for row in _run_rows(q_ok, {**cal_params, "recipe_ids": uuid_ids}):
@@ -376,8 +375,8 @@ def _fetch_calorie_violating_ids(
         UNWIND $elem_ids AS eid
         MATCH (r:Recipe)-[:HAS_NUTRITION]->(nv:NutritionValue)-[:OF_NUTRIENT]->(nd:NutrientDefinition)
         WHERE elementId(r) = eid
-          AND nd.nutrient_name IN $cal_names
-          AND nv.amount <= $cal_limit
+          AND toLower(coalesce(nd.nutrient_name, nd.name, "")) IN $cal_names_lc
+          AND toFloat(nv.amount) <= $cal_limit
         RETURN r.id AS id, elementId(r) AS elem_id
         """
         for row in _run_rows(q_ok_elem, {**cal_params, "elem_ids": elem_ids}):
@@ -445,23 +444,6 @@ def _filter_calories(
     dropped = 0
     for item in fused:
         rid = _rid_for_item(item)
-        payload = item.get("payload") or {}
-        nested = payload.get("payload") or {}
-
-        # Payload-based: if calories are in the payload and exceed limit, drop
-        payload_cal = payload.get("calories") or nested.get("calories")
-        if payload_cal is not None:
-            try:
-                c = float(payload_cal)
-                if c > cal_f:
-                    dropped += 1
-                    logger.info(
-                        "Calorie filter dropped (payload): title=%s calories=%.0f (limit=%s)",
-                        item.get("title", "?"), c, cal_limit,
-                    )
-                    continue
-            except (TypeError, ValueError):
-                pass
 
         if not rid:
             # No ID — cannot verify; drop for strict calorie filtering
@@ -483,6 +465,11 @@ def _filter_calories(
         logger.info(
             "Calorie filter: dropped %d / %d results (limit=%s kcal)",
             dropped, len(fused), cal_limit,
+            extra={
+                "component": "constraint_filter",
+                "counter": "calorie_filter_dropped_count",
+                "value": dropped,
+            },
         )
     return kept
 
@@ -835,6 +822,187 @@ def _filter_nutrient_threshold(
 # relationships are populated — no separate implementation needed.
 
 
+_USDA_GROUPS: tuple[str, ...] = (
+    "protein",
+    "dairy",
+    "vegetables",
+    "fruits",
+    "whole_grains",
+)
+
+
+def food_group_balance_score(
+    payload: dict[str, Any],
+    *,
+    min_mult: float = 0.9,
+    max_mult: float = 1.2,
+) -> float:
+    """
+    Compute USDA food-group diversity multiplier from recipe payload.
+
+    Expects payload["food_groups"] as list[str]. Returns 1.0 when unavailable or
+    invalid so callers can safely apply this as a no-op.
+    """
+    if min_mult <= 0 or max_mult <= 0 or max_mult < min_mult:
+        return 1.0
+
+    raw_groups = payload.get("food_groups")
+    if not isinstance(raw_groups, list) or not raw_groups:
+        return 1.0
+
+    present: set[str] = set()
+    for g in raw_groups:
+        if not isinstance(g, str):
+            continue
+        norm = g.strip().lower()
+        if norm in _USDA_GROUPS:
+            present.add(norm)
+
+    if not present:
+        return 1.0
+
+    coverage = len(present) / float(len(_USDA_GROUPS))
+    return min_mult + (max_mult - min_mult) * coverage
+
+
+def apply_usda_food_group_bonus(
+    fused: list[dict[str, Any]],
+    entities: dict[str, Any],
+    intent: str,
+) -> list[dict[str, Any]]:
+    """
+    Apply a bounded USDA diversity multiplier after hard constraints.
+
+    Ordering target (Phase C):
+      1) hard constraints
+      2) USDA food-group bonus
+      3) contextual rerank
+
+    This step is fail-safe: if data is missing or malformed, it returns fused
+    unchanged for backward compatibility.
+    """
+    if os.getenv("ENABLE_USDA_FOOD_GROUP_BONUS", "").strip() != "1":
+        return fused
+    if not fused or intent not in RECIPE_INTENTS:
+        return fused
+    if not isinstance(entities.get("usda_guidelines"), dict):
+        return fused
+
+    scored: list[dict[str, Any]] = []
+    changed = 0
+    for item in fused:
+        item_copy = dict(item)
+        payload = item_copy.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        base = float(item_copy.get("rrf_score", item_copy.get("score", 0.0)))
+        mult = food_group_balance_score(payload)
+        adjusted = base * mult
+        if adjusted != base:
+            changed += 1
+
+        item_copy["score"] = adjusted
+        item_copy["rrf_score"] = adjusted
+        scored.append(item_copy)
+
+    if changed:
+        logger.info(
+            "USDA diversity bonus applied",
+            extra={
+                "component": "constraint_filter",
+                "intent": intent,
+                "items_adjusted": changed,
+                "total_items": len(scored),
+                "counter": "usda_bonus_applied_count",
+                "value": 1,
+            },
+        )
+    return sorted(scored, key=lambda x: -(x.get("score", 0)))
+
+
+# ── Contextual rerank (PRD-33: soft ranking by context) ───────────────────────
+
+def contextual_rerank(
+    fused: list[dict[str, Any]],
+    entities: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    Soft rerank fused results by contextual signals (recent meals, calorie target,
+    cuisine preference). Does not remove items — only adjusts scores and sort order.
+
+    PRD logic:
+      - Penalize recent meals (×0.3)
+      - Penalize high-calorie recipes when over target (×0.7)
+      - Boost cuisine match (×1.3)
+
+    No-op when entities lack any of: exclude_recipe_ids, calorie_target,
+    cuisine_preference.
+
+    Fused item shape: canonical payload fields only
+    (id, calories, cuisine_code).
+    """
+    exclude_ids: set[str] = set()
+    exclude_raw = entities.get("exclude_recipe_ids")
+    if isinstance(exclude_raw, list):
+        exclude_ids = {str(rid).strip().lower() for rid in exclude_raw if rid}
+    elif exclude_raw:
+        exclude_ids = {str(exclude_raw).strip().lower()}
+
+    cal_target = entities.get("calorie_target")
+    if cal_target is not None:
+        try:
+            cal_target = float(cal_target)
+        except (TypeError, ValueError):
+            cal_target = None
+
+    cuisines: list[str] = []
+    cp = entities.get("cuisine_preference")
+    if isinstance(cp, list):
+        cuisines = [str(c).strip().lower() for c in cp if c]
+    elif cp:
+        cuisines = [str(cp).strip().lower()]
+
+    if not exclude_ids and cal_target is None and not cuisines:
+        return fused
+
+    scored: list[dict[str, Any]] = []
+    for item in fused:
+        item = dict(item)
+        base = float(item.get("rrf_score", item.get("score", 0.5)))
+
+        payload = item.get("payload") or {}
+        recipe_id = str(
+            payload.get("id")
+            or item.get("key", "")
+        ).strip().lower()
+
+        mult = 1.0
+        if recipe_id and recipe_id in exclude_ids:
+            mult *= 0.3
+        if cal_target is not None:
+            cal = payload.get("calories")
+            if cal is not None:
+                try:
+                    if float(cal) > cal_target:
+                        mult *= 0.7
+                except (TypeError, ValueError):
+                    pass
+        if cuisines:
+            recipe_cuisine = payload.get("cuisine_code")
+            if recipe_cuisine:
+                rc = str(recipe_cuisine).strip().lower()
+                if rc and any(c in rc or rc in c for c in cuisines):
+                    mult *= 1.3
+
+        adjusted = base * mult
+        item["score"] = adjusted
+        item["rrf_score"] = adjusted
+        scored.append(item)
+
+    return sorted(scored, key=lambda x: -(x.get("score", 0)))
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def apply_hard_constraints(
@@ -859,7 +1027,7 @@ def apply_hard_constraints(
 
     Returns:
         Filtered list.  Items that could not be verified carry extra source
-        tags ('unverified_allergen', 'unverified_course', 'unverified_calories')
+        tags ('unverified_allergen', 'unverified_calories')
         so the prompt builder can warn the LLM.
     """
     if intent not in RECIPE_INTENTS or not fused:
@@ -971,9 +1139,10 @@ def build_zero_results_message(
         relaxation_hints.append("using fewer diet filters")
 
     # Build the message
-    lines: list[str] = [
-        f"No {searched_for} were found in the knowledge base.",
-    ]
+    lines: list[str] = []
+    if cal_limit:
+        lines.append(f"No recipes found under {cal_limit} kcal after constraints.")
+    lines.append(f"No {searched_for} were found in the knowledge base.")
 
     if allergens and not relaxation_hints:
         # Only constraint is allergens — nothing safe to relax
@@ -1035,10 +1204,14 @@ def check_safety_compliance(
         course_lower = course.lower()
         for item in fused:
             payload = item.get("payload") or {}
-            meal_type = (
-                payload.get("r.meal_type") or payload.get("meal_type") or ""
-            ).lower()
-            if meal_type and meal_type != course_lower:
+            meal_type_raw = payload.get("meal_type")
+            meal_type = str(meal_type_raw).strip().lower() if meal_type_raw is not None else ""
+            if not meal_type:
+                violations.append(
+                    f"course_missing_meal_type: required={course_lower} "
+                    f"(title={item.get('title', '?')})"
+                )
+            elif meal_type != course_lower:
                 violations.append(
                     f"course_mismatch: meal_type={meal_type} required={course_lower} "
                     f"(title={item.get('title', '?')})"

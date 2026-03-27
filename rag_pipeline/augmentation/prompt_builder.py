@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Any
+import os
+import logging
 
 from rag_pipeline.augmentation.condense import (
     condense_for_llm,
@@ -10,12 +12,55 @@ from rag_pipeline.augmentation.condense import (
 from rag_pipeline.augmentation.fusion import format_fused_results_as_text
 from rag_pipeline.orchestrator.orchestrator import OrchestratorResult
 
+logger = logging.getLogger(__name__)
+
 
 SYSTEM_PROMPT_BASE = """You are a Nutrition assistant. Recommend recipes and answer food/nutrition questions using ONLY the context below.
 
 RULES: Use only recipes/ingredients from the context. If no suitable options in the context, say "I don't have matching recipes in my database" and suggest refining the query. Do NOT invent recipes or ingredients. Be concise and practical.
 
 PERSONALIZATION: When [USER PROFILE] is provided: use the customer's name when greeting; respect diets, allergens, and health conditions; tailor suggestions to their health goal and activity level; reference recent meals when avoiding repetition helps."""
+
+
+USDA_2025_SYSTEM_CONTEXT = """
+Use these USDA-style patterns when suggesting meals or weekly plans.
+Treat them as strong guidelines (soft), not hard blockers.
+
+DAILY PATTERN (~2,000 kcal adult)
+- Protein: include at EVERY main meal; overall ~1.2–1.6 g/kg/day.
+- Dairy: ~3 servings/day, low/no added sugar.
+- Vegetables: ~3 servings/day (mixed colors).
+- Fruits: ~2 servings/day (whole fruits > juice).
+- Whole grains: 2–4 servings/day (prefer over refined grains).
+- Healthy fats: favor nuts, seeds, olive oil, fatty fish, whole-fat dairy over ultra-processed fats.
+
+SOFT LIMITS (steer away, don’t strictly forbid)
+- Added sugar: aim for 0; ≲10 g added sugar per meal.
+- Sodium: generally <2,300 mg/day.
+- Saturated fat: <10% of daily calories.
+- Ultra-processed foods & sugary drinks: minimize; prefer water/unsweetened drinks.
+
+MEAL RULES
+- Breakfast: must have a clear protein source; plus dairy or whole grains.
+  Prefer fruit and some healthy fats; avoid “refined-carb only” meals and very sugary drinks.
+- Lunch & Dinner: must have protein + 1–2 veg servings.
+  Prefer whole-grain or starchy-veg base/side, optional dairy, and healthy fats; avoid very salty,
+  deep-fried, or highly processed mains/sides.
+
+CROSS-MEAL BALANCE
+- Across the day, aim for ≈3 veg servings, ≈2 fruit, ≈3 dairy (if appropriate), and 2–4 whole-grain servings.
+- Keep total added sugar low (many meals at 0 g; ideally ≤10 g each), sodium and saturated fat within limits.
+- Avoid meals that are almost entirely one food group (e.g., mostly refined carbs with no protein or vegetables).
+"""
+
+
+def _usda_prompt_enabled() -> bool:
+    """
+    Feature flag for USDA 2025 prompt context (Phase B).
+    Controlled via ENABLE_USDA_2025_PROMPT_CONTEXT env var; default off.
+    """
+    return os.getenv("ENABLE_USDA_2025_PROMPT_CONTEXT", "").strip() == "1"
+
 
 # Backward compatibility for cli.py and other consumers
 SYSTEM_PROMPT = SYSTEM_PROMPT_BASE
@@ -112,6 +157,39 @@ def _build_profile_section(profile: dict[str, Any]) -> str:
     return "\n".join(lines) if lines else ""
 
 
+def _build_context_section(entities: dict[str, Any]) -> str:
+    """
+    Build [USER CONTEXT] section from PRD-33 context fields in entities.
+    Returns lines for: meal_time, season, region, cuisine_preference, calorie_target.
+    Empty string when no context fields are present.
+    """
+    lines: list[str] = []
+    meal_time = entities.get("meal_time")
+    if meal_time and str(meal_time).strip():
+        lines.append(f"Meal time: {str(meal_time).strip()}")
+    season = entities.get("season")
+    if season and str(season).strip():
+        lines.append(f"Season: {str(season).strip()}")
+    region = entities.get("region")
+    if region and str(region).strip():
+        lines.append(f"Region: {str(region).strip()}")
+    cuisines = entities.get("cuisine_preference")
+    if isinstance(cuisines, list) and cuisines:
+        prefs = [str(c).strip() for c in cuisines if c]
+        if prefs:
+            lines.append(f"Cuisine preferences: {', '.join(prefs)}")
+    elif cuisines and isinstance(cuisines, str) and str(cuisines).strip():
+        lines.append(f"Cuisine preferences: {str(cuisines).strip()}")
+    cal_target = entities.get("calorie_target")
+    if cal_target is not None:
+        try:
+            ct = int(float(cal_target))
+            lines.append(f"Target calories: {ct} kcal/day")
+        except (TypeError, ValueError):
+            pass
+    return "\n".join(lines) if lines else ""
+
+
 def build_augmented_prompt(
     result: OrchestratorResult,
     user_query: str,
@@ -151,6 +229,18 @@ def build_augmented_prompt(
         constraint_instructions = _build_constraint_instructions(customer_profile)
         if constraint_instructions:
             system_prompt = f"{system_prompt}\n\nHARD CONSTRAINTS: {constraint_instructions}"
+    # Phase B: optionally inject USDA 2025 food-group context when enabled and
+    # guidelines are available in entities (wired in orchestrator Phase A).
+    if _usda_prompt_enabled() and result.entities.get("usda_guidelines"):
+        system_prompt = f"{system_prompt}\n\n{USDA_2025_SYSTEM_CONTEXT}"
+        logger.info(
+            "USDA prompt context injected",
+            extra={
+                "component": "prompt_builder",
+                "counter": "usda_prompt_injected_count",
+                "value": 1,
+            },
+        )
     sections.append(f"[SYSTEM]\n{system_prompt}")
 
     # ── Customer profile (injected right after system prompt) ──────────────────
@@ -158,6 +248,11 @@ def build_augmented_prompt(
         profile_text = _build_profile_section(customer_profile)
         if profile_text:
             sections.append(f"[USER PROFILE]\n{profile_text}")
+
+    # ── User context (PRD-33: meal_time, season, region, cuisine, calorie_target) ───
+    context_text = _build_context_section(result.entities)
+    if context_text:
+        sections.append(f"[USER CONTEXT]\n{context_text}")
 
     # ── Zero-results fallback (takes priority over context sections) ──────────
     # When post-fusion hard filters removed everything, inject the structured
@@ -228,11 +323,11 @@ def _format_cypher_results(
     if intent in ("find_recipe", "find_recipe_by_pantry", "recipes_for_cuisine", "recipes_by_nutrient", "ingredient_in_recipes", "cuisine_recipes"):
         lines.append("Matching recipes from graph:")
         for i, row in enumerate(rows[:max_items], 1):
-            title = row.get("r.title", row.get("title", "Unknown"))
-            rtype = row.get("r.meal_type", row.get("r.recipe_type", row.get("meal_type", row.get("recipe_type", ""))))
-            time = row.get("r.total_time_minutes", row.get("total_time_minutes", ""))
-            protein = row.get("r.percent_calories_protein", "")
-            cuisine = row.get("cuisine_name", row.get("c.name", ""))
+            title = row.get("title", "Unknown")
+            rtype = row.get("meal_type", "")
+            time = row.get("total_time_minutes", "")
+            protein = row.get("percent_calories_protein", "")
+            cuisine = row.get("cuisine_name", "")
             time_str = f", {time} min" if time else ""
             protein_str = f", {round(float(protein), 1)}% protein" if protein and protein != "" else ""
             cuisine_str = f", {cuisine}" if cuisine else ""

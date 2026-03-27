@@ -3,4 +3,5 @@ __pycache__/
 .env
 .venv/
 venv/
+.claude/
 .DS_Store
