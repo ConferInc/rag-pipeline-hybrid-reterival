@@ -69,6 +69,7 @@ def _build_find_recipe(entities: dict) -> tuple[str, dict]:
     dish                str        – keyword match on r.title
     cal_upper_limit     int        – max calories via NutritionValue (HAS_NUTRITION)
     nutrient_threshold  dict       – {nutrient, operator, value}
+    cuisine_preference  List[str]  – preferred cuisines (context); filter via BELONGS_TO_CUSINE
 
     Graph notes
     -----------
@@ -114,6 +115,24 @@ def _build_find_recipe(entities: dict) -> tuple[str, dict]:
             f"EXISTS {{ MATCH (cust_{idx})-[:SAVED|VIEWED]->(r) }}"
         )
         params[f"diet_{idx}"] = diet
+
+    # ── Cuisine preference (PRD-33 context) ───────────────────────────────────
+    # Recipe must belong to at least one preferred cuisine via BELONGS_TO_CUSINE.
+    cuisine_prefs = entities.get("cuisine_preference", [])
+    if isinstance(cuisine_prefs, list) and cuisine_prefs:
+        prefs = [str(p).strip() for p in cuisine_prefs if p]
+    elif cuisine_prefs:
+        prefs = [str(cuisine_prefs).strip()]
+    else:
+        prefs = []
+    if prefs:
+        where_parts.append(
+            "EXISTS { MATCH (r)-[:BELONGS_TO_CUSINE]->(c_cuis:Cuisine) "
+            "WHERE ANY(pref IN $cuisine_preference "
+            "WHERE toLower(c_cuis.name) CONTAINS toLower(pref) "
+            "OR toLower(c_cuis.code) CONTAINS toLower(pref)) }"
+        )
+        params["cuisine_preference"] = prefs
 
     # ── Course / meal_type ───────────────────────────────────────────────────
     course = entities.get("course")
@@ -481,7 +500,7 @@ def _build_rank_results(entities: dict) -> tuple[str, dict]:
             "MATCH (r)-[:HAS_NUTRITION]->(rnv:NutritionValue)"
             "-[:OF_NUTRIENT]->(nd:NutrientDefinition)\n"
             "WHERE nd.nutrient_name IN ['Energy', 'Calories/Energy']\n"
-            "RETURN r.id, r.title, rnv.amount AS calories, rnv.unit\n"
+            "RETURN r.id, r.title, r.meal_type, rnv.amount AS calories, rnv.unit\n"
             "ORDER BY calories ASC"
         )
     else:
@@ -491,7 +510,7 @@ def _build_rank_results(entities: dict) -> tuple[str, dict]:
         cypher = (
             "MATCH (r:Recipe)\n"
             "WHERE r.id IN $recipe_ids\n"
-            f"RETURN r.id, r.title, {prop} AS sort_value\n"
+            f"RETURN r.id, r.title, r.meal_type, {prop} AS sort_value\n"
             f"ORDER BY sort_value {direction}"
         )
 

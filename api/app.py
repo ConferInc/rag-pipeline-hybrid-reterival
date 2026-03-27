@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import re
 import time
+from itertools import combinations
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -36,9 +38,25 @@ from rag_pipeline.embeddings.openai_embedder import OpenAIQueryEmbedder
 from rag_pipeline.neo4j_client import create_neo4j_driver, neo4j_settings_from_env
 from rag_pipeline.profile import aggregate_profile, get_household_id_for_customer, get_household_type, resolve_profile_for_recommendation
 from rag_pipeline.nlu.intents import CHATBOT_DATA_INTENTS, DATA_INTENTS_NEEDING_RETRIEVAL
-from rag_pipeline.orchestrator.constraint_filter import apply_hard_constraints, build_zero_results_message
+from rag_pipeline.orchestrator.constraint_filter import (
+    apply_hard_constraints,
+    apply_usda_food_group_bonus,
+    build_zero_results_message,
+    contextual_rerank,
+)
 from rag_pipeline.orchestrator.cypher_runner import run_cypher_retrieval
+from rag_pipeline.orchestrator.profile_enrichment import merge_profile_into_entities
 from rag_pipeline.orchestrator.orchestrator import orchestrate, OrchestratorResult
+from rag_pipeline.orchestrator.food_group_audit import (
+    audit_candidate_set,
+    build_audit_warnings,
+)
+from rag_pipeline.orchestrator.usda_guidelines import (
+    guidelines_to_jsonable,
+    infer_food_groups_for_ingredients,
+    load_usda_guidelines,
+    load_usda_soft_guidelines,
+)
 from rag_pipeline.retrieval.service import retrieve_semantic, SemanticRetrievalRequest
 from rag_pipeline.retrieval.similar_constraint import retrieve_recipes_from_similar_constraint_users
 from rag_pipeline.retrieval.structural import get_seed_embedding, structural_search_with_expansion
@@ -84,12 +102,14 @@ _driver = None
 _cfg = None
 _embedder = None
 _response_validation_cfg: dict[str, Any] = {}
+_usda_guidelines: dict[str, Any] | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize Neo4j driver + embedder on startup, close on shutdown."""
     global _driver, _cfg, _embedder, _response_validation_cfg
+    global _usda_guidelines
 
     neo_settings = neo4j_settings_from_env()
     neo_timeout = os.getenv("NEO4J_CONNECTION_TIMEOUT")
@@ -124,6 +144,15 @@ async def lifespan(app: FastAPI):
         )
     else:
         _embedder = base_embedder
+
+    # Phase A/PRD-34: load USDA hard + soft guideline config (defaults + cache)
+    # and attach into orchestrator entities for prompt/scoring/audit contracts.
+    try:
+        hard_guidelines = guidelines_to_jsonable(load_usda_guidelines())
+        hard_guidelines["soft_guidelines"] = load_usda_soft_guidelines()
+        _usda_guidelines = hard_guidelines
+    except Exception:
+        _usda_guidelines = None
 
     yield
 
@@ -222,6 +251,7 @@ class SearchRequest(BaseModel):
         None,
         description="Pre-built profile: {diets: [], allergens: [], health_conditions: [], household_type?, ...}. Primary over Neo4j when provided.",
     )
+    context: dict[str, Any] | None = Field(None, description="RecommendationContext from B2C")
 
 
 class FeedRequest(BaseModel):
@@ -242,6 +272,7 @@ class FeedRequest(BaseModel):
         None,
         description="Pre-built profile: {diets, allergens, health_conditions, health_goal, household_type?, ...}. Primary over Neo4j when provided.",
     )
+    context: dict[str, Any] | None = Field(None, description="RecommendationContext from B2C")
 
 
 class MealCandidateRequest(BaseModel):
@@ -273,6 +304,10 @@ class MealCandidateRequest(BaseModel):
         None,
         description="Pre-built aggregated profile. Primary over Neo4j when provided.",
     )
+    context: dict[str, Any] | None = Field(
+        None,
+        description="B2C RecommendationContext: timezone, season, mealTimeSlot, macro targets, recentMealIds, cuisinePreferences",
+    )
 
 
 class MealCandidateItem(BaseModel):
@@ -281,12 +316,32 @@ class MealCandidateItem(BaseModel):
     title: str
     score: float
     reasons: list[str] = Field(default_factory=list)
+    # Phase A contract: inferred USDA food groups for later meal-plan audits.
+    food_groups: list[str] = Field(default_factory=list)
+    calories: float | None = Field(None, description="Recipe calories used for calorie-fit planning")
 
 
 class MealCandidateResponse(BaseModel):
     candidates: list[MealCandidateItem]
     retrieval_time_ms: float
     zero_results_explanation: str | None = Field(None, description="Explanation when no candidates satisfy constraints")
+    guideline_compliance: str | None = Field(
+        None,
+        description='USDA guideline compliance summary: "adequate" | "partial"',
+    )
+    audit_warnings: list[str] = Field(default_factory=list)
+    missing_groups: list[str] = Field(default_factory=list)
+    food_group_audit: list[dict[str, Any]] = Field(default_factory=list)
+    strict_mode_insufficiency: dict[str, Any] | None = Field(
+        None,
+        description="Structured insufficiency explanation when USDA strict mode is enabled and coverage is infeasible.",
+    )
+    daily_calorie_target: float | None = Field(None, description="Profile daily calorie target used for plan calibration")
+    selected_total_calories: float | None = Field(None, description="Sum of calories for selected meals in this response")
+    calorie_delta: float | None = Field(None, description="selected_total_calories - daily_calorie_target")
+    calorie_tolerance: float | None = Field(None, description="Allowed absolute deviation for calorie compliance")
+    calorie_compliance: str | None = Field(None, description='"adequate" | "partial" based on calorie_delta and tolerance')
+    calorie_phase: str = Field("phase_1_2_3", description="Calorie calibration implementation phase marker")
 
 
 class RecommendationResult(BaseModel):
@@ -438,6 +493,7 @@ class ChatProcessRequest(BaseModel):
         None,
         description="Pre-built profile. Primary over Neo4j when provided.",
     )
+    context: dict[str, Any] | None = Field(None, description="RecommendationContext from B2C")
 
 
 class ChatRecipeItem(BaseModel):
@@ -747,10 +803,16 @@ _GOAL_WORDS: dict[str, str] = {
 }
 
 
-def build_feed_query_text(profile: dict[str, Any], meal_type: str | None = None) -> str:
+def build_feed_query_text(
+    profile: dict[str, Any],
+    meal_type: str | None = None,
+    entities: dict[str, Any] | None = None,
+) -> str:
     """
     Build a short text string for the semantic embedder from a customer profile.
     This text is NOT passed to the LLM — it is only embedded for vector similarity search.
+
+    When entities is provided (PRD-33), includes cuisine, season, region, course/meal_time.
 
     Examples:
       diets=["Vegan"], goal="weight_loss"  → "Vegan low calorie recipes"
@@ -758,10 +820,28 @@ def build_feed_query_text(profile: dict[str, Any], meal_type: str | None = None)
       meal_type="breakfast"                → "Vegan low calorie breakfast recipes"
     """
     parts: list[str] = list(profile.get("diets") or [])
+    if entities:
+        cuisines = entities.get("cuisine_preference", [])
+        if isinstance(cuisines, list) and cuisines:
+            for c in cuisines[:3]:
+                if c and str(c).strip():
+                    parts.append(str(c).strip())
+        elif cuisines and isinstance(cuisines, str):
+            parts.append(str(cuisines).strip())
+        season = entities.get("season")
+        if season and str(season).strip():
+            parts.append(str(season).strip())
+        region = entities.get("region")
+        if region and str(region).strip():
+            parts.append(str(region).strip())
     goal_text = _GOAL_WORDS.get(profile.get("health_goal") or "", "healthy")
     parts.append(goal_text)
     if meal_type:
         parts.append(meal_type)
+    elif entities:
+        course_val = entities.get("course") or entities.get("meal_time")
+        if course_val and str(course_val).strip():
+            parts.append(str(course_val).strip())
     parts.append("recipes")
     return " ".join(parts)
 
@@ -936,13 +1016,11 @@ def _resolve_id(payload: dict[str, Any], key: str) -> str:
     """
     Resolve the best available recipe ID from a fused result payload.
     Returns only what is in payload; does not perform DB lookup.
-    Priority: payload.id > payload["r.id"] > nested payload.id (structural) > key fallback.
+    Priority: payload.id > nested payload.id (temporary migration fallback) > key fallback.
     """
     uid = (
         payload.get("id")
-        or payload.get("r.id")
         or (payload.get("payload") or {}).get("id")
-        or (payload.get("payload") or {}).get("r.id")
     )
     if uid:
         return str(uid)
@@ -967,7 +1045,7 @@ def _resolve_id_with_lookup(
         return uid
     # Try lookup: use elementId (connected_id or key) or title
     connected_id = item.get("connected_id") or (key if _looks_like_element_id(key) else None)
-    title = payload.get("title") or payload.get("r.title") or (payload.get("payload") or {}).get("title")
+    title = payload.get("title") or (payload.get("payload") or {}).get("title")
     name = payload.get("name") or (payload.get("payload") or {}).get("name")
     looked_up = _lookup_uuid_from_neo4j(
         driver,
@@ -987,6 +1065,399 @@ def _resolve_id_with_lookup(
     return uid
 
 
+def _fetch_recipe_ingredient_names(
+    driver: Driver,
+    recipe_ids: list[str],
+    *,
+    database: str | None = None,
+) -> dict[str, list[str]]:
+    """
+    Batch fetch ingredient names for a list of Recipe UUIDs.
+
+    Phase A: recipes currently don't include `food_groups` in retrieval payloads,
+    so we infer buckets using Recipe -> USES_INGREDIENT -> Ingredient.
+    """
+    if not recipe_ids:
+        return {}
+
+    cypher = """
+    UNWIND $recipe_ids AS rid
+    MATCH (r:Recipe {id: rid})-[:USES_INGREDIENT]->(i:Ingredient)
+    RETURN rid AS recipe_id,
+           collect(DISTINCT coalesce(i.name, i.title, i.display_name)) AS ingredient_names
+    """
+    try:
+        with driver.session(database=database) as session:
+            rows = session.run(cypher, recipe_ids=recipe_ids)
+            out: dict[str, list[str]] = {rid: [] for rid in recipe_ids}
+            for row in rows:
+                rid = str(row.get("recipe_id"))
+                ing_names_raw = row.get("ingredient_names") or []
+                out[rid] = [str(x).strip() for x in ing_names_raw if x and str(x).strip()]
+            return out
+    except Exception as e:
+        logger.warning(
+            "Failed to fetch recipe ingredient names for USDA inference: %s",
+            e,
+            extra={"component": "usda_food_groups"},
+        )
+        return {rid: [] for rid in recipe_ids}
+
+
+def _is_kcal_unit(unit: Any) -> bool:
+    """Return True when unit represents kcal/calories variants."""
+    if unit is None:
+        return False
+    text = str(unit).strip().lower()
+    if not text:
+        return False
+    normalized = re.sub(r"[^a-z]", "", text)
+    return normalized in {
+        "kcal",
+        "kcals",
+        "kilocalorie",
+        "kilocalories",
+        "calorie",
+        "calories",
+        "cal",
+    }
+
+
+def _fetch_recipe_calories_map(
+    driver: Driver,
+    recipe_ids: list[str],
+    *,
+    database: str | None = None,
+    request_cache: dict[str, float | None] | None = None,
+) -> dict[str, float | None]:
+    """
+    Batch fetch calories from nutrition graph path:
+    Recipe -> HAS_NUTRITION -> NutritionValue -> OF_NUTRIENT -> NutrientDefinition.
+    """
+    if not recipe_ids:
+        return {}
+    if os.getenv("ENABLE_GRAPH_CALORIE_RESOLVER", "1").strip() != "1":
+        return {rid: None for rid in recipe_ids}
+
+    cache = request_cache if request_cache is not None else {}
+    missing_for_query = [rid for rid in recipe_ids if rid not in cache]
+    if not missing_for_query:
+        return {rid: cache.get(rid) for rid in recipe_ids}
+
+    aliases = [
+        "Energy",
+        "Calories",
+        "Calories/Energy",
+        "Energy (kcal)",
+        "Energy, calories",
+    ]
+    alias_rank = {
+        "energy": 5,
+        "calories": 4,
+        "calories/energy": 3,
+        "energy (kcal)": 2,
+        "energy, calories": 1,
+    }
+    cypher = """
+    UNWIND $recipe_ids AS rid
+    OPTIONAL MATCH (r:Recipe {id: rid})-[:HAS_NUTRITION]->(nv:NutritionValue)-[:OF_NUTRIENT]->(nd:NutrientDefinition)
+    WHERE toLower(coalesce(nd.name, "")) IN $alias_names_lc
+    RETURN rid AS recipe_id,
+           nd.name AS nutrient_name,
+           nv.amount AS amount,
+           coalesce(nv.unit, nv.unit_name, nd.unit, "") AS unit
+    """
+    out: dict[str, float | None] = {rid: cache.get(rid) for rid in recipe_ids}
+    try:
+        lookup_start = time.perf_counter()
+        timeout_s = float(os.getenv("CALORIE_LOOKUP_TIMEOUT_S", "1.5"))
+        with driver.session(database=database) as session:
+            with session.begin_transaction(timeout=timeout_s) as tx:
+                rows = list(
+                    tx.run(
+                        cypher,
+                        recipe_ids=missing_for_query,
+                        alias_names_lc=[a.lower() for a in aliases],
+                    )
+                )
+            best_per_recipe: dict[str, tuple[tuple[int, int, int], float]] = {}
+            for idx, row in enumerate(rows):
+                rid = str(row.get("recipe_id"))
+                amount = _safe_float(row.get("amount"))
+                if amount is None:
+                    continue
+                nutrient_name = str(row.get("nutrient_name") or "").strip().lower()
+                unit = row.get("unit")
+                is_kcal = 1 if _is_kcal_unit(unit) else 0
+                # Deterministic selection:
+                # 1) kcal unit, 2) nutrient alias confidence, 3) first valid row.
+                selection_key = (is_kcal, alias_rank.get(nutrient_name, 0), -idx)
+                current = best_per_recipe.get(rid)
+                if current is None or selection_key > current[0]:
+                    best_per_recipe[rid] = (selection_key, amount)
+
+            for rid, (_, cal) in best_per_recipe.items():
+                cache[rid] = float(cal)
+                out[rid] = float(cal)
+
+            for rid in missing_for_query:
+                if rid not in cache:
+                    cache[rid] = None
+                out[rid] = cache.get(rid)
+
+            resolved = sum(1 for v in out.values() if v is not None)
+            missing = len(out) - resolved
+            lookup_ms = (time.perf_counter() - lookup_start) * 1000.0
+            if resolved:
+                logger.info(
+                    "Graph calorie lookup resolved",
+                    extra={
+                        "component": "calorie_graph_lookup",
+                        "counter": "calorie_graph_lookup_success_count",
+                        "value": resolved,
+                        "latency_ms": round(lookup_ms, 2),
+                    },
+                )
+            if missing:
+                logger.warning(
+                    "Graph calorie lookup missing values",
+                    extra={
+                        "component": "calorie_graph_lookup",
+                        "counter": "calorie_graph_lookup_missing_count",
+                        "value": missing,
+                        "latency_ms": round(lookup_ms, 2),
+                    },
+                )
+            if missing and random.random() < 0.1:
+                missing_ids = [rid for rid, val in out.items() if val is None][:10]
+                logger.info(
+                    "Graph calorie lookup sampled missing nutrient mappings",
+                    extra={
+                        "component": "calorie_graph_lookup",
+                        "sample_missing_recipe_ids": missing_ids,
+                        "sample_size": len(missing_ids),
+                    },
+                )
+            return out
+    except Exception as e:
+        logger.warning(
+            "Failed to fetch calories from nutrition graph: %s",
+            e,
+            extra={
+                "component": "calorie_graph_lookup",
+                "counter": "calorie_graph_lookup_missing_count",
+                "value": len(missing_for_query),
+            },
+        )
+        return out
+
+
+def _food_group_coverage_and_hint(food_groups: list[str]) -> tuple[float, str | None]:
+    """
+    Compute normalized food-group coverage and an optional USDA balance hint.
+
+    Coverage is the fraction of canonical USDA groups present in the recipe.
+    Hint is only returned for low-diversity results and remains optional/non-breaking.
+    """
+    canonical = {"protein", "dairy", "vegetables", "fruits", "whole_grains"}
+    present = {
+        str(g).strip().lower()
+        for g in (food_groups or [])
+        if isinstance(g, str) and str(g).strip().lower() in canonical
+    }
+    coverage = len(present) / 5.0
+    if coverage >= 0.6:
+        return coverage, None
+
+    missing_priority = ["protein", "vegetables", "whole_grains", "fruits", "dairy"]
+    missing = [g for g in missing_priority if g not in present]
+    if not missing:
+        return coverage, None
+    top_missing = ", ".join(missing[:3])
+    return coverage, f"Low food-group diversity; consider adding {top_missing}."
+
+
+def _safe_float(v: Any) -> float | None:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+_CAL_LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(?:under|below|less than|at most|upto|up to)\s*(\d{2,5}(?:\.\d+)?)\s*(?:kcal|calories?|cal)\b", re.I),
+    re.compile(r"\b(\d{2,5}(?:\.\d+)?)\s*(?:kcal|calories?|cal)\s*(?:or less|or below|max(?:imum)?)\b", re.I),
+)
+
+
+def _inject_calorie_limit_entity(query_text: str, entities: dict[str, Any]) -> dict[str, Any]:
+    """
+    Deterministically map calorie phrases to entities.cal_upper_limit.
+    Preserves existing cal_upper_limit when already set.
+    """
+    if not isinstance(entities, dict):
+        return entities
+    existing = entities.get("cal_upper_limit")
+    if _safe_float(existing) is not None:
+        return entities
+    text = str(query_text or "")
+    for pattern in _CAL_LIMIT_PATTERNS:
+        m = pattern.search(text)
+        if not m:
+            continue
+        parsed = _safe_float(m.group(1))
+        if parsed is None:
+            continue
+        entities["cal_upper_limit"] = int(parsed) if float(parsed).is_integer() else float(parsed)
+        break
+    return entities
+
+
+def _inject_graph_calories_into_fused(
+    fused: list[dict[str, Any]],
+    *,
+    driver: Driver,
+    database: str | None = None,
+    label: str = "Recipe",
+    calorie_cache: dict[str, float | None] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Enrich fused payload.calories from graph resolver, preserving payload fallback.
+    This helps downstream rerankers that read calories from payload.
+    """
+    if not fused:
+        return fused
+
+    resolved_items: list[dict[str, Any]] = []
+    recipe_ids: list[str] = []
+    for item in fused:
+        payload = item.get("payload", {}) or {}
+        key = item.get("key", "")
+        rec_id = _resolve_id_with_lookup(payload, key, item, driver, label=label, database=database)
+        item_copy = dict(item)
+        item_copy["_resolved_recipe_id"] = rec_id
+        resolved_items.append(item_copy)
+        if _is_uuid(str(rec_id)):
+            recipe_ids.append(str(rec_id))
+
+    recipe_ids = list(dict.fromkeys(recipe_ids))
+    graph_calories_map = _fetch_recipe_calories_map(
+        driver,
+        recipe_ids,
+        database=database,
+        request_cache=calorie_cache,
+    )
+
+    out: list[dict[str, Any]] = []
+    for item in resolved_items:
+        payload = item.get("payload", {}) or {}
+        payload_copy = dict(payload)
+        rid = str(item.get("_resolved_recipe_id") or "")
+        graph_cal = graph_calories_map.get(rid)
+        if graph_cal is not None:
+            payload_copy["calories"] = graph_cal
+        item_copy = dict(item)
+        item_copy["payload"] = payload_copy
+        item_copy.pop("_resolved_recipe_id", None)
+        out.append(item_copy)
+    return out
+
+
+def _apply_calorie_fit_rerank(
+    fused: list[dict[str, Any]],
+    *,
+    calorie_target: float | None,
+    meals_per_day: int,
+) -> list[dict[str, Any]]:
+    """
+    Phase 2: soft rerank candidates toward per-meal calorie target.
+    """
+    if not fused or calorie_target is None or calorie_target <= 0:
+        return fused
+    meals = max(1, meals_per_day)
+    target_per_meal = calorie_target / float(meals)
+    # Keep a practical tolerance band for smooth penalties.
+    band = max(120.0, target_per_meal * 0.25)
+
+    scored: list[dict[str, Any]] = []
+    for item in fused:
+        item_copy = dict(item)
+        payload = item_copy.get("payload") or {}
+        base = float(item_copy.get("rrf_score", item_copy.get("score", 0.0)))
+        cal = _safe_float(payload.get("calories"))
+        if cal is None:
+            multiplier = 1.0
+        else:
+            # Linear fit in [0.7, 1.2] where near-target recipes are boosted.
+            deviation = abs(cal - target_per_meal)
+            closeness = max(0.0, 1.0 - (deviation / band))
+            multiplier = 0.7 + (0.5 * closeness)
+        adjusted = base * multiplier
+        item_copy["score"] = adjusted
+        item_copy["rrf_score"] = adjusted
+        scored.append(item_copy)
+    return sorted(scored, key=lambda x: -(x.get("score", 0.0)))
+
+
+def _select_best_calorie_set(
+    candidates: list["MealCandidateItem"],
+    *,
+    calorie_target: float | None,
+    meals_per_day: int,
+    tolerance: float,
+) -> tuple[list["MealCandidateItem"], float | None, float | None, str | None]:
+    """
+    Phase 3: choose a meal set whose total calories best matches target.
+    Returns reordered candidates (selected first), selected_total, delta, compliance.
+    """
+    if not candidates or calorie_target is None or calorie_target <= 0:
+        return candidates, None, None, None
+
+    meals = max(1, meals_per_day)
+    pool = candidates[: min(len(candidates), 20)]
+    indexed = [(idx, c, _safe_float(c.calories)) for idx, c in enumerate(pool)]
+    with_cal = [(idx, c, cal) for idx, c, cal in indexed if cal is not None]
+    if len(with_cal) < meals:
+        return candidates, None, None, "partial"
+
+    best_combo: tuple[int, ...] | None = None
+    best_delta = float("inf")
+    best_total: float | None = None
+
+    for combo in combinations(range(len(with_cal)), meals):
+        total = sum(float(with_cal[i][2]) for i in combo)
+        delta = abs(total - calorie_target)
+        if delta < best_delta:
+            best_delta = delta
+            best_combo = combo
+            best_total = total
+
+    if best_combo is None:
+        return candidates, None, None, "partial"
+
+    selected_ids = {with_cal[i][1].recipe_id for i in best_combo}
+    selected = [c for c in candidates if c.recipe_id in selected_ids]
+    non_selected = [c for c in candidates if c.recipe_id not in selected_ids]
+    ordered = selected + non_selected
+
+    delta_signed = (best_total - calorie_target) if best_total is not None else None
+    compliance = None
+    if delta_signed is not None:
+        compliance = "adequate" if abs(delta_signed) <= tolerance else "partial"
+    if compliance == "adequate":
+        logger.info(
+            "Calorie set selection marked adequate compliance",
+            extra={
+                "component": "calorie_set_selection",
+                "counter": "calorie_set_selection_adequate_count",
+                "value": 1,
+            },
+        )
+    return ordered, best_total, delta_signed, compliance
+
+
 def _merge_results_with_profile(
     fused: list[dict[str, Any]],
     entities: dict[str, Any],
@@ -996,6 +1467,7 @@ def _merge_results_with_profile(
     database: str | None = None,
     label: str = "Recipe",
     limit: int = 20,
+    calorie_cache: dict[str, float | None] | None = None,
 ) -> list[RecommendationResult]:
     """
     Build RecommendationResult list from raw fused RRF results for personalized endpoints.
@@ -1004,27 +1476,101 @@ def _merge_results_with_profile(
     Always returns results with PostgreSQL UUID. When UUID is not in payload,
     performs Neo4j lookup by elementId or title. Never skips recipes.
     """
-    out: list[RecommendationResult] = []
+    fused = fused[:limit]
+
+    candidates: list[dict[str, Any]] = []
     for item in fused:
-        if len(out) >= limit:
-            break
         payload = item.get("payload", {}) or {}
         key = item.get("key", "")
-        title = item.get("title") or payload.get("title") or payload.get("name") or key
-        rec_id = _resolve_id_with_lookup(payload, key, item, driver, label=label, database=database)
+        title = payload.get("title") or item.get("title") or payload.get("name") or key
+        rec_id = _resolve_id_with_lookup(
+            payload,
+            key,
+            item,
+            driver,
+            label=label,
+            database=database,
+        )
+        candidates.append({"item": item, "title": title, "rec_id": rec_id})
+
+    recipe_ids_to_fetch = [str(c["rec_id"]) for c in candidates if _is_uuid(str(c["rec_id"]))]  # type: ignore[arg-type]
+    recipe_ids_to_fetch = list(dict.fromkeys(recipe_ids_to_fetch))  # preserve order, dedupe
+
+    ingredient_names_map = _fetch_recipe_ingredient_names(
+        driver,
+        recipe_ids_to_fetch,
+        database=database,
+    )
+    graph_calories_map = _fetch_recipe_calories_map(
+        driver,
+        recipe_ids_to_fetch,
+        database=database,
+        request_cache=calorie_cache,
+    )
+
+    food_groups_map: dict[str, dict[str, Any]] = {}
+    for rid, ing_names in ingredient_names_map.items():
+        food_groups_map[rid] = infer_food_groups_for_ingredients(ing_names or [])
+
+    out: list[RecommendationResult] = []
+    missing_food_group_fields_count = 0
+    for c in candidates:
+        item = c["item"]
+        rec_id = c["rec_id"]
+        rid = str(rec_id)
+        inferred = food_groups_map.get(rid) or {}
+        payload = item.get("payload", {}) or {}
+        graph_calories = graph_calories_map.get(rid)
+        payload_calories = _safe_float(payload.get("calories"))
+        resolved_calories = graph_calories if graph_calories is not None else payload_calories
+        calorie_source = (
+            "graph"
+            if graph_calories is not None
+            else ("payload_fallback" if payload_calories is not None else "unknown")
+        )
+
+        # Prefer well-formed payload food_groups when available; otherwise fall back
+        # to inferred ingredient-based buckets. Non-list values are ignored.
+        payload_food_groups = payload.get("food_groups")
+        if not isinstance(payload_food_groups, list):
+            missing_food_group_fields_count += 1
+            payload_food_groups = None
+        effective_food_groups = payload_food_groups or inferred.get("food_groups") or []
+        coverage, balance_hint = _food_group_coverage_and_hint(effective_food_groups)
 
         out.append(
             RecommendationResult(
-                id=str(rec_id),
+                id=rid,
                 score=float(item.get("rrf_score", 0.0)),
                 reasons=_build_reasons(item, entities, profile),
                 metadata={
-                    "title": title,
+                    "title": c["title"],
                     "label": item.get("label", ""),
                     "sources": item.get("sources", []),
                     "id_source": "uuid" if _is_uuid(rec_id) else "lookup",
+                    "calories": resolved_calories,
+                    "calorie_source": calorie_source,
+                    # Phase A contract: inferred food buckets for recipes.
+                    "food_groups": effective_food_groups,
+                    "food_group_coverage": coverage,
+                    "usda_balance_hint": balance_hint,
+                    "food_group_confidence": inferred.get("confidence_by_group") or {},
+                    "food_group_source": "ingredient_keyword_rules",
+                    "food_group_unknown_count": inferred.get("unknown_count"),
+                    # Preserve any precomputed payload fields (future wiring).
+                    "payload_food_groups": payload_food_groups,
                 },
             )
+        )
+
+    if missing_food_group_fields_count:
+        logger.info(
+            "Food-group payload fields missing; inferred fallback used",
+            extra={
+                "component": "usda_food_groups",
+                "counter": "food_group_inference_missing_fields_count",
+                "value": missing_food_group_fields_count,
+            },
         )
     return out
 
@@ -1038,6 +1584,7 @@ def _merge_results(
     database: str | None = None,
     label: str = "Recipe",
     limit: int = 20,
+    calorie_cache: dict[str, float | None] | None = None,
 ) -> list[RecommendationResult]:
     """
     Merge fused RRF results into a ranked list for API response.
@@ -1047,28 +1594,97 @@ def _merge_results(
     Never returns title or elementId as id.
     """
     fused = orch.fused_results[:limit]
-    out: list[RecommendationResult] = []
 
+    candidates: list[dict[str, Any]] = []
     for item in fused:
         payload = item.get("payload", {}) or {}
         key = item.get("key", "")
-        title = item.get("title") or payload.get("title") or payload.get("name") or key
-        rec_id = _resolve_id_with_lookup(payload, key, item, driver, label=label, database=database)
+        title = payload.get("title") or item.get("title") or payload.get("name") or key
+        rec_id = _resolve_id_with_lookup(
+            payload,
+            key,
+            item,
+            driver,
+            label=label,
+            database=database,
+        )
+        candidates.append({"item": item, "title": title, "rec_id": rec_id})
+
+    recipe_ids_to_fetch = [str(c["rec_id"]) for c in candidates if _is_uuid(str(c["rec_id"]))]  # type: ignore[arg-type]
+    recipe_ids_to_fetch = list(dict.fromkeys(recipe_ids_to_fetch))  # preserve order, dedupe
+
+    ingredient_names_map = _fetch_recipe_ingredient_names(
+        driver,
+        recipe_ids_to_fetch,
+        database=database,
+    )
+    graph_calories_map = _fetch_recipe_calories_map(
+        driver,
+        recipe_ids_to_fetch,
+        database=database,
+        request_cache=calorie_cache,
+    )
+
+    food_groups_map: dict[str, dict[str, Any]] = {}
+    for rid, ing_names in ingredient_names_map.items():
+        food_groups_map[rid] = infer_food_groups_for_ingredients(ing_names or [])
+
+    out: list[RecommendationResult] = []
+    missing_food_group_fields_count = 0
+    for c in candidates:
+        item = c["item"]
+        rec_id = c["rec_id"]
+        rid = str(rec_id)
+        inferred = food_groups_map.get(rid) or {}
+        payload = item.get("payload", {}) or {}
+        graph_calories = graph_calories_map.get(rid)
+        payload_calories = _safe_float(payload.get("calories"))
+        resolved_calories = graph_calories if graph_calories is not None else payload_calories
+        calorie_source = (
+            "graph"
+            if graph_calories is not None
+            else ("payload_fallback" if payload_calories is not None else "unknown")
+        )
+
+        payload_food_groups = payload.get("food_groups")
+        if not isinstance(payload_food_groups, list):
+            missing_food_group_fields_count += 1
+            payload_food_groups = None
+        effective_food_groups = payload_food_groups or inferred.get("food_groups") or []
+        coverage, balance_hint = _food_group_coverage_and_hint(effective_food_groups)
 
         out.append(
             RecommendationResult(
-                id=str(rec_id),
+                id=rid,
                 score=float(item.get("rrf_score", 0.0)),
                 reasons=_build_reasons(item, orch.entities, profile=None),
                 metadata={
-                    "title": title,
+                    "title": c["title"],
                     "label": item.get("label", ""),
                     "sources": item.get("sources", []),
                     "id_source": "uuid" if _is_uuid(rec_id) else "lookup",
+                    "calories": resolved_calories,
+                    "calorie_source": calorie_source,
+                    "food_groups": effective_food_groups,
+                    "food_group_coverage": coverage,
+                    "usda_balance_hint": balance_hint,
+                    "food_group_confidence": inferred.get("confidence_by_group") or {},
+                    "food_group_source": "ingredient_keyword_rules",
+                    "food_group_unknown_count": inferred.get("unknown_count"),
+                    "payload_food_groups": payload_food_groups,
                 },
             )
         )
 
+    if missing_food_group_fields_count:
+        logger.info(
+            "Food-group payload fields missing; inferred fallback used",
+            extra={
+                "component": "usda_food_groups",
+                "counter": "food_group_inference_missing_fields_count",
+                "value": missing_food_group_fields_count,
+            },
+        )
     return out
 
 
@@ -1111,15 +1727,22 @@ async def search_hybrid(req: SearchRequest):
     check_rate_limit(identity)
     start = time.time()
     database = os.getenv("NEO4J_DATABASE")
+    logger.info("search_hybrid context=%s", req.context)
 
     # Run NLU first (needed for family_scope / target_member_role from query)
     nlu_result = extract_hybrid(req.query)
+    nlu_result.entities = _inject_calorie_limit_entity(req.query, nlu_result.entities or {})
     logger.warning(
         "search_hybrid NLU query=%s intent=%s entities=%s",
         req.query,
         nlu_result.intent,
         nlu_result.entities,
     )
+    # Step 7: deterministic meal filter wiring from structured request filters.
+    # Request filter takes precedence over NLU-derived course.
+    meal_type_filter = req.filters.get("meal_type") if isinstance(req.filters, dict) else None
+    if meal_type_filter and isinstance(meal_type_filter, str) and meal_type_filter.strip():
+        nlu_result.entities["course"] = meal_type_filter.strip().lower()
 
     # Resolve profile: B2C (member_profile) primary, Neo4j fallback via merge
     customer_profile = None
@@ -1176,6 +1799,12 @@ async def search_hybrid(req: SearchRequest):
         family_scope=nlu_result.entities.get("family_scope"),
         target_member_role=nlu_result.entities.get("target_member_role"),
     )
+    # PRD-33 Step 10: Attach context to profile before orchestrate (incl. anonymous search)
+    if req.context:
+        if customer_profile is None:
+            customer_profile = {"context": req.context}
+        else:
+            customer_profile["context"] = req.context
     result = await orchestrate(
         _driver,
         cfg=_cfg,
@@ -1188,6 +1817,7 @@ async def search_hybrid(req: SearchRequest):
         database=database,
         intent_override=nlu_result.intent,
         entities_override=nlu_result.entities,
+        usda_guidelines=_usda_guidelines,
     )
 
     recommendations = _merge_results(
@@ -1235,6 +1865,7 @@ async def recommend_feed(req: FeedRequest):
     check_rate_limit((req.customer_id or "").strip() or "anonymous")
     start = time.time()
     database = os.getenv("NEO4J_DATABASE")
+    logger.info("recommend_feed context=%s", req.context)
 
     effective_scope = (req.scope or "").strip() or _infer_default_scope(
         _driver, req.customer_id, req.household_id, database,
@@ -1274,6 +1905,8 @@ async def recommend_feed(req: FeedRequest):
 
     # Resolve diet/allergen IDs (UUIDs) to names so Cypher and semantic get meaningful values
     profile = _resolve_profile_ids_to_names(_driver, profile, database)
+    if req.context:
+        profile["context"] = req.context
 
     entities: dict[str, Any] = {
         "diet":               profile["diets"],
@@ -1281,8 +1914,9 @@ async def recommend_feed(req: FeedRequest):
     }
     if req.meal_type:
         entities["course"] = req.meal_type
+    entities = merge_profile_into_entities(entities, profile)
 
-    synthetic_text = build_feed_query_text(profile, req.meal_type)
+    synthetic_text = build_feed_query_text(profile, req.meal_type, entities=entities)
 
     # DEBUG: feed profile/entities/synthetic (remove after diet debugging)
     logger.warning(
@@ -1382,6 +2016,9 @@ async def recommend_feed(req: FeedRequest):
         fused, entities, "find_recipe", _driver, database=database,
     )
 
+    # ── Contextual rerank: recent meals, calorie target, cuisine preference ───
+    fused = contextual_rerank(fused, entities)
+
     # DEBUG: feed after hard constraints (remove after diet debugging)
     after_titles = []
     for item in fused[:10]:
@@ -1394,10 +2031,27 @@ async def recommend_feed(req: FeedRequest):
         after_titles,
     )
 
-    # ── Post-filter: remove recipes eaten in the last 14 days ─────────────
-    recent = {t.lower() for t in profile["recent_recipes"]}
-    if recent:
-        fused = [f for f in fused if (f.get("title") or "").lower() not in recent]
+    # ── Post-filter: exclude recent meals (by recipe ID when from context, else by title) ─
+    exclude_recipe_ids = entities.get("exclude_recipe_ids")
+    if not isinstance(exclude_recipe_ids, list):
+        exclude_recipe_ids = []
+    if exclude_recipe_ids:
+        exclude_ids = {str(rid).strip().lower() for rid in exclude_recipe_ids if rid}
+        if exclude_ids:
+
+            def _should_exclude(item: dict[str, Any]) -> bool:
+                payload = item.get("payload") or {}
+                key = item.get("key", "")
+                rec_id = _resolve_id_with_lookup(
+                    payload, key, item, _driver, label="Recipe", database=database
+                )
+                return rec_id is not None and str(rec_id).lower() in exclude_ids
+
+            fused = [f for f in fused if not _should_exclude(f)]
+    else:
+        recent = {t.lower() for t in (profile.get("recent_recipes") or []) if t}
+        if recent:
+            fused = [f for f in fused if (f.get("title") or "").lower() not in recent]
 
     recommendations = _merge_results_with_profile(
         fused, entities, profile,
@@ -1441,6 +2095,7 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
     check_rate_limit(identity)
     start = time.time()
     database = os.getenv("NEO4J_DATABASE")
+    logger.info("recommend_meal_candidates context=%s", req.context)
 
     effective_scope = (req.scope or "").strip() or _infer_default_scope(
         _driver, req.customer_id, req.household_id, database,
@@ -1495,14 +2150,21 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
             household_type_override=req.household_type,
         )
 
+    profile = _resolve_profile_ids_to_names(_driver, profile, database)
+    if req.context:
+        profile["context"] = req.context
+
     entities: dict[str, Any] = {
         "diet": profile["diets"],
         "exclude_ingredient": profile["allergens"],
     }
+    if isinstance(_usda_guidelines, dict):
+        entities["usda_guidelines"] = _usda_guidelines
     if req.meal_type:
         entities["course"] = req.meal_type
+    entities = merge_profile_into_entities(entities, profile)
 
-    synthetic_text = build_feed_query_text(profile, req.meal_type)
+    synthetic_text = build_feed_query_text(profile, req.meal_type, entities=entities)
 
     # ── Semantic retrieval ────────────────────────────────────────────────
     semantic_results: list[Any] = []
@@ -1581,9 +2243,14 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
     fused = apply_hard_constraints(
         fused, entities, "find_recipe", _driver, database=database,
     )
+    fused = apply_usda_food_group_bonus(fused, entities, "find_recipe")
+    fused = contextual_rerank(fused, entities)
 
     # ── Post-filter: exclude recently eaten + meal_history + exclude_ids ───
     exclude_ids = {rid.strip().lower() for rid in (req.meal_history or []) + (req.exclude_ids or []) if rid}
+    ctx_exclude = entities.get("exclude_recipe_ids")
+    if isinstance(ctx_exclude, list) and ctx_exclude:
+        exclude_ids |= {str(rid).strip().lower() for rid in ctx_exclude if rid}
     recent_titles = {t.lower() for t in profile["recent_recipes"] or []}
 
     def _should_exclude(item: dict[str, Any]) -> bool:
@@ -1599,6 +2266,31 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
 
     fused = [f for f in fused if not _should_exclude(f)]
 
+    expected_meals = req.meals_per_day if isinstance(req.meals_per_day, int) and req.meals_per_day > 0 else 3
+    calorie_target_raw = None
+    if isinstance(req.member_profile, dict):
+        calorie_target_raw = req.member_profile.get("calorie_target")
+    if calorie_target_raw is None and isinstance(profile, dict):
+        calorie_target_raw = profile.get("calorie_target")
+    calorie_target = _safe_float(calorie_target_raw)
+    calorie_tolerance = (max(100.0, (calorie_target or 0.0) * 0.08) if calorie_target else None)
+
+    calorie_cache: dict[str, float | None] = {}
+    # Phase 2: calorie-aware soft rerank before response mapping.
+    if os.getenv("ENABLE_CALORIE_RERANK", "1").strip() == "1":
+        fused = _inject_graph_calories_into_fused(
+            fused,
+            driver=_driver,
+            database=database,
+            label="Recipe",
+            calorie_cache=calorie_cache,
+        )
+        fused = _apply_calorie_fit_rerank(
+            fused,
+            calorie_target=calorie_target,
+            meals_per_day=expected_meals,
+        )
+
     # ── Map to MealCandidateItem format ────────────────────────────────────
     recs = _merge_results_with_profile(
         fused, entities, profile,
@@ -1606,6 +2298,7 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
         database=database,
         label="Recipe",
         limit=limit,
+        calorie_cache=calorie_cache,
     )
     candidates = [
         MealCandidateItem(
@@ -1613,9 +2306,89 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
             title=r.metadata.get("title", r.id),
             score=r.score,
             reasons=r.reasons,
+            food_groups=r.metadata.get("food_groups") or [],
+            calories=_safe_float(r.metadata.get("calories")),
         )
         for r in recs
     ]
+
+    # Phase 3: select best daily set by calorie closeness and reorder candidates.
+    selected_total_calories: float | None = None
+    calorie_delta: float | None = None
+    calorie_compliance: str | None = None
+    if os.getenv("ENABLE_CALORIE_SET_SELECTION", "1").strip() == "1":
+        candidates, selected_total_calories, calorie_delta, calorie_compliance = _select_best_calorie_set(
+            candidates,
+            calorie_target=calorie_target,
+            meals_per_day=expected_meals,
+            tolerance=(calorie_tolerance or 0.0),
+        )
+
+    guideline_compliance: str | None = None
+    audit_warnings: list[str] = []
+    missing_groups: list[str] = []
+    food_group_audit: list[dict[str, Any]] = []
+    strict_mode_insufficiency: dict[str, Any] | None = None
+    strict_mode_enabled = (
+        os.getenv("USDA_STRICT_MODE", "").strip() == "1"
+        or os.getenv("USDA_GUIDELINES_STRICT", "").strip() == "1"
+    )
+    try:
+        candidate_rows = [
+            {
+                "recipe_id": c.recipe_id,
+                "title": c.title,
+                "food_groups": c.food_groups,
+            }
+            for c in candidates[:expected_meals]
+        ]
+
+        audit = audit_candidate_set(
+            candidate_rows,
+            usda_guidelines=_usda_guidelines,
+            calorie_target=calorie_target,
+            expected_meals=expected_meals,
+        )
+        food_group_audit = audit.get("food_group_audit") or []
+        missing_groups = audit.get("missing_groups") or []
+        if missing_groups:
+            guideline_compliance = "partial"
+            audit_warnings = build_audit_warnings(missing_groups)
+            if strict_mode_enabled:
+                strict_mode_insufficiency = {
+                    "reason": "insufficient_food_group_coverage",
+                    "guideline_compliance": "partial",
+                    "missing_groups": missing_groups,
+                    "expected_meals": expected_meals,
+                    "calorie_target": calorie_target,
+                    "message": (
+                        "USDA strict mode is enabled. Returning best-feasible candidates "
+                        "with explicit insufficiency metadata."
+                    ),
+                }
+                audit_warnings.append(
+                    "USDA strict mode is enabled; coverage remains infeasible for one or more food groups."
+                )
+            logger.info(
+                "Meal candidate audit marked partial compliance",
+                extra={
+                    "component": "food_group_audit",
+                    "counter": "meal_candidate_audit_partial_count",
+                    "value": 1,
+                },
+            )
+        else:
+            guideline_compliance = "adequate"
+    except Exception as e:
+        logger.warning(
+            "Meal candidate USDA audit failed; returning candidates without audit metadata: %s",
+            e,
+            extra={
+                "component": "food_group_audit",
+                "counter": "meal_candidate_audit_fail_count",
+                "value": 1,
+            },
+        )
 
     zero_explanation = None
     if not candidates:
@@ -1626,6 +2399,16 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
         candidates=candidates,
         retrieval_time_ms=latency_ms,
         zero_results_explanation=zero_explanation,
+        guideline_compliance=guideline_compliance,
+        audit_warnings=audit_warnings,
+        missing_groups=missing_groups,
+        food_group_audit=food_group_audit,
+        strict_mode_insufficiency=strict_mode_insufficiency,
+        daily_calorie_target=calorie_target,
+        selected_total_calories=selected_total_calories,
+        calorie_delta=calorie_delta,
+        calorie_tolerance=calorie_tolerance,
+        calorie_compliance=calorie_compliance,
     )
 
 
@@ -1783,6 +2566,7 @@ async def chat_process(req: ChatProcessRequest):
     identity = (req.customer_id or req.session_id or "anonymous").strip() or "anonymous"
     check_rate_limit(identity)
     start = time.time()
+    logger.info("chat_process context=%s", req.context)
     # Get or create session and record user message
     session = get_or_create_session(req.customer_id, req.session_id)
     session.add_message("user", req.message.strip())
@@ -1850,6 +2634,7 @@ async def chat_process(req: ChatProcessRequest):
     # NLU: intent + entities (rules first, LLM fallback). Pass history for session-based
     # intent continuation (e.g. "more options?" after substitution -> get_substitution_suggestion)
     nlu_result = extract_hybrid(effective_msg, context={"history": history_pairs})
+    nlu_result.entities = _inject_calorie_limit_entity(effective_msg, nlu_result.entities or {})
 
     # Action orchestrator: WRITE intents need confirmation
     orch = route_intent(nlu_result.intent, nlu_result.entities)
@@ -2008,6 +2793,8 @@ async def chat_process(req: ChatProcessRequest):
                     target_member_role=nlu_result.entities.get("target_member_role"),
                     household_type_override=req.household_type,
                 )
+            if req.context:
+                profile["context"] = req.context
 
             # For substitution follow-ups, use synthesized query if effective_msg is
             # still vague (orchestrator re-extracts intent; "some more options?" is unclear)
@@ -2036,6 +2823,7 @@ async def chat_process(req: ChatProcessRequest):
                 database=database,
                 intent_override=nlu_result.intent,
                 entities_override=nlu_result.entities,
+                usda_guidelines=_usda_guidelines,
             )
 
             # Build conversation history from session (exclude current user message)

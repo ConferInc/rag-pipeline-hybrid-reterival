@@ -20,7 +20,12 @@ from rag_pipeline.augmentation.fusion import apply_rrf
 from rag_pipeline.config import EmbeddingConfig
 from rag_pipeline.logging_utils import truncate_for_log
 from rag_pipeline.embeddings.base import QueryEmbedder
-from rag_pipeline.orchestrator.constraint_filter import apply_hard_constraints, build_zero_results_message
+from rag_pipeline.orchestrator.constraint_filter import (
+    apply_hard_constraints,
+    apply_usda_food_group_bonus,
+    build_zero_results_message,
+    contextual_rerank,
+)
 from rag_pipeline.orchestrator.cypher_runner import run_cypher_retrieval
 from rag_pipeline.orchestrator.entity_enrichment import enrich_entities
 from rag_pipeline.orchestrator.entity_validation import validate_entity_compatibility
@@ -36,7 +41,54 @@ from rag_pipeline.retrieval.structural import (
 # Intents that benefit from structural (collaborative filtering) retrieval
 STRUCTURAL_INTENTS = {"find_recipe", "find_recipe_by_pantry"}
 
+# PRD-33: meal_time → meal terms for semantic query augmentation
+_MEAL_TIME_TERMS: dict[str, str] = {
+    "morning": "breakfast morning",
+    "afternoon": "lunch midday",
+    "evening": "dinner supper",
+    "late_night": "snack",
+}
+# PRD-33: season → seasonal terms for semantic query augmentation
+_SEASON_TERMS: dict[str, str] = {
+    "summer": "fresh light cool refreshing salad",
+    "winter": "warm hearty comfort soup stew",
+    "spring": "fresh seasonal spring",
+    "fall": "hearty autumn harvest",
+}
+
 logger = logging.getLogger(__name__)
+
+
+def augment_query_with_context(query: str, entities: dict[str, Any]) -> str:
+    """
+    Augment user query with context-derived terms for better semantic retrieval (PRD-33).
+
+    Maps meal_time, season, and cuisine_preference into search terms. No-op when
+    entities lack relevant fields.
+    """
+    if not entities:
+        return query
+    parts: list[str] = [query.strip()] if query.strip() else []
+    meal_time = entities.get("meal_time")
+    if meal_time and isinstance(meal_time, str):
+        terms = _MEAL_TIME_TERMS.get(meal_time.strip().lower())
+        if terms:
+            parts.append(terms)
+    season = entities.get("season")
+    if season and isinstance(season, str):
+        terms = _SEASON_TERMS.get(season.strip().lower())
+        if terms:
+            parts.append(terms)
+    cuisines = entities.get("cuisine_preference", [])
+    if isinstance(cuisines, list) and cuisines:
+        for c in cuisines[:3]:
+            if c and str(c).strip():
+                parts.append(str(c).strip())
+    elif cuisines and isinstance(cuisines, str):
+        parts.append(str(cuisines).strip())
+    if len(parts) <= 1 and not (meal_time or season or cuisines):
+        return query
+    return " ".join(parts)
 
 
 def _run_semantic(
@@ -214,6 +266,7 @@ async def orchestrate(
     config_path: str = "embedding_config.yaml",
     intent_override: str | None = None,
     entities_override: dict[str, Any] | None = None,
+    usda_guidelines: dict[str, Any] | None = None,
 ) -> OrchestratorResult:
     """
     Run all three retrievals for a user query and return merged results.
@@ -388,6 +441,15 @@ async def orchestrate(
                 return result
 
     # ── Step 2–4: Parallel retrieval (semantic, structural, cypher) ────────────
+    # Phase A contract: attach USDA guideline config into entities for later
+    # prompt injection / scoring phases. No behavioral impact yet.
+    if usda_guidelines is not None:
+        try:
+            result.entities["usda_guidelines"] = usda_guidelines
+        except Exception:
+            # Never fail orchestration due to observability/contract plumbing.
+            pass
+
     # Run all three paths concurrently via asyncio.to_thread. Structural is skipped
     # entirely (no task launched) when customer_node_id is missing or intent is not
     # in STRUCTURAL_INTENTS. Each path has a timeout; on timeout, that path returns
@@ -431,12 +493,13 @@ async def orchestrate(
             },
         )
 
+    semantic_query = augment_query_with_context(user_query, result.entities)
     semantic_task = asyncio.to_thread(
         _run_semantic,
         driver,
         cfg,
         embedder,
-        user_query,
+        semantic_query,
         result.intent,
         intent_semantic_labels,
         intent_cfg,
@@ -568,10 +631,38 @@ async def orchestrate(
         )
     except Exception as e:
         logger.warning(
-            "Post-fusion constraint filter failed — results unfiltered: %s", e,
+            "Post-fusion hard constraints failed — continuing with unfiltered fused results: %s",
+            e,
             extra={"component": "orchestrator", "query": query_truncated},
         )
         result.errors.append(f"Constraint filter error: {e}")
+
+    try:
+        result.fused_results = apply_usda_food_group_bonus(
+            result.fused_results,
+            result.entities,
+            result.intent,
+        )
+    except Exception as e:
+        logger.warning(
+            "USDA food-group bonus failed — continuing without USDA bonus: %s",
+            e,
+            extra={"component": "orchestrator", "query": query_truncated},
+        )
+        result.errors.append(f"USDA food-group bonus error: {e}")
+
+    try:
+        result.fused_results = contextual_rerank(
+            result.fused_results,
+            result.entities,
+        )
+    except Exception as e:
+        logger.warning(
+            "Contextual rerank failed — preserving current fused ordering: %s",
+            e,
+            extra={"component": "orchestrator", "query": query_truncated},
+        )
+        result.errors.append(f"Contextual rerank error: {e}")
 
     t_filter_ms = (time.perf_counter() - t_filter) * 1000
     logger.info(

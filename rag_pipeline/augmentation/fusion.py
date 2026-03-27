@@ -37,7 +37,7 @@ def _get_key_from_semantic(r: Any) -> str | None:
     Prefers PostgreSQL UUID (id) when available; falls back to title/name for dedup.
     """
     payload = getattr(r, "payload", {}) or {}
-    uid = payload.get("id") or payload.get("r.id")
+    uid = payload.get("id")
     if uid and _is_uuid(str(uid)):
         return str(uid)
     key = _normalize_title(payload.get("title") or payload.get("name") or payload.get("code"))
@@ -51,7 +51,7 @@ def _get_key_from_structural(item: dict[str, Any]) -> str | None:
     Falls back to title/name only when no UUID.
     """
     payload = item.get("payload", {}) or {}
-    uid = payload.get("id") or payload.get("r.id")
+    uid = payload.get("id")
     if uid and _is_uuid(str(uid)):
         return str(uid)
     key = _normalize_title(
@@ -69,10 +69,10 @@ def _get_key_from_cypher(row: dict[str, Any], intent: str) -> str | None:
     """
     if intent in ("find_recipe", "find_recipe_by_pantry", "rank_results", "recipes_for_cuisine", "recipes_by_nutrient", "ingredient_in_recipes"):
         # Prefer UUID id; fall back to title for fusion matching with semantic results
-        uuid_key = row.get("r.id") or row.get("id")
+        uuid_key = row.get("id")
         if uuid_key:
             return str(uuid_key)
-        key = _normalize_title(row.get("r.title") or row.get("title"))
+        key = _normalize_title(row.get("title"))
     elif intent in ("get_nutritional_info", "compare_foods", "check_diet_compliance", "nutrient_in_foods", "ingredient_nutrients"):
         key = _normalize_title(row.get("ingredient") or row.get("name"))
     elif intent in ("check_substitution", "get_substitution_suggestion"):
@@ -131,10 +131,16 @@ def apply_rrf(
             items[key]["sources"].append(source)
         # Merge payload: prefer richer data (keep first non-empty)
         existing = items[key]["payload"]
-        if not existing and item_data:
-            items[key]["payload"] = dict(item_data)
-            items[key]["label"] = item_data.get("label", "Unknown")
-            items[key]["title"] = item_data.get("title") or item_data.get("name") or key
+        if item_data:
+            if not existing:
+                items[key]["payload"] = dict(item_data)
+                items[key]["label"] = item_data.get("label", "Unknown")
+                items[key]["title"] = item_data.get("title") or item_data.get("name") or key
+            else:
+                # Keep first payload as base, but backfill missing canonical fields.
+                for field in ("id", "title", "meal_type", "total_time_minutes", "cuisine_code", "calories"):
+                    if items[key]["payload"].get(field) in (None, "") and item_data.get(field) not in (None, ""):
+                        items[key]["payload"][field] = item_data.get(field)
 
     # Semantic
     for rank, r in enumerate(semantic_results, 1):
@@ -142,6 +148,8 @@ def apply_rrf(
         if key:
             payload = getattr(r, "payload", {}) or {}
             label = getattr(r, "label", "Unknown")
+            if label == "Recipe":
+                payload = _canonical_recipe_payload(payload)
             title = payload.get("title") or payload.get("name") or key
             add(key, rank, "semantic", {"label": label, "title": title, **payload})
 
@@ -152,8 +160,16 @@ def apply_rrf(
         key = _get_key_from_structural(item)
         if key:
             label = item.get("label", "Unknown")
-            title = item.get("title") or item.get("name") or key
-            add(key, rank, "structural", {"label": label, "title": title, "relationship": item.get("relationship"), **item})
+            payload = item.get("payload", {}) or {}
+            if label == "Recipe":
+                payload = _canonical_recipe_payload(payload)
+            title = payload.get("title") or item.get("title") or item.get("name") or key
+            add(
+                key,
+                rank,
+                "structural",
+                {"label": label, "title": title, "relationship": item.get("relationship"), **payload},
+            )
 
     # Cypher
     def _cypher_label(intent: str, row: dict) -> str:
@@ -173,17 +189,17 @@ def apply_rrf(
         key = _get_key_from_cypher(row, intent)
         if key:
             title = str(
-                row.get("r.title") or row.get("title") or row.get("ingredient")
+                row.get("title") or row.get("ingredient")
                 or row.get("product") or row.get("cuisine_name") or row.get("c.name")
                 or row.get("a.name") or row.get("category_name") or row.get("display_name")
                 or key
             )
             label = _cypher_label(intent, row)
-            # Normalise id field so _merge_results always finds it as "id"
-            recipe_id = row.get("r.id") or row.get("id")
             payload = {"label": label, "title": title, **row}
-            if recipe_id:
-                payload["id"] = str(recipe_id)
+            if label == "Recipe":
+                payload = _canonical_recipe_payload(row.get("payload", payload))
+                payload["label"] = label
+                payload["title"] = payload.get("title") or title
             add(key, rank, "cypher", payload)
 
     # Sort by RRF score descending, limit
@@ -225,6 +241,24 @@ def _condense_for_fusion(expanded_context: list[dict[str, Any]]) -> list[dict[st
                 "name": payload.get("name"),
             }
     return list(seen.values())
+
+
+def _canonical_recipe_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return canonical recipe payload fields only."""
+    return {
+        "id": payload.get("id"),
+        "title": payload.get("title"),
+        "meal_type": payload.get("meal_type"),
+        "total_time_minutes": payload.get("total_time_minutes"),
+        "cuisine_code": payload.get("cuisine_code"),
+        "calories": payload.get("calories"),
+        # USDA foundation contract (Phase A): only preserved if upstream
+        # payload already provided it; inference is wired at the API merge layer
+        # for now because current retrieval payloads don't include ingredients.
+        "food_groups": payload.get("food_groups"),
+        "food_group_confidence": payload.get("food_group_confidence"),
+        "food_group_source": payload.get("food_group_source"),
+    }
 
 
 def format_fused_results_as_text(

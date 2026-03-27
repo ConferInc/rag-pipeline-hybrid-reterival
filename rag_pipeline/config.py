@@ -106,3 +106,82 @@ def get_structural_index_spec(
         )
     return spec
 
+
+# ── USDA guideline foundation (Phase A) ────────────────────────────────────
+
+# USDA food groups we track for the 2025 food-pyramid behavior.
+USDA_FOOD_GROUPS: tuple[str, ...] = (
+    "protein",
+    "dairy",
+    "vegetables",
+    "fruits",
+    "whole_grains",
+)
+
+
+@dataclass(frozen=True)
+class USDAGroupRule:
+    """
+    Minimal rule representation for a USDA food group.
+
+    Note: Phase A focuses on contracts and defaults. Scoring logic is added in
+    later phases.
+    """
+
+    # Target default (units are "group portions" for now; can be adapted later).
+    target_default: float
+    # Soft threshold used to decide when to reduce bonus or warn.
+    soft_threshold: float
+    # Lower priority number => higher importance when relaxing in later phases.
+    priority: int
+    # Weight used in later scoring/ranking.
+    weight: float
+    # Unit for daily targets (e.g. 'oz_eq', 'cup_eq', 'servings').
+    unit: str
+
+
+@dataclass(frozen=True)
+class USDAGuidelineConfig:
+    version: str
+    # Map group_name -> rule
+    groups: dict[str, USDAGroupRule]
+
+
+def get_default_usda_guidelines() -> USDAGuidelineConfig:
+    """
+    Deterministic local defaults for USDA 2025 food-group targets.
+
+    Integration with Postgres/Supabase (gold.nutritional_guidelines) is handled
+    by `rag_pipeline.orchestrator.usda_guidelines` with fallback to these
+    defaults.
+    """
+
+    # Priority order is per Phase A relaxation ladder (whole_grains first, protein last).
+    # The absolute target values are placeholders until you wire real guideline units.
+    order = {
+        "whole_grains": 1,
+        "fruits": 2,
+        "vegetables": 3,
+        "dairy": 4,
+        "protein": 5,
+    }
+
+    groups: dict[str, USDAGroupRule] = {}
+    for g in USDA_FOOD_GROUPS:
+        unit = {
+            "protein": "oz_eq",
+            "dairy": "cup_eq",
+            "vegetables": "cup_eq",
+            "fruits": "cup_eq",
+            "whole_grains": "oz_eq",
+        }.get(g, "unit")
+        groups[g] = USDAGroupRule(
+            target_default=1.0,
+            soft_threshold=0.8,
+            priority=order[g],
+            weight=1.0,
+            unit=unit,
+        )
+
+    return USDAGuidelineConfig(version="usda_2025_default_v1", groups=groups)
+

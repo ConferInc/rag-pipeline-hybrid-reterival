@@ -66,6 +66,15 @@ def structural_search_by_label(
             score = float(row["score"])
 
             node_label = label if label in node_labels else (next(iter(node_labels), label))
+            payload = _build_structural_payload(node_label, dict(node))
+            if node_label == "Recipe":
+                payload = _canonicalize_recipe_payload(payload, dict(node))
+                if payload is None:
+                    logger.warning(
+                        "Dropping structural recipe result due to payload contract violation",
+                        extra={"component": "structural", "node_id": str(row["node_id"])},
+                    )
+                    continue
 
             results.append(
                 RetrievalResult(
@@ -74,7 +83,7 @@ def structural_search_by_label(
                     score_raw=score,
                     source="structural",
                     index_name=str(spec.index_name),
-                    payload=_build_structural_payload(node_label, dict(node)),
+                    payload=payload,
                 )
             )
 
@@ -176,12 +185,22 @@ def expand_from_seeds(
         rows = session.run(cypher, seed_ids=seed_node_ids)
         for row in rows:
             connected_node = dict(row["connected_node"])
+            connected_labels = list(row["connected_labels"])
+            payload = _build_structural_payload("", connected_node)
+            if "Recipe" in connected_labels:
+                payload = _canonicalize_recipe_payload(payload, connected_node)
+                if payload is None:
+                    logger.warning(
+                        "Dropping structural expanded recipe due to payload contract violation",
+                        extra={"component": "structural", "connected_id": str(row["connected_id"])},
+                    )
+                    continue
             results.append({
                 "seed_id": str(row["seed_id"]),
                 "connected_id": str(row["connected_id"]),
-                "connected_labels": list(row["connected_labels"]),
+                "connected_labels": connected_labels,
                 "relationship": str(row["relationship"]),
-                "payload": _build_structural_payload("", connected_node),
+                "payload": payload,
             })
 
     return results
@@ -296,4 +315,36 @@ def _build_structural_payload(label: str, node_properties: dict[str, Any]) -> di
         if isinstance(value, list) and len(value) > 50 and all(isinstance(v, (int, float)) for v in value[:5]):
             continue
         payload[key] = value
+    return payload
+
+
+def _canonicalize_recipe_payload(
+    payload: dict[str, Any], node_properties: dict[str, Any]
+) -> dict[str, Any] | None:
+    """
+    Ensure structural Recipe payload follows canonical contract.
+
+    Mandatory: id, title, meal_type.
+    Optional: total_time_minutes, cuisine_code, calories.
+    """
+    recipe_id = payload.get("id") or node_properties.get("id")
+    title = payload.get("title") or node_properties.get("title")
+    meal_type = payload.get("meal_type") or node_properties.get("meal_type")
+
+    if not recipe_id or not title or not meal_type:
+        return None
+
+    payload["id"] = recipe_id
+    payload["title"] = title
+    payload["meal_type"] = meal_type
+    payload["total_time_minutes"] = payload.get(
+        "total_time_minutes", node_properties.get("total_time_minutes")
+    )
+    payload["cuisine_code"] = (
+        payload.get("cuisine_code")
+        or payload.get("cuisine")
+        or node_properties.get("cuisine_code")
+        or node_properties.get("cuisine")
+    )
+    payload["calories"] = payload.get("calories", node_properties.get("calories"))
     return payload
