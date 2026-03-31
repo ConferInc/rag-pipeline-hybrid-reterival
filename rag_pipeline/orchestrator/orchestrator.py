@@ -36,6 +36,7 @@ from rag_pipeline.retrieval.structural import (
     get_seed_embedding,
     structural_search_with_expansion,
 )
+from rag_pipeline.retrieval.keyword import keyword_search
 
 
 # Intents that benefit from structural (collaborative filtering) retrieval
@@ -242,6 +243,7 @@ class OrchestratorResult:
     semantic_results: list[Any] = field(default_factory=list)
     structural_results: dict[str, Any] = field(default_factory=dict)
     cypher_results: list[dict[str, Any]] = field(default_factory=list)
+    keyword_results: list[dict[str, Any]] = field(default_factory=list)
     fused_results: list[dict[str, Any]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     # Set when post-fusion hard filters reduce the result list to zero.
@@ -304,6 +306,10 @@ async def orchestrate(
     semantic_min_score: float = (guardrails.get("semantic") or {}).get("min_score", 0.5)
     structural_min_score: float = (guardrails.get("structural") or {}).get("min_score", 0.3)
     cypher_max_rows: int | None = (guardrails.get("cypher") or {}).get("max_rows")
+    keyword_cfg: dict[str, Any] = guardrails.get("keyword") or {}
+    keyword_min_score: float = keyword_cfg.get("min_score", 0.3)
+    keyword_enabled: bool = keyword_cfg.get("enabled", True)
+    keyword_index_name: str = keyword_cfg.get("index_name", "recipe_title_ft")
     intent_cfg: dict[str, Any] = raw_cfg.get("intent_extraction", {}) or {}
     query_truncated = truncate_for_log(user_query)
 
@@ -543,20 +549,51 @@ async def orchestrate(
         database,
     )
 
-    semantic_results, structural_results, cypher_results = await asyncio.gather(
+    # 4th lane: keyword search via Neo4j Fulltext Index (recipe_title_ft)
+    # Only for recipe-search intents with a text query; skip for non-text intents
+    _KEYWORD_INTENTS = {"find_recipe", "find_recipe_by_pantry", "rank_results",
+                        "recipes_for_cuisine", "ingredient_in_recipes"}
+    run_keyword = (
+        keyword_enabled
+        and result.intent in _KEYWORD_INTENTS
+        and user_query
+        and len(user_query.strip()) >= 2
+    )
+
+    async def _empty_keyword() -> list[dict]:
+        return []
+
+    keyword_task = (
+        asyncio.to_thread(
+            keyword_search,
+            driver,
+            query=user_query,
+            top_k=top_k,
+            database=database,
+            min_score=keyword_min_score,
+            index_name=keyword_index_name,
+        )
+        if run_keyword
+        else _empty_keyword()
+    )
+
+    semantic_results, structural_results, cypher_results, keyword_results = await asyncio.gather(
         _with_timeout(semantic_task, "semantic", []),
         _with_timeout(structural_task, "structural", {}),
         _with_timeout(cypher_task, "cypher", []),
+        _with_timeout(keyword_task, "keyword", []),
     )
 
     result.semantic_results = semantic_results or []
     result.structural_results = structural_results or {}
     result.cypher_results = cypher_results or []
+    result.keyword_results = keyword_results or []
 
     # Surface errors for failed paths (workers return empty on error; we infer from counts)
     semantic_count = len(result.semantic_results)
     structural_count = len(result.structural_results.get("expanded_context", []))
     cypher_count = len(result.cypher_results)
+    keyword_count = len(result.keyword_results)
     semantic_label = intent_semantic_labels.get(result.intent, "Recipe")
 
     t_retrieval_ms = (time.perf_counter() - t_retrieval) * 1000
@@ -569,6 +606,7 @@ async def orchestrate(
             "semantic_count": semantic_count,
             "structural_count": structural_count,
             "cypher_count": cypher_count,
+            "keyword_count": keyword_count,
             "latency_ms": round(t_retrieval_ms, 1),
         },
     )
@@ -582,6 +620,7 @@ async def orchestrate(
     rrf_cfg = raw_cfg.get("retrieval_guardrails", {}).get("rrf", {})
     rrf_k = rrf_cfg.get("k", 60)
     rrf_max_items = rrf_cfg.get("max_items", 15)
+    rrf_keyword_weight = rrf_cfg.get("keyword_weight", 2.0)
     t_fusion = time.perf_counter()
     try:
         result.fused_results = apply_rrf(
@@ -589,8 +628,10 @@ async def orchestrate(
             result.structural_results,
             result.cypher_results,
             result.intent,
+            keyword_results=result.keyword_results,
             k=rrf_k,
             max_items=rrf_max_items,
+            keyword_weight=rrf_keyword_weight,
         )
     except Exception as e:
         logger.warning(
@@ -608,7 +649,7 @@ async def orchestrate(
             "component": "orchestrator",
             "query": query_truncated,
             "intent": result.intent,
-            "retrieval_counts": {"semantic": len(result.semantic_results), "structural": len(result.structural_results.get("expanded_context", [])), "cypher": len(result.cypher_results)},
+            "retrieval_counts": {"semantic": len(result.semantic_results), "structural": len(result.structural_results.get("expanded_context", [])), "cypher": len(result.cypher_results), "keyword": len(result.keyword_results)},
             "fused_count": fused_count,
             "latency_ms": round(t_fusion_ms, 1),
         },

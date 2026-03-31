@@ -201,6 +201,7 @@ _CUISINE_SET: set[str] = {
     "japanese", "thai", "french", "greek", "american", "middle eastern",
     "spanish", "korean", "vietnamese", "turkish", "moroccan", "lebanese",
     "persian", "ethiopian", "caribbean", "brazilian", "german", "british",
+    "swedish", "danish", "polish", "russian", "hungarian", "norwegian",
 }
 
 _RECIPE_TRIGGERS: set[str] = {

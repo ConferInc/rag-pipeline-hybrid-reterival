@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 
-SourceType = Literal["semantic", "structural", "hybrid"]
+SourceType = Literal["semantic", "structural", "hybrid", "keyword"]
 
 
 @dataclass(frozen=True)

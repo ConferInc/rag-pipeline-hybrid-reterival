@@ -96,8 +96,10 @@ def apply_rrf(
     cypher_results: list[dict[str, Any]],
     intent: str,
     *,
+    keyword_results: list[dict[str, Any]] | None = None,
     k: int = 60,
     max_items: int = 15,
+    keyword_weight: float = 2.0,
 ) -> list[dict[str, Any]]:
     """
     Fuse semantic, structural, and Cypher results using Reciprocal Rank Fusion.
@@ -119,10 +121,10 @@ def apply_rrf(
     scores: dict[str, float] = {}
     items: dict[str, dict[str, Any]] = {}
 
-    def add(key: str, rank: int, source: str, item_data: dict[str, Any]) -> None:
+    def add(key: str, rank: int, source: str, item_data: dict[str, Any], *, weight: float = 1.0) -> None:
         if not key:
             return
-        contrib = 1.0 / (k + rank)
+        contrib = weight * (1.0 / (k + rank))
         scores[key] = scores.get(key, 0.0) + contrib
         if key not in items:
             items[key] = {"key": key, "rrf_score": 0.0, "sources": [], "label": "Unknown", "title": "", "payload": {}}
@@ -202,6 +204,19 @@ def apply_rrf(
                 payload["title"] = payload.get("title") or title
             add(key, rank, "cypher", payload)
 
+    # Keyword (4th lane — BM25 fulltext results with boosted weight)
+    for rank, item in enumerate(keyword_results or [], 1):
+        key = item.get("key")
+        if key:
+            payload = item.get("payload", {}) or {}
+            title = payload.get("title") or item.get("title") or key
+            payload_data = {
+                "label": item.get("label", "Recipe"),
+                "title": title,
+                **payload,
+            }
+            add(key, rank, "keyword", payload_data, weight=keyword_weight)
+
     # Sort by RRF score descending, limit
     sorted_keys = sorted(scores.keys(), key=lambda x: -scores[x])[:max_items]
     fused = [items[k] for k in sorted_keys]
@@ -213,6 +228,8 @@ def apply_rrf(
             "semantic_count": len(semantic_results),
             "structural_count": len(structural_results.get("expanded_context", [])),
             "cypher_count": len(cypher_results),
+            "keyword_count": len(keyword_results or []),
+            "keyword_weight": keyword_weight,
             "fused_count": len(fused),
         },
     )

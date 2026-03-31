@@ -182,6 +182,12 @@ vector_indexes:
       dimensions: 128
       index_name: vec_recipe_graphsageembedding
 
+# Fulltext indexes (Lucene-powered BM25 keyword search)
+fulltext_indexes:
+  - label: Recipe
+    properties: [title]
+    index_name: recipe_title_ft
+
 # Intent / entity extraction failure handling (defaults preserve current flow)
 intent_extraction:
   # On JSON parse failure: "abort" (current), "fallback", or "retry"
@@ -271,6 +277,11 @@ retrieval_guardrails:
   rrf:
     k: 60
     max_items: 10
+    keyword_weight: 2.0          # RRF weight multiplier for keyword lane (>1 = boost)
+  keyword:
+    enabled: true                 # Master switch for keyword retrieval
+    min_score: 0.3                # Minimum BM25 relevance score (0-1 range)
+    index_name: recipe_title_ft   # Neo4j Fulltext Index name
 
 # Label inference (for semantic search when --label not provided)
 label_inference:

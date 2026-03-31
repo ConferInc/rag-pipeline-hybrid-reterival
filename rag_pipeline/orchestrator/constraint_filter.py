@@ -82,6 +82,11 @@ def _key_for_item(item: dict[str, Any]) -> str:
 
 # ── Filter A — Course / meal_type (payload-based, zero DB calls) ───────────────
 
+# Only these are valid meal_type values in the graph — if the NLU extracts something
+# else (e.g. "soup", "salad", "sandwich"), it's a dish category, NOT a meal type,
+# and the filter should be skipped to avoid dropping all results.
+_VALID_MEAL_TYPES: set[str] = {"breakfast", "lunch", "dinner", "snack", "dessert"}
+
 def _filter_course(
     fused: list[dict[str, Any]],
     course: str,
@@ -89,8 +94,27 @@ def _filter_course(
     """
     Drop recipes whose meal_type does not match the requested course.
     Uses canonical payload["meal_type"] only.
-    Missing meal_type is treated as contract violation and dropped.
+
+    IMPORTANT: Only filters when course is a valid meal_type (breakfast, lunch,
+    dinner, snack, dessert). Non-standard values like "soup" or "curry" are
+    dish categories — filtering on them drops all results because no recipe has
+    meal_type="soup". In that case we skip the filter entirely.
+
+    Semantic/structural results without meal_type pass through — they are
+    marked 'unverified' in their sources list so the LLM is aware.
+    Recipes with missing meal_type are KEPT (benefit of the doubt) rather than
+    dropped, to avoid zero-result scenarios when graph data is incomplete.
     """
+    course_lower = course.strip().lower()
+
+    # Skip filter for non-standard course values (dish categories, not meal types)
+    if course_lower not in _VALID_MEAL_TYPES:
+        logger.info(
+            "Course filter skipped: '%s' is not a valid meal_type (valid: %s)",
+            course, ", ".join(sorted(_VALID_MEAL_TYPES)),
+        )
+        return fused
+
     kept: list[dict[str, Any]] = []
     dropped = 0
     for item in fused:
@@ -99,13 +123,14 @@ def _filter_course(
         meal_type = str(meal_type_raw).strip().lower() if meal_type_raw is not None else ""
 
         if not meal_type:
-            dropped += 1
-            logger.warning(
-                "Course filter dropped recipe due to missing meal_type (contract violation): title=%s required=%s",
-                item.get("title", "?"),
-                course,
-            )
-        elif meal_type == course.lower():
+            # Keep recipes with missing meal_type (benefit of the doubt) but mark them
+            item = dict(item)
+            sources = list(item.get("sources", []))
+            if "unverified_course" not in sources:
+                sources.append("unverified_course")
+            item["sources"] = sources
+            kept.append(item)
+        elif meal_type == course_lower:
             kept.append(item)
         else:
             dropped += 1

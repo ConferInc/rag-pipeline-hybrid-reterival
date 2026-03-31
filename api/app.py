@@ -10,6 +10,7 @@ Dependency direction: api → rag_pipeline (one-way). Core pipeline is untouched
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import random
@@ -223,7 +224,7 @@ async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
     Express backend validates user JWTs, then calls us with this shared API key.
     """
     expected = os.getenv("RAG_API_KEY")
-    if not expected or x_api_key != expected:
+    if not expected or not hmac.compare_digest(x_api_key, expected):
         raise HTTPException(
             status_code=401,
             detail="Authentication failed. Please try again or sign in.",
@@ -1732,6 +1733,26 @@ async def search_hybrid(req: SearchRequest):
     # Run NLU first (needed for family_scope / target_member_role from query)
     nlu_result = extract_hybrid(req.query)
     nlu_result.entities = _inject_calorie_limit_entity(req.query, nlu_result.entities or {})
+
+    # ── Search-context intent override ────────────────────────────────────
+    # On the search page, every query is a recipe search by definition.
+    # The NLU may classify single-word queries like "swedish", "holiday",
+    # "grandma's" as out_of_scope because they lack food-context keywords.
+    # Override to find_recipe so all retrieval lanes (keyword, cypher,
+    # semantic, structural) remain active.
+    _NON_SEARCH_INTENTS = {"out_of_scope", "greeting", "help", "farewell", "unclear"}
+    if nlu_result.intent in _NON_SEARCH_INTENTS:
+        logger.info(
+            "Search-context intent override: %s → find_recipe (query=%s)",
+            nlu_result.intent, req.query,
+        )
+        nlu_result.intent = "find_recipe"
+        # Preserve any extracted entities; add dish fallback if empty
+        if not nlu_result.entities or not any(
+            k in nlu_result.entities for k in ("dish", "diet", "course", "cuisine", "include_ingredient")
+        ):
+            nlu_result.entities["dish"] = req.query
+
     logger.warning(
         "search_hybrid NLU query=%s intent=%s entities=%s",
         req.query,
@@ -1743,6 +1764,7 @@ async def search_hybrid(req: SearchRequest):
     meal_type_filter = req.filters.get("meal_type") if isinstance(req.filters, dict) else None
     if meal_type_filter and isinstance(meal_type_filter, str) and meal_type_filter.strip():
         nlu_result.entities["course"] = meal_type_filter.strip().lower()
+
 
     # Resolve profile: B2C (member_profile) primary, Neo4j fallback via merge
     customer_profile = None
