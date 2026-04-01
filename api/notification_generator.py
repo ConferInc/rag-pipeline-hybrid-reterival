@@ -57,14 +57,14 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "body": "🔥 Amazing! {streak}-day streak! Keep it going!",
         "action_url": "/meal-log",
         "icon": "🔥",
-        "type": "engagement",
+        "type": "system",
     },
     "streak_broken": {
         "title": "Start fresh",
         "body": "Your {streak}-day streak ended yesterday — log today to start a new one!",
         "action_url": "/meal-log",
         "icon": "📅",
-        "type": "engagement",
+        "type": "system",
     },
     "calorie_overshoot_3day": {
         "title": "Calorie goal",
