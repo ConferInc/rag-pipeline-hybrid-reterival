@@ -56,7 +56,7 @@ def _op(operator: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_find_recipe(entities: dict) -> tuple[str, dict]:
+def _build_find_recipe(entities: dict, limit: int = 50) -> tuple[str, dict]:
     """
     Dynamically build a find_recipe Cypher query.
 
@@ -196,12 +196,12 @@ def _build_find_recipe(entities: dict) -> tuple[str, dict]:
         "RETURN r.id, r.title, r.meal_type, r.total_time_minutes,\n"
         "       r.percent_calories_protein, r.percent_calories_fat, r.percent_calories_carbs"
     )
-    clauses.append("LIMIT 10")
+    clauses.append(f"LIMIT {limit}")
 
     return "\n".join(clauses), params
 
 
-def _build_find_recipe_by_pantry(entities: dict) -> tuple[str, dict]:
+def _build_find_recipe_by_pantry(entities: dict, limit: int = 50) -> tuple[str, dict]:
     """
     Find recipes makeable from the user's available pantry.
 
@@ -224,7 +224,7 @@ def _build_find_recipe_by_pantry(entities: dict) -> tuple[str, dict]:
         "       SIZE(have_ingredients) AS matching_count,\n"
         "       total_needed\n"
         "ORDER BY matching_count DESC\n"
-        "LIMIT 10"
+        f"LIMIT {limit}"
     )
     params = {"pantry_list": pantry}
     return cypher, params
@@ -518,7 +518,7 @@ def _build_rank_results(entities: dict) -> tuple[str, dict]:
     return cypher, params
 
 
-def _build_recipes_for_cuisine(entities: dict) -> tuple[str, dict]:
+def _build_recipes_for_cuisine(entities: dict, limit: int = 50) -> tuple[str, dict]:
     """
     Find recipes from a specific cuisine.
     Recipe -[:BELONGS_TO_CUSINE]-> Cuisine.
@@ -543,12 +543,12 @@ def _build_recipes_for_cuisine(entities: dict) -> tuple[str, dict]:
         "RETURN DISTINCT r.id, r.title, r.meal_type, r.total_time_minutes, "
         "r.percent_calories_protein, c.name AS cuisine_name"
     )
-    clauses.append("LIMIT 10")
+    clauses.append(f"LIMIT {limit}")
     cypher = "\n".join(clauses)
     return cypher, params
 
 
-def _build_recipes_by_nutrient(entities: dict) -> tuple[str, dict]:
+def _build_recipes_by_nutrient(entities: dict, limit: int = 50) -> tuple[str, dict]:
     """
     Recipes filtered by nutrient (e.g. high-protein).
     Uses Recipe percent_calories_* or nutrient_threshold.
@@ -584,7 +584,7 @@ def _build_recipes_by_nutrient(entities: dict) -> tuple[str, dict]:
         "r.percent_calories_protein, r.percent_calories_fat, r.percent_calories_carbs"
     )
     clauses.append("ORDER BY r.percent_calories_protein DESC")
-    clauses.append("LIMIT 10")
+    clauses.append(f"LIMIT {limit}")
     return "\n".join(clauses), params
 
 
@@ -648,7 +648,7 @@ def _build_nutrient_category(entities: dict) -> tuple[str, dict]:
     return cypher, {}
 
 
-def _build_ingredient_in_recipes(entities: dict) -> tuple[str, dict]:
+def _build_ingredient_in_recipes(entities: dict, limit: int = 50) -> tuple[str, dict]:
     """Recipes containing a specific ingredient."""
     ingredient = entities.get("ingredient", "")
     params = {"ingredient_pattern": ingredient}
@@ -656,7 +656,7 @@ def _build_ingredient_in_recipes(entities: dict) -> tuple[str, dict]:
         "MATCH (r:Recipe)-[:USES_INGREDIENT]->(i:Ingredient)\n"
         "WHERE toLower(i.name) CONTAINS toLower($ingredient_name)\n"
         "RETURN r.id, r.title, r.meal_type, r.total_time_minutes, i.name AS ingredient\n"
-        "LIMIT 10"
+        f"LIMIT {limit}"
     )
     params["ingredient_name"] = ingredient
     return cypher, params
@@ -754,7 +754,22 @@ _INTENT_BUILDERS = {
 }
 
 
-def generate_cypher_query(intent: str, entities: dict) -> tuple[str, dict]:
+# Recipe-returning intents whose builders accept a `limit` parameter.
+_RECIPE_INTENT_BUILDERS: set[str] = {
+    "find_recipe",
+    "find_recipe_by_pantry",
+    "recipes_for_cuisine",
+    "cuisine_recipes",
+    "recipes_by_nutrient",
+    "ingredient_in_recipes",
+}
+
+
+def generate_cypher_query(
+    intent: str,
+    entities: dict,
+    limit: int = 50,
+) -> tuple[str, dict]:
     """
     Dispatch to the appropriate Cypher builder based on intent.
 
@@ -762,6 +777,7 @@ def generate_cypher_query(intent: str, entities: dict) -> tuple[str, dict]:
     ----------
     intent   : str   — supported intent from extractor_classifier
     entities : dict  — entity dict from extractor_classifier output
+    limit    : int   — maximum rows to return for recipe-returning intents (default 50)
 
     Returns
     -------
@@ -774,6 +790,8 @@ def generate_cypher_query(intent: str, entities: dict) -> tuple[str, dict]:
             f"Unknown intent '{intent}'. "
             f"Supported intents: {sorted(_INTENT_BUILDERS.keys())}"
         )
+    if intent in _RECIPE_INTENT_BUILDERS:
+        return builder(entities, limit=limit)
     return builder(entities)
 
 

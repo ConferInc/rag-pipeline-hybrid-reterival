@@ -76,12 +76,16 @@ def run_cypher_retrieval(
         intent: Extracted intent from extractor_classifier
         entities: Extracted entities from extractor_classifier
         database: Neo4j database name (optional)
+        max_rows: Maximum rows to return. Also used as the Cypher LIMIT for
+                  recipe-returning intents so Neo4j only fetches what we need.
+                  Defaults to 50 when not specified.
 
     Returns:
         List of result rows as dicts
     """
+    cypher_limit = max_rows if max_rows is not None else 50
     try:
-        cypher, params = generate_cypher_query(intent, entities)
+        cypher, params = generate_cypher_query(intent, entities, limit=cypher_limit)
     except ValueError:
         return []
 
