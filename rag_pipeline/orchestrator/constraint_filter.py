@@ -948,24 +948,42 @@ def apply_usda_food_group_bonus(
 
 # ── Contextual rerank (PRD-33: soft ranking by context) ───────────────────────
 
+# ── Health-goal → nutrient-alignment map ─────────────────────────────────────
+# Maps health_goal strings to (payload_field, min_value, boost_multiplier).
+# percent_calories_protein/fat/carbs are inline Recipe properties (0–100).
+_GOAL_BOOST_MAP: dict[str, tuple[str, float, float]] = {
+    "weight_loss":    ("percent_calories_protein", 25.0, 1.15),
+    "muscle_gain":    ("percent_calories_protein", 30.0, 1.20),
+    "heart_health":   ("percent_calories_fat",     0.0,  1.0),   # handled via low-fat penalty below
+    "energy_boost":   ("percent_calories_carbs",   40.0, 1.10),
+    "balanced":       ("percent_calories_protein", 15.0, 1.05),
+}
+
+
 def contextual_rerank(
     fused: list[dict[str, Any]],
     entities: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """
     Soft rerank fused results by contextual signals (recent meals, calorie target,
-    cuisine preference). Does not remove items — only adjusts scores and sort order.
+    cuisine preference, health goal, meal type, collaborative score).
+    Does not remove items — only adjusts scores and sort order.
 
-    PRD logic:
+    PRD logic (original):
       - Penalize recent meals (×0.3)
       - Penalize high-calorie recipes when over target (×0.7)
       - Boost cuisine match (×1.3)
 
-    No-op when entities lack any of: exclude_recipe_ids, calorie_target,
-    cuisine_preference.
+    RC#2 additions (profile boost — Tier 2):
+      - Boost meal_type match vs preferred course (×1.2)
+      - Boost health-goal aligned recipes (×1.1–1.2, goal-dependent)
+      - Boost recipes with strong collaborative signal: collab_score > 0 (×1.1)
+      - Penalize heart_health goal when percent_calories_fat is high (×0.85)
+
+    No-op when entities lack all signal fields.
 
     Fused item shape: canonical payload fields only
-    (id, calories, cuisine_code).
+    (id, calories, cuisine_code, meal_type, percent_calories_*, collab_score).
     """
     exclude_ids: set[str] = set()
     exclude_raw = entities.get("exclude_recipe_ids")
@@ -1019,6 +1037,40 @@ def contextual_rerank(
                 rc = str(recipe_cuisine).strip().lower()
                 if rc and any(c in rc or rc in c for c in cuisines):
                     mult *= 1.3
+
+        # ── RC#2: Profile boost (Tier 2) ────────────────────────────────────
+
+        # Boost: meal_type matches user's preferred course
+        preferred_course = str(entities.get("course") or "").strip().lower()
+        if preferred_course:
+            recipe_meal_type = str(payload.get("meal_type") or "").strip().lower()
+            if recipe_meal_type and recipe_meal_type == preferred_course:
+                mult *= 1.2
+
+        # Boost: health-goal nutrient alignment
+        health_goal = str(entities.get("health_goal") or "").strip().lower()
+        if health_goal and health_goal in _GOAL_BOOST_MAP:
+            nutrient_field, min_val, goal_mult = _GOAL_BOOST_MAP[health_goal]
+            nutrient_val = payload.get(nutrient_field)
+            if nutrient_val is not None:
+                try:
+                    nv = float(nutrient_val)
+                    if health_goal == "heart_health":
+                        # Penalize high-fat recipes for heart health goal
+                        if nv > 35.0:
+                            mult *= 0.85
+                    elif nv >= min_val:
+                        mult *= goal_mult
+                except (TypeError, ValueError):
+                    pass
+
+        # Boost: strong collaborative signal from Cypher lane
+        collab = payload.get("collab_score", 0) or item.get("collab_score", 0)
+        try:
+            if float(collab) > 0:
+                mult *= 1.1
+        except (TypeError, ValueError):
+            pass
 
         adjusted = base * mult
         item["score"] = adjusted

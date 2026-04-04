@@ -100,21 +100,26 @@ def _build_find_recipe(entities: dict, limit: int = 50) -> tuple[str, dict]:
         )
         params[param_key] = ing
 
-    # ── Diet filter — via B2C_Customer FOLLOWS_DIET relationship
-    # Finds recipes saved/viewed by customers who follow the requested diet.
-    # This uses the existing (B2C_Customer)-[:FOLLOWS_DIET]->(Dietary_Preferences)
-    # and (B2C_Customer)-[:SAVED]->(Recipe) relationships which are present in Neo4j.
-    # NOTE: FORBIDS/USES_INGREDIENT don't exist yet — using collaborative signal instead.
+    # ── Diet filter — collaborative scoring via B2C_Customer FOLLOWS_DIET
+    #
+    # Strategy: two-tier scoring
+    #   Tier 1 (Primary)  — Collaborative: recipes popular with users who share
+    #                        the same diets float to the top via collab_score.
+    #   Tier 2 (Secondary) — Direct profile boost applied in contextual_rerank
+    #                        (cuisine, meal_type, health_goal).
+    #
+    # OPTIONAL MATCH means every recipe is a candidate regardless of whether
+    # collaborative data exists. collab_score = 0 for uncovered recipes; they
+    # still appear, just ranked lower. This replaces the previous hard-JOIN
+    # pattern that produced near-zero results on a sparse graph.
     diets = entities.get("diet", [])
-    for idx, diet in enumerate(diets):
-        alias = f"dp_{idx}"
+    if diets:
         clauses.append(
-            f"MATCH (cust_{idx}:B2C_Customer)-[:FOLLOWS_DIET]->({alias}:Dietary_Preferences {{name: $diet_{idx}}})"
+            "OPTIONAL MATCH (cu_diet:B2C_Customer)-[:FOLLOWS_DIET]->(dp_diet:Dietary_Preferences)"
         )
-        where_parts.append(
-            f"EXISTS {{ MATCH (cust_{idx})-[:SAVED|VIEWED]->(r) }}"
-        )
-        params[f"diet_{idx}"] = diet
+        where_parts.append("dp_diet.name IN $diets")
+        where_parts.append("EXISTS { MATCH (cu_diet)-[:SAVED|VIEWED]->(r) }")
+        params["diets"] = [str(d) for d in diets]
 
     # ── Cuisine preference (PRD-33 context) ───────────────────────────────────
     # Recipe must belong to at least one preferred cuisine via BELONGS_TO_CUSINE.
@@ -192,10 +197,23 @@ def _build_find_recipe(entities: dict, limit: int = 50) -> tuple[str, dict]:
     if where_parts:
         clauses.append("WHERE " + "\n  AND ".join(where_parts))
 
+    # ── Aggregate collab_score, then RETURN ───────────────────────────────────
+    # WITH groups by recipe so count(DISTINCT cu_diet) gives the number of
+    # diet-matching users who saved/viewed each recipe. When no diets are
+    # supplied (cu_diet never bound), count() returns 0 for all recipes.
+    # Recipes with no collaborative data still appear — just ranked lower.
     clauses.append(
-        "RETURN r.id, r.title, r.meal_type, r.total_time_minutes,\n"
-        "       r.percent_calories_protein, r.percent_calories_fat, r.percent_calories_carbs"
+        "WITH r, count(DISTINCT cu_diet) AS collab_score"
     )
+    clauses.append(
+        "RETURN r.id AS id, r.title AS title, r.meal_type AS meal_type,\n"
+        "       r.total_time_minutes AS total_time_minutes,\n"
+        "       r.percent_calories_protein AS percent_calories_protein,\n"
+        "       r.percent_calories_fat AS percent_calories_fat,\n"
+        "       r.percent_calories_carbs AS percent_calories_carbs,\n"
+        "       collab_score"
+    )
+    clauses.append("ORDER BY collab_score DESC, id")
     clauses.append(f"LIMIT {limit}")
 
     return "\n".join(clauses), params

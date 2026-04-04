@@ -48,14 +48,17 @@ def _canonicalize_cypher_row(
     canonical["meal_type"] = meal_type
     canonical["total_time_minutes"] = total_time_minutes
     canonical["cuisine_code"] = cuisine_code
+    collab_score = row.get("collab_score", 0) or 0
     canonical["source"] = "cypher"
     canonical["score_raw"] = 1.0 / float(max(rank, 1))
+    canonical["collab_score"] = collab_score
     canonical["payload"] = {
         "id": recipe_id,
         "title": title,
         "meal_type": meal_type,
         "total_time_minutes": total_time_minutes,
         "cuisine_code": cuisine_code,
+        "collab_score": collab_score,
     }
     return canonical
 
