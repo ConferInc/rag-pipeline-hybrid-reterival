@@ -1936,6 +1936,10 @@ async def recommend_feed(req: FeedRequest):
     }
     if req.meal_type:
         entities["course"] = req.meal_type
+    # RC#2: thread health_goal and cuisine_preference into entities so
+    # contextual_rerank can apply the profile boost (Tier 2).
+    if profile.get("health_goal"):
+        entities["health_goal"] = profile["health_goal"]
     entities = merge_profile_into_entities(entities, profile)
 
     synthetic_text = build_feed_query_text(profile, req.meal_type, entities=entities)
@@ -2185,6 +2189,9 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
         entities["usda_guidelines"] = _usda_guidelines
     if req.meal_type:
         entities["course"] = req.meal_type
+    # RC#2: thread health_goal into entities for contextual_rerank profile boost
+    if profile.get("health_goal"):
+        entities["health_goal"] = profile["health_goal"]
     entities = merge_profile_into_entities(entities, profile)
 
     synthetic_text = build_feed_query_text(profile, req.meal_type, entities=entities)
