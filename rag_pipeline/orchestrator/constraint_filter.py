@@ -154,18 +154,27 @@ def _fetch_allergen_violating_ids(
 ) -> set[str]:
     """
     Return the set of recipe IDs that contain at least one allergen/exclude ingredient.
-    Uses CONTAINS (not exact match) so "strawberries" matches "Strawberry" etc.
+
+    Uses exact case-insensitive matching (toLower(i.name) = toLower(a)) to avoid
+    false positives from substring collisions — e.g. "milk" must NOT eliminate
+    recipes that contain "buttermilk" or "almond milk" as distinct ingredients.
+
+    Tradeoff: exact matching requires allergen names to match Ingredient node names
+    precisely (e.g. "cow's milk" vs "milk"). The proper long-term fix is a
+    FORBIDDEN relationship from Allergen → Ingredient nodes in the graph, which
+    would handle synonyms and variants at the data layer.
     """
     if not recipe_ids or not allergens:
         return set()
 
     allergens_lower = [a.lower() for a in allergens]
 
-    # ANY(a IN $allergens WHERE toLower(i.name) CONTAINS a) — flexible matching
+    # Exact case-insensitive match: toLower(i.name) = a
+    # Prevents over-exclusion caused by substring matching (CONTAINS).
     cypher = """
     UNWIND $recipe_ids AS rid
     MATCH (r:Recipe {id: rid})-[:USES_INGREDIENT]->(i:Ingredient)
-    WHERE ANY(a IN $allergens WHERE toLower(i.name) CONTAINS a)
+    WHERE ANY(a IN $allergens WHERE toLower(i.name) = a)
     RETURN DISTINCT r.id AS flagged_id
     """
     try:

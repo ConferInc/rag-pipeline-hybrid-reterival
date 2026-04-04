@@ -2002,6 +2002,60 @@ async def recommend_feed(req: FeedRequest):
                     allowed_relationships=["SAVED", "VIEWED"],
                     database=database,
                 )
+            else:
+                # RC#5 Fix #4: No stored embedding for this customer.
+                # Fall back to globally popular recipes (most-saved across all users)
+                # so the structural lane still contributes to RRF instead of being empty.
+                logger.warning(
+                    "recommend_feed: no stored embedding for customer %s — "
+                    "falling back to popularity-based structural results",
+                    (req.customer_id or "anonymous")[:16],
+                )
+                try:
+                    with _driver.session(database=database) as _sess:
+                        _pop_rows = _sess.run(
+                            """
+                            MATCH (r:Recipe)<-[:SAVED]-(c:B2C_Customer)
+                            WITH r, count(DISTINCT c) AS save_count
+                            WHERE save_count > 0
+                            RETURN r.id AS id, r.title AS title,
+                                   r.meal_type AS meal_type,
+                                   r.total_time_minutes AS total_time_minutes,
+                                   r.percent_calories_protein AS percent_calories_protein,
+                                   r.percent_calories_fat AS percent_calories_fat,
+                                   r.percent_calories_carbs AS percent_calories_carbs,
+                                   save_count
+                            ORDER BY save_count DESC
+                            LIMIT $limit
+                            """,
+                            limit=req.limit,
+                        )
+                        pop_items = []
+                        for _rank, _row in enumerate(list(_pop_rows), start=1):
+                            _d = dict(_row)
+                            _d["source"] = "popularity_fallback"
+                            _d["score_raw"] = 1.0 / float(_rank)
+                            _d["payload"] = {
+                                "id": _d.get("id"),
+                                "title": _d.get("title"),
+                                "meal_type": _d.get("meal_type"),
+                                "total_time_minutes": _d.get("total_time_minutes"),
+                                "percent_calories_protein": _d.get("percent_calories_protein"),
+                                "percent_calories_fat": _d.get("percent_calories_fat"),
+                                "percent_calories_carbs": _d.get("percent_calories_carbs"),
+                                "collab_score": _d.get("save_count", 0),
+                            }
+                            pop_items.append(_d)
+                        if pop_items:
+                            structural_results = {"expanded_context": pop_items}
+                            logger.info(
+                                "recommend_feed: popularity fallback returned %s recipes",
+                                len(pop_items),
+                            )
+                except Exception as _pop_err:
+                    logger.warning(
+                        "recommend_feed: popularity fallback also failed: %s", _pop_err
+                    )
     except Exception as e:
         logger.warning("recommend_feed: structural/similar-constraint retrieval failed: %s", e)
 
@@ -2042,6 +2096,45 @@ async def recommend_feed(req: FeedRequest):
     fused = apply_hard_constraints(
         fused, entities, "find_recipe", _driver, database=database,
     )
+
+    # ── Fix #5: Minimum result fallback — relax allergen constraint and retry ──
+    # If fewer than 3 recipes survive hard constraints, retry once with allergens
+    # removed. Allergen data may be stale or ingredient names may not match
+    # exactly. Returning 0–2 recipes is worse than returning unverified results
+    # with a warning label.
+    if len(fused) < 3:
+        logger.warning(
+            "recommend_feed: only %s results after hard constraints — "
+            "retrying without allergen filter (minimum result fallback)",
+            len(fused),
+        )
+        relaxed_entities = {k: v for k, v in entities.items() if k != "exclude_ingredient"}
+        fused_relaxed = apply_hard_constraints(
+            # Re-run on the original pre-filter fused pool (re-fuse from components)
+            apply_rrf(
+                semantic_results,
+                structural_results,
+                cypher_results,
+                "find_recipe",
+                max_items=req.limit,
+            ),
+            relaxed_entities,
+            "find_recipe",
+            _driver,
+            database=database,
+        )
+        if len(fused_relaxed) > len(fused):
+            logger.warning(
+                "recommend_feed: minimum fallback recovered %s results (allergens relaxed)",
+                len(fused_relaxed),
+            )
+            # Tag relaxed results so the frontend/LLM can add a disclaimer
+            for item in fused_relaxed:
+                sources = list(item.get("sources") or [])
+                if "allergen_relaxed" not in sources:
+                    sources.append("allergen_relaxed")
+                item["sources"] = sources
+            fused = fused_relaxed
 
     # ── Contextual rerank: recent meals, calorie target, cuisine preference ───
     fused = contextual_rerank(fused, entities)
