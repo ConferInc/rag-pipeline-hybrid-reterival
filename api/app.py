@@ -2009,6 +2009,7 @@ async def recommend_feed(req: FeedRequest):
             intent="find_recipe",
             entities=entities,
             database=database,
+            max_rows=req.limit,
         )
     except Exception as e:
         logger.warning("recommend_feed: cypher retrieval failed: %s", e)
@@ -2248,6 +2249,7 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
             intent="find_recipe",
             entities=entities,
             database=database,
+            max_rows=req.limit,
         )
     except Exception as e:
         logger.warning("recommend_meal_candidates: cypher retrieval failed: %s", e)
