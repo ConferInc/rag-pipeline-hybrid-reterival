@@ -102,7 +102,7 @@ semantic:
   # Per-label text assembly: which properties to concatenate for embedding
   label_text_rules:
     Recipe:
-      properties: [id, title, description, difficulty, cuisine_code, total_time_minutes]
+      properties: [id, title, description, meal_type, difficulty, cuisine_code, total_time_minutes]
       separator: " "
     Ingredient:
       properties: [id, name, category]
@@ -276,7 +276,7 @@ retrieval_guardrails:
     max_rows: 50
   rrf:
     k: 60
-    max_items: 10
+    max_items: 50
     keyword_weight: 2.0          # RRF weight multiplier for keyword lane (>1 = boost)
   keyword:
     enabled: true                 # Master switch for keyword retrieval
