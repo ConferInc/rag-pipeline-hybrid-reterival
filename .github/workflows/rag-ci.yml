@@ -1,0 +1,33 @@
+name: RAG Pipeline CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: ConferInc/CI-Pipeline/.github/workflows/reusable-python-ci.yml@main
+    with:
+      python-version: "3.11"
+      working-directory: .
+      requirements-file: requirements.txt
+      run-ruff: false
+      run-mypy: false
+      run-pytest: false
+    secrets: inherit
+
+  docker-validate:
+    needs: [ci]
+    uses: ConferInc/CI-Pipeline/.github/workflows/reusable-docker-validate.yml@main
+    with:
+      context: .
+      dockerfile: Dockerfile
+      build-args: ""
+    secrets: inherit
