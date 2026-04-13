@@ -34,14 +34,14 @@ TEMPLATES: dict[str, dict[str, str]] = {
     "high_fat_2day": {
         "title": "Fat intake high",
         "body": "Your fat intake has been trending high — here are some lighter alternatives for today",
-        "action_url": "/recipes?diet=low-fat",
+        "action_url": "/search?q=low+fat",
         "icon": "📊",
         "type": "nutrition",
     },
     "low_protein_3day": {
         "title": "Low protein",
         "body": "You've been getting less protein than your goal — try adding these high-protein options",
-        "action_url": "/recipes?diet=high-protein",
+        "action_url": "/search?q=high+protein",
         "icon": "💪",
         "type": "nutrition",
     },
@@ -69,7 +69,7 @@ TEMPLATES: dict[str, dict[str, str]] = {
     "calorie_overshoot_3day": {
         "title": "Calorie goal",
         "body": "You've been over your calorie goal this week — would you like to adjust your target or explore lighter meals?",
-        "action_url": "/recipes",
+        "action_url": "/search?q=low+calorie",
         "icon": "📉",
         "type": "nutrition",
     },
@@ -94,17 +94,35 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "icon": "📋",
         "type": "system",
     },
+    "missed_dinner": {
+        "title": "How was dinner?",
+        "body": "You haven't logged dinner yet — tap to log what you had!",
+        "action_url": "/meal-log?type=dinner",
+        "icon": "🌙",
+        "type": "meal",
+    },
+    "suggest_dinner": {
+        "title": "Dinner time!",
+        "body": "Looking for dinner? Here are options that fit your remaining calorie budget",
+        "action_url": "/search?q=dinner",
+        "icon": "🥘",
+        "type": "meal",
+    },
 }
 
 # Fallback bodies when suggest_breakfast/suggest_lunch have no suggested_recipe
 SUGGEST_FALLBACK = {
     "suggest_breakfast": {
         "body": "Good morning! How about a high-protein breakfast today? Tap to explore options",
-        "action_url": "/recipes?meal=breakfast",
+        "action_url": "/search?q=breakfast",
     },
     "suggest_lunch": {
         "body": "Lunchtime! Tap to explore recipes that fit your calorie budget",
-        "action_url": "/recipes?meal=lunch",
+        "action_url": "/search?q=lunch",
+    },
+    "suggest_dinner": {
+        "body": "Dinner time! Tap to explore recipes that fit your remaining budget",
+        "action_url": "/search?q=dinner",
     },
 }
 
