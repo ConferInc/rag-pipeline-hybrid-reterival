@@ -54,10 +54,12 @@ def _pg_connect():
     if not url:
         print("ERROR: DATABASE_URL not set")
         sys.exit(1)
-    # OLD: required SSL unless DB_SSL_REJECT_UNAUTHORIZED == "false" — but direct-IP hosts don't support SSL
-    # ssl = {"sslmode": "require"} if "supabase" in url or os.getenv("DB_SSL_REJECT_UNAUTHORIZED") != "false" else {}
-    # NEW: only require SSL for Supabase cloud hosts (URL contains "supabase")
-    ssl = {"sslmode": "require"} if "supabase" in url else {}
+    # OLD: checked "supabase" in url — brittle if URL format changes or uses a proxy
+    # ssl = {"sslmode": "require"} if "supabase" in url else {}
+    # NEW: explicit DB_SSL_MODE env var (defaults to "disable" so direct-IP hosts work)
+    ssl_mode = os.getenv("DB_SSL_MODE", "disable")
+    ssl = {"sslmode": ssl_mode} if ssl_mode != "disable" else {}
+    print(f"  PostgreSQL SSL mode: {ssl_mode}")
     return psycopg2.connect(url, **ssl)
 
 
@@ -67,7 +69,11 @@ def _neo4j_driver():
     password = os.environ.get("NEO4J_PASSWORD", "")
     database = os.environ.get("NEO4J_DATABASE", "neo4j")
     driver = GraphDatabase.driver(uri, auth=(user, password))
-    driver.verify_connectivity()
+    try:
+        driver.verify_connectivity()
+    except Exception as e:
+        print(f"ERROR: Cannot connect to Neo4j at {uri}: {e}")
+        sys.exit(1)
     return driver, database
 
 

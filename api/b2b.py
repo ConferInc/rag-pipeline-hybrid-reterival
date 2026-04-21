@@ -623,7 +623,8 @@ async def substitutions(req: SubstitutionsRequest):
                 brand=str(r.get("brand", "") or ""),
                 # CHANGED: score was hardcoded 0.8; now comes from composite Cypher score
                 # OLD: score=float(r.get("score", 0.8)),
-                score=float(r.get("score", 0.5)),
+                # OLD: score=float(r.get("score", 0.5)),  — 0.5 is arbitrary, would surface mediocre results
+                score=float(r.get("score", 0.0)),
                 reason=reason,
                 reasons=reasons_list,
                 score_breakdown=score_breakdown,

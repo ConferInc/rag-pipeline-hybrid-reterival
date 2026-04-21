@@ -27,6 +27,9 @@ COPY cypher_query_generator.py  .
 COPY extractor_classifier.py    .
 COPY entity_codes.py            .
 COPY embedding_config.yaml      .
+# scripts/ contains one-off admin tools (e.g. seed_neo4j_schema.py).
+# Run inside container: docker exec -u root <container> python scripts/seed_neo4j_schema.py
+# Requires DATABASE_URL (PostgreSQL) and NEO4J_* env vars to be set.
 COPY scripts/                   ./scripts/
 
 # Switch to non-root user

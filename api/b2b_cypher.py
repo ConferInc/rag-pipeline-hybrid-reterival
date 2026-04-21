@@ -358,7 +358,9 @@ MATCH (orig:Product {{id: $product_id}})-[:SOLD_BY_VENDOR]->(v:Vendor {{id: $ven
 MATCH (cand:Product)-[:SOLD_BY_VENDOR]->(v)
 WHERE cand.id <> orig.id
   AND (cand.status = 'Active' OR cand.status = 'active' OR cand.status IS NULL)
-  AND (orig.category_name = cand.category_name OR (orig.category_name IS NULL AND cand.category_name IS NULL))
+  // OLD: case-sensitive string equality — fails if Neo4j has inconsistent casing (e.g. "Snacks" vs "snacks")
+  // AND (orig.category_name = cand.category_name OR (orig.category_name IS NULL AND cand.category_name IS NULL))
+  AND (toLower(orig.category_name) = toLower(cand.category_name) OR (orig.category_name IS NULL AND cand.category_name IS NULL))
 {allergen_filter}
 
 // Ingredient overlap: collect shared ingredients for Jaccard score
