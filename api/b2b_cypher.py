@@ -2,11 +2,11 @@
 B2B Cypher Query Builders
 =========================
 Vendor-scoped Cypher queries for B2B endpoints.
-Graph schema: Vendor, B2BCustomer, Product, Ingredient, Allergen,
-HealthCondition, DietaryPreference, B2BHealthProfile, ProductCategory.
+Graph schema: Vendor, B2BCustomer, Product, Ingredient, Allergens,
+Health_Condition, Dietary_Preferences, B2BHealthProfile, ProductCategory.
 
-Relationships: SOLD_BY, BELONGS_TO_VENDOR, CONTAINS_INGREDIENT, CONTAINS_ALLERGEN,
-ALLERGIC_TO, HAS_CONDITION, FOLLOWS_DIET, HAS_PROFILE, BELONGS_TO, COMPATIBLE_WITH_DIET.
+Relationships: SOLD_BY_VENDOR, BELONGS_TO_VENDOR, CONTAINS_INGREDIENT, HAS_ALLERGEN,
+IS_ALLERGIC, HAS_CONDITION, FOLLOWS_DIET, HAS_PROFILE, COMPATIBLE_WITH_DIET.
 """
 
 from __future__ import annotations
@@ -48,24 +48,24 @@ def build_b2b_recommend_products(
         where_parts.append("p.category_id = $category_id")
         params["category_id"] = category_id
 
-    # Allergen exclusion: Product→Ingredient→CONTAINS_ALLERGEN→Allergen
+    # Allergen exclusion: Product→HAS_ALLERGEN→Allergens (direct, 2,377 edges exist)
     allergen_filter = ""
     if allergen_codes:
         params["allergen_codes"] = allergen_codes
+        # OLD: used 3-hop via CONTAINS_INGREDIENT→Ingredient→HAS_ALLERGEN
+        # AND NOT EXISTS { MATCH (p)-[:CONTAINS_INGREDIENT]->(i:Ingredient)
+        #   WHERE EXISTS { (i)-[:HAS_ALLERGEN]->(a:Allergens) WHERE a.code IN $allergen_codes } }
+        # AND NOT EXISTS { MATCH (p)-[:CONTAINS_INGREDIENT]->(i:Ingredient)
+        #   WHERE toLower(i.name) IN [x IN $allergen_names | toLower(x)] }
         allergen_filter = """
 AND NOT EXISTS {
-  MATCH (p)-[:CONTAINS_INGREDIENT]->(i:Ingredient)
-  WHERE EXISTS { (i)-[:CONTAINS_ALLERGEN]->(a:Allergen) WHERE a.code IN $allergen_codes }
-}
-AND NOT EXISTS {
-  MATCH (p)-[:CONTAINS_INGREDIENT]->(i:Ingredient)
-  WHERE toLower(i.name) IN [x IN $allergen_names | toLower(x)]
+  MATCH (p)-[:HAS_ALLERGEN]->(a:Allergens)
+  WHERE a.code IN $allergen_codes
 }"""
-        params["allergen_names"] = [str(c) for c in allergen_codes]
 
     cypher = f"""
 MATCH (c:B2BCustomer {{id: $customer_id}})-[:BELONGS_TO_VENDOR]->(v:Vendor {{id: $vendor_id}})
-MATCH (p:Product)-[:SOLD_BY]->(v)
+MATCH (p:Product)-[:SOLD_BY_VENDOR]->(v)
 WHERE {' AND '.join(where_parts)}
 {allergen_filter}
 
@@ -100,14 +100,17 @@ def build_b2b_product_customers(
     # Customer allergens with severity
     # Exclude severe/anaphylactic; include safe + optionally warning (mild)
     cypher = """
-MATCH (p:Product {id: $product_id})-[:SOLD_BY]->(v:Vendor {id: $vendor_id})
-OPTIONAL MATCH (p)-[:CONTAINS_INGREDIENT]->(pi:Ingredient)-[:CONTAINS_ALLERGEN]->(pa:Allergen)
+MATCH (p:Product {id: $product_id})-[:SOLD_BY_VENDOR]->(v:Vendor {id: $vendor_id})
+// OLD: OPTIONAL MATCH (p)-[:CONTAINS_INGREDIENT]->(pi:Ingredient)-[:HAS_ALLERGEN]->(pa:Allergens)
+// Product→HAS_ALLERGEN→Allergens already exists directly (2,377 edges)
+OPTIONAL MATCH (p)-[:HAS_ALLERGEN]->(pa:Allergens)
 WITH p, v, COLLECT(DISTINCT pa.code) AS product_allergen_codes
 
 MATCH (c:B2BCustomer)-[:BELONGS_TO_VENDOR]->(v)
 WHERE c.account_status = 'active' OR c.account_status IS NULL
 
-OPTIONAL MATCH (c)-[ca:ALLERGIC_TO]->(a:Allergen)
+// OLD: OPTIONAL MATCH (c)-[ca:ALLERGIC_TO]->(a:Allergens)  — actual rel is IS_ALLERGIC
+OPTIONAL MATCH (c)-[ca:IS_ALLERGIC]->(a:Allergens)
 WHERE a.code IN product_allergen_codes
 
 WITH c, product_allergen_codes,
@@ -117,12 +120,12 @@ WITH c, product_allergen_codes, overlap_details,
 WITH c,
      CASE
        WHEN SIZE(overlaps) = 0 THEN 'safe'
-       WHEN ALL(x IN overlaps WHERE x.severity IN ['mild', 'moderate']) THEN 'warning'
+       WHEN ALL(x IN overlaps WHERE coalesce(x.severity, 'mild') IN ['mild', 'moderate']) THEN 'warning'
        ELSE 'excluded'
      END AS safety_status
 WHERE safety_status IN ['safe', 'warning']
 
-OPTIONAL MATCH (c)-[:FOLLOWS_DIET]->(dp:DietaryPreference)
+OPTIONAL MATCH (c)-[:FOLLOWS_DIET]->(dp:Dietary_Preferences)
 WITH c, safety_status, COLLECT(DISTINCT dp.name) AS diets
 RETURN c.id AS customer_id, c.full_name AS customer_name, c.email AS email,
        safety_status,
@@ -174,17 +177,19 @@ def build_b2b_search_products(
         params["brand"] = brand
     if allergen_free:
         params["allergen_free"] = allergen_free
+        # OLD: 3-hop via CONTAINS_INGREDIENT→Ingredient→HAS_ALLERGEN; direct Product→HAS_ALLERGEN exists
+        # "NOT EXISTS { MATCH (p)-[:CONTAINS_INGREDIENT]->(i:Ingredient)-[:HAS_ALLERGEN]->(a:Allergens) WHERE a.code IN $allergen_free }"
         where_parts.append(
-            "NOT EXISTS { MATCH (p)-[:CONTAINS_INGREDIENT]->(i:Ingredient)-[:CONTAINS_ALLERGEN]->(a:Allergen) WHERE a.code IN $allergen_free }"
+            "NOT EXISTS { MATCH (p)-[:HAS_ALLERGEN]->(a:Allergens) WHERE a.code IN $allergen_free }"
         )
     if diet_codes:
         params["diet_codes"] = diet_codes
         where_parts.append(
-            "EXISTS { (p)-[:COMPATIBLE_WITH_DIET]->(dp:DietaryPreference) WHERE dp.code IN $diet_codes OR dp.name IN $diet_codes }"
+            "EXISTS { (p)-[:COMPATIBLE_WITH_DIET]->(dp:Dietary_Preferences) WHERE dp.code IN $diet_codes OR dp.name IN $diet_codes }"
         )
 
     cypher = f"""
-MATCH (p:Product)-[:SOLD_BY]->(v:Vendor {{id: $vendor_id}})
+MATCH (p:Product)-[:SOLD_BY_VENDOR]->(v:Vendor {{id: $vendor_id}})
 WHERE {' AND '.join(where_parts)}
 RETURN p.id AS id, p.name AS name, p.brand AS brand,
        p.calories AS calories, p.protein_g AS protein_g,
@@ -289,7 +294,7 @@ LIMIT $limit
     params["condition_codes"] = condition_codes
     cypher = """
 MATCH (c:B2BCustomer)-[:BELONGS_TO_VENDOR]->(v:Vendor {id: $vendor_id})
-MATCH (c)-[:HAS_CONDITION]->(hc:HealthCondition)
+MATCH (c)-[:HAS_CONDITION]->(hc:Health_Condition)
 WHERE hc.code IN $condition_codes
   AND (c.account_status = 'active' OR c.account_status IS NULL)
 RETURN DISTINCT c.id AS customer_id, c.full_name AS customer_name, c.email AS email
@@ -299,6 +304,22 @@ LIMIT $limit
     return cypher, params
 
 
+# OLD build_b2b_substitutions (scored on calorie similarity only — gave random/irrelevant results):
+# def build_b2b_substitutions(vendor_id, product_id, customer_id, limit=10):
+#     ...
+#     cypher = f"""
+# MATCH (orig:Product {{id: $product_id}})-[:SOLD_BY_VENDOR]->(v:Vendor {{id: $vendor_id}})
+# MATCH (cand:Product)-[:SOLD_BY_VENDOR]->(v)
+# WHERE cand.id <> orig.id AND (cand.status = 'active' OR cand.status IS NULL)
+#   AND (orig.category_id = cand.category_id OR ...)
+# {allergen_filter}
+# WITH orig, cand,
+#      CASE WHEN orig.calories IS NOT NULL AND cand.calories IS NOT NULL
+#           THEN 1.0 - abs(orig.calories - cand.calories) / COALESCE(NULLIF(orig.calories,0),1) / 100.0
+#           ELSE 0.5 END AS calorie_sim
+# RETURN cand.id AS id, ..., calorie_sim AS score
+# ORDER BY score DESC LIMIT $limit
+# """
 def build_b2b_substitutions(
     vendor_id: str,
     product_id: str,
@@ -306,7 +327,8 @@ def build_b2b_substitutions(
     limit: int = 10,
 ) -> tuple[str, dict[str, Any]]:
     """
-    Find substitute products: same category, similar nutrition, optionally allergen-safe.
+    Find substitute products scored on ingredient overlap (Jaccard) and
+    nutrition similarity (calories/protein/fat). Allergen-safe when customer_id provided.
     """
     params: dict[str, Any] = {
         "vendor_id": vendor_id,
@@ -317,26 +339,74 @@ def build_b2b_substitutions(
     allergen_filter = ""
     if customer_id:
         params["customer_id"] = customer_id
+        # OLD: used 3-hop CONTAINS_INGREDIENT→Ingredient→HAS_ALLERGEN; direct Product→HAS_ALLERGEN exists
+        # AND NOT EXISTS {
+        #   MATCH (c:B2BCustomer {id: $customer_id})-[:IS_ALLERGIC]->(a:Allergens)
+        #   MATCH (cand)-[:CONTAINS_INGREDIENT]->(i)-[:HAS_ALLERGEN]->(a)
+        # }
         allergen_filter = """
 AND NOT EXISTS {
-  MATCH (c:B2BCustomer {id: $customer_id})-[:ALLERGIC_TO]->(a:Allergen)
-  MATCH (cand)-[:CONTAINS_INGREDIENT]->(i)-[:CONTAINS_ALLERGEN]->(a)
+  MATCH (c:B2BCustomer {id: $customer_id})-[:IS_ALLERGIC]->(a:Allergens)
+  MATCH (cand)-[:HAS_ALLERGEN]->(a)
 }
 """
 
+    # OLD used category_id (not a property in this Neo4j graph — use category_name instead):
+    # AND (orig.category_id = cand.category_id OR (orig.category_id IS NULL AND cand.category_id IS NULL))
     cypher = f"""
-MATCH (orig:Product {{id: $product_id}})-[:SOLD_BY]->(v:Vendor {{id: $vendor_id}})
-MATCH (cand:Product)-[:SOLD_BY]->(v)
-WHERE cand.id <> orig.id AND (cand.status = 'active' OR cand.status IS NULL)
-  AND (orig.category_id = cand.category_id OR (orig.category_id IS NULL AND cand.category_id IS NULL))
+MATCH (orig:Product {{id: $product_id}})-[:SOLD_BY_VENDOR]->(v:Vendor {{id: $vendor_id}})
+MATCH (cand:Product)-[:SOLD_BY_VENDOR]->(v)
+WHERE cand.id <> orig.id
+  AND (cand.status = 'Active' OR cand.status = 'active' OR cand.status IS NULL)
+  AND (orig.category_name = cand.category_name OR (orig.category_name IS NULL AND cand.category_name IS NULL))
 {allergen_filter}
+
+// Ingredient overlap: collect shared ingredients for Jaccard score
+OPTIONAL MATCH (orig)-[:CONTAINS_INGREDIENT]->(oi:Ingredient)
+WITH orig, cand, COLLECT(DISTINCT oi.id) AS orig_ings
+OPTIONAL MATCH (cand)-[:CONTAINS_INGREDIENT]->(ci:Ingredient)
+WITH orig, cand, orig_ings, COLLECT(DISTINCT ci.id) AS cand_ings
 WITH orig, cand,
-     CASE WHEN orig.calories IS NOT NULL AND cand.calories IS NOT NULL
-          THEN 1.0 - abs(orig.calories - cand.calories) / COALESCE(NULLIF(orig.calories, 0), 1) / 100.0
-          ELSE 0.5 END AS calorie_sim
+     SIZE(orig_ings) AS orig_size,
+     SIZE(cand_ings) AS cand_size,
+     SIZE([x IN orig_ings WHERE x IN cand_ings]) AS shared_count
+WITH orig, cand, shared_count, orig_size, cand_size,
+     CASE WHEN (orig_size + cand_size - shared_count) > 0
+          THEN toFloat(shared_count) / toFloat(orig_size + cand_size - shared_count)
+          ELSE 0.0 END AS ingredient_jaccard
+
+// Nutrition similarity (clamped to 0..1 range)
+WITH orig, cand, shared_count, ingredient_jaccard,
+     CASE
+       WHEN orig.calories IS NOT NULL AND cand.calories IS NOT NULL AND toFloat(orig.calories) > 0
+            AND 1.0 - toFloat(abs(orig.calories - cand.calories)) / toFloat(orig.calories) > 0
+       THEN 1.0 - toFloat(abs(orig.calories - cand.calories)) / toFloat(orig.calories)
+       WHEN orig.calories IS NOT NULL AND cand.calories IS NOT NULL AND toFloat(orig.calories) > 0
+       THEN 0.0
+       ELSE 0.5 END AS calorie_sim,
+     CASE
+       WHEN orig.protein_g IS NOT NULL AND cand.protein_g IS NOT NULL AND toFloat(orig.protein_g) > 0
+            AND 1.0 - toFloat(abs(orig.protein_g - cand.protein_g)) / toFloat(orig.protein_g) > 0
+       THEN 1.0 - toFloat(abs(orig.protein_g - cand.protein_g)) / toFloat(orig.protein_g)
+       WHEN orig.protein_g IS NOT NULL AND cand.protein_g IS NOT NULL AND toFloat(orig.protein_g) > 0
+       THEN 0.0
+       ELSE 0.5 END AS protein_sim,
+     CASE
+       WHEN orig.fat_g IS NOT NULL AND cand.fat_g IS NOT NULL AND toFloat(orig.fat_g) > 0
+            AND 1.0 - toFloat(abs(orig.fat_g - cand.fat_g)) / toFloat(orig.fat_g) > 0
+       THEN 1.0 - toFloat(abs(orig.fat_g - cand.fat_g)) / toFloat(orig.fat_g)
+       WHEN orig.fat_g IS NOT NULL AND cand.fat_g IS NOT NULL AND toFloat(orig.fat_g) > 0
+       THEN 0.0
+       ELSE 0.5 END AS fat_sim
+
+// Composite score: ingredient overlap 0.40 + calorie 0.30 + protein 0.20 + fat 0.10
+WITH cand, shared_count, ingredient_jaccard, calorie_sim, protein_sim, fat_sim,
+     (ingredient_jaccard * 0.40 + calorie_sim * 0.30 + protein_sim * 0.20 + fat_sim * 0.10) AS score
+
 RETURN cand.id AS id, cand.name AS name, cand.brand AS brand,
-       cand.calories AS calories, cand.protein_g AS protein_g,
-       calorie_sim AS score
+       cand.calories AS calories, cand.protein_g AS protein_g, cand.fat_g AS fat_g,
+       shared_count, ingredient_jaccard, calorie_sim, protein_sim,
+       score
 ORDER BY score DESC
 LIMIT $limit
 """
@@ -353,13 +423,13 @@ def build_b2b_product_intel(
     params = {"vendor_id": vendor_id, "product_id": product_id}
 
     cypher = """
-MATCH (p:Product {id: $product_id})-[:SOLD_BY]->(v:Vendor {id: $vendor_id})
-OPTIONAL MATCH (p)-[:COMPATIBLE_WITH_DIET]->(dp:DietaryPreference)
+MATCH (p:Product {id: $product_id})-[:SOLD_BY_VENDOR]->(v:Vendor {id: $vendor_id})
+OPTIONAL MATCH (p)-[:COMPATIBLE_WITH_DIET]->(dp:Dietary_Preferences)
 WITH p, COLLECT(DISTINCT dp.name) AS diet_names
 OPTIONAL MATCH (p)-[:CONTAINS_INGREDIENT]->(i:Ingredient)
 WITH p, [d IN diet_names WHERE d IS NOT NULL] AS diet_compatibility,
      [x IN COLLECT(DISTINCT i.name) WHERE x IS NOT NULL] AS ingredients
-OPTIONAL MATCH (p)-[:CONTAINS_INGREDIENT]->(i2:Ingredient)-[:CONTAINS_ALLERGEN]->(a:Allergen)
+OPTIONAL MATCH (p)-[:CONTAINS_INGREDIENT]->(i2:Ingredient)-[:HAS_ALLERGEN]->(a:Allergens)
 WITH p, diet_compatibility, ingredients,
      [x IN COLLECT(DISTINCT coalesce(a.name, a.code)) WHERE x IS NOT NULL] AS allergens
 RETURN p.id AS product_id, diet_compatibility, ingredients, allergens
@@ -387,12 +457,16 @@ def build_b2b_safety_check(
 
     where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
+    # OLD: used 3-hop Product→CONTAINS_INGREDIENT→Ingredient→HAS_ALLERGEN→Allergens
+    # Product→HAS_ALLERGEN→Allergens already exists directly (2,377 edges) — use it instead
     cypher = f"""
-MATCH (p:Product)-[:SOLD_BY]->(v:Vendor {{id: $vendor_id}})
+MATCH (p:Product)-[:SOLD_BY_VENDOR]->(v:Vendor {{id: $vendor_id}})
 MATCH (c:B2BCustomer)-[:BELONGS_TO_VENDOR]->(v)
 {where_clause}
-MATCH (p)-[:CONTAINS_INGREDIENT]->(i:Ingredient)-[:CONTAINS_ALLERGEN]->(a:Allergen)
-MATCH (c)-[ca:ALLERGIC_TO]->(a)
+// OLD: MATCH (p)-[:CONTAINS_INGREDIENT]->(i:Ingredient)-[:HAS_ALLERGEN]->(a:Allergens)
+MATCH (p)-[:HAS_ALLERGEN]->(a:Allergens)
+// OLD: MATCH (c)-[ca:ALLERGIC_TO]->(a)  — ALLERGIC_TO does not exist; actual rel is IS_ALLERGIC
+MATCH (c)-[ca:IS_ALLERGIC]->(a)
 RETURN p.id AS product_id, p.name AS product_name,
        c.id AS customer_id, c.full_name AS customer_name,
        a.name AS conflict_allergen, a.code AS allergen_code,

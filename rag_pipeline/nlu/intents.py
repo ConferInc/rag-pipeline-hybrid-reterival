@@ -73,6 +73,16 @@ RECIPE_INTENTS: frozenset[str] = frozenset({
 })
 
 # Intents that run retrieval (semantic + structural + cypher) + LLM generation
+# CHANGED: added similar_ingredients, rank_results, dietary_advice (were stubs — fell through to _stub_chat_response)
+# OLD:
+# DATA_INTENTS_NEEDING_RETRIEVAL: frozenset[str] = frozenset({
+#     "find_recipe", "find_recipe_by_pantry", "get_nutritional_info", "compare_foods",
+#     "check_diet_compliance", "check_substitution", "get_substitution_suggestion",
+#     "similar_recipes", "recipes_for_cuisine", "recipes_by_nutrient", "nutrient_in_foods",
+#     "nutrient_category", "ingredient_in_recipes", "ingredient_nutrients", "find_product",
+#     "product_nutrients", "cuisine_recipes", "cuisine_hierarchy", "cross_reactive_allergens",
+#     "general_nutrition",
+# })
 DATA_INTENTS_NEEDING_RETRIEVAL: frozenset[str] = frozenset({
     "find_recipe",
     "find_recipe_by_pantry",
@@ -82,8 +92,10 @@ DATA_INTENTS_NEEDING_RETRIEVAL: frozenset[str] = frozenset({
     "check_substitution",
     "get_substitution_suggestion",
     "similar_recipes",
+    "similar_ingredients",  # added: was stub
     "recipes_for_cuisine",
     "recipes_by_nutrient",
+    "rank_results",         # added: was stub
     "nutrient_in_foods",
     "nutrient_category",
     "ingredient_in_recipes",
@@ -94,6 +106,7 @@ DATA_INTENTS_NEEDING_RETRIEVAL: frozenset[str] = frozenset({
     "cuisine_hierarchy",
     "cross_reactive_allergens",
     "general_nutrition",
+    "dietary_advice",       # added: was stub
 })
 
 # Deterministic chatbot intents: fixed Cypher, no retrieval or LLM generation

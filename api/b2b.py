@@ -592,16 +592,41 @@ async def substitutions(req: SubstitutionsRequest):
     rows = _run_cypher(driver, cypher, params)
     substitutes = []
     for r in rows:
-        reasons_list = [f"Similar nutrition ({r.get('calories')} cal)"]
+        # CHANGED: reason now reflects actual similarity signals instead of hardcoded string
+        # OLD: reasons_list = [f"Similar nutrition ({r.get('calories')} cal)"]
+        reasons_list = []
+        shared = int(r.get("shared_count") or 0)
+        if shared > 0:
+            reasons_list.append(f"{shared} shared ingredient{'s' if shared > 1 else ''}")
+        cal = r.get("calories")
+        cal_sim = float(r.get("calorie_sim") or 0)
+        if cal is not None and cal_sim >= 0.7:
+            reasons_list.append(f"Similar calories ({cal} kcal)")
+        protein_sim = float(r.get("protein_sim") or 0)
+        if protein_sim >= 0.7 and r.get("protein_g") is not None:
+            reasons_list.append(f"Similar protein ({r.get('protein_g')}g)")
+        if not reasons_list:
+            reasons_list.append("Same product category")
+        reason = ", ".join(reasons_list)
+
+        # CHANGED: score_breakdown now multi-factor instead of {"nutrition_similarity": score}
+        # OLD: score_breakdown = {"nutrition_similarity": float(r.get("score", 0.8))}
+        score_breakdown = {
+            "ingredient_overlap": float(r.get("ingredient_jaccard") or 0),
+            "calorie_similarity": cal_sim,
+            "protein_similarity": protein_sim,
+        }
         substitutes.append(
             SubstituteItem(
                 id=str(r.get("id", "")),
                 name=str(r.get("name", "")),
-                brand=str(r.get("brand", "")),
-                score=float(r.get("score", 0.8)),
-                reason=reasons_list[0] if reasons_list else "Similar product",
+                brand=str(r.get("brand", "") or ""),
+                # CHANGED: score was hardcoded 0.8; now comes from composite Cypher score
+                # OLD: score=float(r.get("score", 0.8)),
+                score=float(r.get("score", 0.5)),
+                reason=reason,
                 reasons=reasons_list,
-                score_breakdown={"nutrition_similarity": float(r.get("score", 0.8))},
+                score_breakdown=score_breakdown,
             )
         )
 

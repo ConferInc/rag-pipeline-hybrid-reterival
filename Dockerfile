@@ -27,6 +27,7 @@ COPY cypher_query_generator.py  .
 COPY extractor_classifier.py    .
 COPY entity_codes.py            .
 COPY embedding_config.yaml      .
+COPY scripts/                   ./scripts/
 
 # Switch to non-root user
 USER appuser
