@@ -1,0 +1,30 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+htmlcov
+.mypy_cache
+.ruff_cache
+*.log
+logs
+
+# Secrets and env
+.env*
+*.pem
+secrets/
+.aws/
+
+# OS/Editor
+.DS_Store
+.vscode
+.idea
+
+# Docs and local tooling
+docs
+README.md
+*.md
