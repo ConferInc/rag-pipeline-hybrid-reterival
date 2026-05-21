@@ -7,7 +7,12 @@ import time
 from dataclasses import asdict
 from typing import Any
 
-from rag_pipeline.config import USDAGuidelineConfig, USDAGroupRule, USDA_FOOD_GROUPS, get_default_usda_guidelines
+from rag_pipeline.config import (
+    USDA_FOOD_GROUPS,
+    USDAGroupRule,
+    USDAGuidelineConfig,
+    get_default_usda_guidelines,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +58,6 @@ def load_usda_guidelines(*, ttl_s: int = 600) -> USDAGuidelineConfig:
       Set `USDA_GUIDELINES_STRICT=1` to disable this fallback.
     """
 
-    key = _cache_key()
     now = time.time()
     cached = _USDA_GUIDELINES_CACHE.get("value")
     cached_ts = _USDA_GUIDELINES_CACHE.get("ts", 0.0)
@@ -251,9 +255,7 @@ def _load_usda_guidelines_via_supabase_client(
     resp = (
         client.schema(schema)
         .from_("nutritional_guidelines")
-        .select(
-            "food_group,daily_target_min,daily_target_max,daily_target_unit,pyramid_priority"
-        )
+        .select("food_group,daily_target_min,daily_target_max,daily_target_unit,pyramid_priority")
         .eq("model_name", model_name)
         .eq("is_active", True)
         .execute()
@@ -262,8 +264,7 @@ def _load_usda_guidelines_via_supabase_client(
     data = resp.data or []
     if not data:
         raise RuntimeError(
-            f"No USDA guideline rows returned from {schema}.nutritional_guidelines "
-            f"for model_name={model_name!r}"
+            f"No USDA guideline rows returned from {schema}.nutritional_guidelines for model_name={model_name!r}"
         )
 
     rows = list(data)
@@ -372,8 +373,7 @@ def _load_usda_guidelines_from_postgres(
 
     if not rows:
         raise RuntimeError(
-            f"No USDA guideline rows returned from {schema}.nutritional_guidelines "
-            f"for model_name={model_name!r}"
+            f"No USDA guideline rows returned from {schema}.nutritional_guidelines for model_name={model_name!r}"
         )
 
     # Normalize into our internal representation.
@@ -500,12 +500,7 @@ def _normalize_ingredient_name(name: Any) -> str:
     s = _TOKEN_RE.sub(" ", s)
     s = re.sub(r"\\s+", " ", s).strip()
     # Common aliases / synonyms.
-    s = (
-        s.replace("curd", "yogurt")
-        .replace("hung curd", "yogurt")
-        .replace("dahi", "yogurt")
-        .replace("paneer", "paneer")
-    )
+    s = s.replace("curd", "yogurt").replace("hung curd", "yogurt").replace("dahi", "yogurt").replace("paneer", "paneer")
     return s
 
 
@@ -668,4 +663,3 @@ def infer_food_groups_for_ingredients(ingredient_names: list[str]) -> dict[str, 
         "confidence_by_group": confidence_by_group,
         "unknown_count": unknown_count,
     }
-

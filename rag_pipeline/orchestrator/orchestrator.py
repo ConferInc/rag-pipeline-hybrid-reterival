@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import sys
@@ -13,13 +12,13 @@ import yaml
 from neo4j import Driver
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from extractor_classifier import extract_intent, extract_intent_with_retry, parse_extractor_output, sanity_check
-
-from rag_pipeline.augmentation.condense import condense_for_llm, format_semantic_results_as_text
+from extractor_classifier import (
+    sanity_check,
+)
 from rag_pipeline.augmentation.fusion import apply_rrf
 from rag_pipeline.config import EmbeddingConfig
-from rag_pipeline.logging_utils import truncate_for_log
 from rag_pipeline.embeddings.base import QueryEmbedder
+from rag_pipeline.logging_utils import truncate_for_log
 from rag_pipeline.orchestrator.constraint_filter import (
     apply_hard_constraints,
     apply_usda_food_group_bonus,
@@ -30,14 +29,13 @@ from rag_pipeline.orchestrator.cypher_runner import run_cypher_retrieval
 from rag_pipeline.orchestrator.entity_enrichment import enrich_entities
 from rag_pipeline.orchestrator.entity_validation import validate_entity_compatibility
 from rag_pipeline.orchestrator.profile_enrichment import merge_profile_into_entities
+from rag_pipeline.retrieval.keyword import keyword_search
 from rag_pipeline.retrieval.service import SemanticRetrievalRequest, retrieve_semantic
 from rag_pipeline.retrieval.similar_constraint import retrieve_recipes_from_similar_constraint_users
 from rag_pipeline.retrieval.structural import (
     get_seed_embedding,
     structural_search_with_expansion,
 )
-from rag_pipeline.retrieval.keyword import keyword_search
-
 
 # Intents that benefit from structural (collaborative filtering) retrieval
 STRUCTURAL_INTENTS = {"find_recipe", "find_recipe_by_pantry"}
@@ -345,7 +343,6 @@ async def orchestrate(
         )
     else:
         try:
-            raw_response: str
             parsed: dict[str, Any] | None = None
 
             if on_parse_failure == "retry":
@@ -476,16 +473,8 @@ async def orchestrate(
     async def _empty_structural() -> dict[str, Any]:
         return {}
 
-    use_similar_constraint = (
-        is_aggregated_profile
-        and customer_profile
-        and result.intent in STRUCTURAL_INTENTS
-    )
-    use_structural = (
-        not use_similar_constraint
-        and customer_node_id
-        and result.intent in STRUCTURAL_INTENTS
-    )
+    use_similar_constraint = is_aggregated_profile and customer_profile and result.intent in STRUCTURAL_INTENTS
+    use_structural = not use_similar_constraint and customer_node_id and result.intent in STRUCTURAL_INTENTS
     skip_structural = not use_similar_constraint and not use_structural
 
     if skip_structural:
@@ -551,14 +540,14 @@ async def orchestrate(
 
     # 4th lane: keyword search via Neo4j Fulltext Index (recipe_title_ft)
     # Only for recipe-search intents with a text query; skip for non-text intents
-    _KEYWORD_INTENTS = {"find_recipe", "find_recipe_by_pantry", "rank_results",
-                        "recipes_for_cuisine", "ingredient_in_recipes"}
-    run_keyword = (
-        keyword_enabled
-        and result.intent in _KEYWORD_INTENTS
-        and user_query
-        and len(user_query.strip()) >= 2
-    )
+    _KEYWORD_INTENTS = {
+        "find_recipe",
+        "find_recipe_by_pantry",
+        "rank_results",
+        "recipes_for_cuisine",
+        "ingredient_in_recipes",
+    }
+    run_keyword = keyword_enabled and result.intent in _KEYWORD_INTENTS and user_query and len(user_query.strip()) >= 2
 
     async def _empty_keyword() -> list[dict]:
         return []
@@ -649,7 +638,12 @@ async def orchestrate(
             "component": "orchestrator",
             "query": query_truncated,
             "intent": result.intent,
-            "retrieval_counts": {"semantic": len(result.semantic_results), "structural": len(result.structural_results.get("expanded_context", [])), "cypher": len(result.cypher_results), "keyword": len(result.keyword_results)},
+            "retrieval_counts": {
+                "semantic": len(result.semantic_results),
+                "structural": len(result.structural_results.get("expanded_context", [])),
+                "cypher": len(result.cypher_results),
+                "keyword": len(result.keyword_results),
+            },
             "fused_count": fused_count,
             "latency_ms": round(t_fusion_ms, 1),
         },

@@ -1,0 +1,10 @@
+-r requirements.txt
+pytest
+pytest-mock
+pytest-asyncio
+coverage
+pytest-cov
+pip-audit
+bandit[toml]
+pip-licenses
+ruff

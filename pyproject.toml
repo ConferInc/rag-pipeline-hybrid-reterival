@@ -1,0 +1,15 @@
+[tool.ruff]
+line-length = 120
+exclude = [".venv", "__pycache__", "tests", "test_extraction_failures.py", "extractor_classifier.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.bandit]
+skips = ["B101"]
+exclude_dirs = [".venv", "tests", "__pycache__"]

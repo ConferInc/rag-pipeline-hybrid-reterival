@@ -10,7 +10,7 @@ import os
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from neo4j import Driver
 from pydantic import BaseModel, Field
 
@@ -34,14 +34,17 @@ router = APIRouter(prefix="/b2b", tags=["b2b"])
 
 # ── Helpers (driver injected at request time to avoid circular import) ──────
 
+
 def _get_driver() -> Driver:
     from api.app import _driver
+
     if _driver is None:
         raise HTTPException(status_code=503, detail="Neo4j not initialized")
     return _driver
 
 
 # ── Schemas ─────────────────────────────────────────────────────────────────
+
 
 class HealthProfileInput(BaseModel):
     target_calories: int | None = None
@@ -239,6 +242,7 @@ class ChatResponse(BaseModel):
 
 # ── Intent → Cypher routing ─────────────────────────────────────────────────
 
+
 def route_b2b_intent(
     intent: str,
     entities: dict[str, Any],
@@ -255,7 +259,11 @@ def route_b2b_intent(
     customer_name = (entities.get("customer_name") or "").strip()
     cal_limit = entities.get("cal_upper_limit")
     nutrient_thresh = entities.get("nutrient_threshold") or {}
-    min_protein = nutrient_thresh.get("value") if nutrient_thresh.get("nutrient", "").lower() == "protein" and nutrient_thresh.get("operator") == "gt" else None
+    min_protein = (
+        nutrient_thresh.get("value")
+        if nutrient_thresh.get("nutrient", "").lower() == "protein" and nutrient_thresh.get("operator") == "gt"
+        else None
+    )
 
     if intent == "b2b_products_allergen_free":
         cypher, params = build_b2b_products_allergen_free(vendor_id, allergens, limit)
@@ -263,7 +271,9 @@ def route_b2b_intent(
 
     if intent == "b2b_products_for_diet":
         cypher, params = build_b2b_products_for_diet(
-            vendor_id, diets, limit,
+            vendor_id,
+            diets,
+            limit,
             max_calories=cal_limit,
             min_protein=min_protein,
         )
@@ -275,7 +285,9 @@ def route_b2b_intent(
 
     if intent == "b2b_customers_with_condition":
         cypher, params = build_b2b_customers_with_condition(
-            vendor_id, conditions, limit=min(limit, 50),
+            vendor_id,
+            conditions,
+            limit=min(limit, 50),
         )
         return cypher, params
 
@@ -283,7 +295,9 @@ def route_b2b_intent(
     if intent in ("b2b_product_compliance", "b2b_product_nutrition") and product_name:
         # Use search to find product by name, then product_intel or product_customers
         cypher, params = build_b2b_search_products(
-            vendor_id, limit=5, category=product_name,
+            vendor_id,
+            limit=5,
+            category=product_name,
         )
         return cypher, params
 
@@ -293,6 +307,7 @@ def route_b2b_intent(
             diets_used = diets or []
             if conditions:
                 from .b2b_cypher import _CONDITION_TO_DIET
+
                 for c in conditions:
                     for d in _CONDITION_TO_DIET.get(c, []):
                         if d and d not in diets_used:
@@ -316,6 +331,7 @@ def route_b2b_intent(
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
+
 def _run_cypher(driver: Driver, cypher: str, params: dict[str, Any]) -> list[dict[str, Any]]:
     database = os.getenv("NEO4J_DATABASE")
     try:
@@ -328,6 +344,7 @@ def _run_cypher(driver: Driver, cypher: str, params: dict[str, Any]) -> list[dic
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
+
 
 @router.post("/recommend-products", response_model=RecommendProductsResponse)
 async def recommend_products(req: RecommendProductsRequest):
@@ -454,6 +471,7 @@ async def search(req: SearchRequest):
     nlu = None
     if req.query:
         from chatbot.nlu import extract_hybrid_b2b
+
         nlu = extract_hybrid_b2b(req.query)
         ents = nlu.entities or {}
         # Merge entities into filters
@@ -511,7 +529,7 @@ async def search(req: SearchRequest):
             parts.append(f"max {e['cal_upper_limit']} cal")
         if e.get("nutrient_threshold"):
             nt = e["nutrient_threshold"]
-            parts.append(f"{nt.get('operator','')} {nt.get('value','')}g {nt.get('nutrient','')}")
+            parts.append(f"{nt.get('operator', '')} {nt.get('value', '')}g {nt.get('nutrient', '')}")
         query_interpretation = "; ".join(parts) if parts else f"Products matching: {req.query}"
 
     elapsed = (time.time() - start) * 1000
@@ -551,7 +569,9 @@ async def search_suggest(req: SearchSuggestRequest):
         for a in allergens:
             suggestions.append(f"Products free from {a.replace('_', ' ')}")
     if nt and nt.get("nutrient") and nt.get("value") is not None:
-        entities_found["nutrient_threshold"] = [f"{nt.get('operator','')} {nt.get('value','')}g {nt.get('nutrient','')}"]
+        entities_found["nutrient_threshold"] = [
+            f"{nt.get('operator', '')} {nt.get('value', '')}g {nt.get('nutrient', '')}"
+        ]
         op = nt.get("operator", "gt")
         val = nt.get("value", "")
         nut = nt.get("nutrient", "").lower()
@@ -608,7 +628,11 @@ async def substitutions(req: SubstitutionsRequest):
     elapsed = (time.time() - start) * 1000
     ctx = None
     if req.customer_id:
-        ctx = {"customer_id": req.customer_id, "allergens_excluded": [], "note": "Health-aware substitution"}
+        ctx = {
+            "customer_id": req.customer_id,
+            "allergens_excluded": [],
+            "note": "Health-aware substitution",
+        }
 
     return SubstitutionsResponse(
         original=None,
@@ -639,9 +663,7 @@ async def product_intel(req: ProductIntelRequest):
         r = rows[0]
         comp = r.get("diet_compatibility") or []
         for d in comp:
-            diet_compatibility.append(
-                DietCompatibilityItem(diet=str(d), compatible=True, reason=None)
-            )
+            diet_compatibility.append(DietCompatibilityItem(diet=str(d), compatible=True, reason=None))
         ingredients = [str(x) for x in (r.get("ingredients") or []) if x]
         allergens = [str(x) for x in (r.get("allergens") or []) if x]
         # Build customer_suitability from diets + allergens
@@ -671,11 +693,9 @@ async def chat(req: ChatRequest):
     """
     B2B domain chatbot. NLU → intent routing → Cypher → response.
     """
-    import uuid
     from chatbot.b2b_session import add_message, get_or_create_session
     from chatbot.nlu import extract_hybrid_b2b
 
-    start = time.time()
     session = get_or_create_session(req.session_id, req.vendor_id)
     session_id = session.session_id
     add_message(session_id, "user", req.message)
@@ -699,8 +719,14 @@ async def chat(req: ChatRequest):
             # Product-style rows (id, name, brand, score, ...)
             if any("id" in r and "name" in r for r in rows):
                 products = [
-                    {"id": str(r.get("id", "")), "name": str(r.get("name", "")), "brand": str(r.get("brand", "")),
-                     "score": float(r.get("score", 0.9)), "calories": r.get("calories"), "protein_g": r.get("protein_g")}
+                    {
+                        "id": str(r.get("id", "")),
+                        "name": str(r.get("name", "")),
+                        "brand": str(r.get("brand", "")),
+                        "score": float(r.get("score", 0.9)),
+                        "calories": r.get("calories"),
+                        "protein_g": r.get("protein_g"),
+                    }
                     for r in rows
                 ]
                 structured_data = {"products": products}
@@ -712,8 +738,11 @@ async def chat(req: ChatRequest):
             # Customer-style rows
             elif any("customer_id" in r or "customer_name" in r for r in rows):
                 customers = [
-                    {"customer_id": str(r.get("customer_id", "")), "customer_name": str(r.get("customer_name", "")),
-                     "email": str(r.get("email", ""))}
+                    {
+                        "customer_id": str(r.get("customer_id", "")),
+                        "customer_name": str(r.get("customer_name", "")),
+                        "email": str(r.get("email", "")),
+                    }
                     for r in rows
                 ]
                 structured_data = {"customers": customers}

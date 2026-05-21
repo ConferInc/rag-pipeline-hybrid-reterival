@@ -62,13 +62,15 @@ def fetch_graph_substitutes(
             out = []
             for row in rows:
                 if row["id"] and row["name"]:
-                    out.append({
-                        "ingredient_id": str(row["id"]),
-                        "name": str(row["name"]),
-                        "reason": str(row["reason"]) if row["reason"] else "Graph substitution",
-                        "source": "graph",
-                        "score": float(row["confidence"]) if row["confidence"] is not None else 1.0,
-                    })
+                    out.append(
+                        {
+                            "ingredient_id": str(row["id"]),
+                            "name": str(row["name"]),
+                            "reason": str(row["reason"]) if row["reason"] else "Graph substitution",
+                            "source": "graph",
+                            "score": float(row["confidence"]) if row["confidence"] is not None else 1.0,
+                        }
+                    )
             return out
     except Exception as e:
         logger.debug("fetch_graph_substitutes failed (expected if edges missing): %s", e)
@@ -85,7 +87,8 @@ def fetch_semantic_substitutes(
     database: str | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch semantically similar ingredients (excluding original)."""
-    from rag_pipeline.retrieval.service import retrieve_semantic, SemanticRetrievalRequest
+    from rag_pipeline.retrieval.service import SemanticRetrievalRequest, retrieve_semantic
+    from rag_pipeline.retrieval.types import RetrievalResult
 
     query = f"substitute for {ingredient_name} alternative"
     results: list[RetrievalResult] = retrieve_semantic(
@@ -109,13 +112,15 @@ def fetch_semantic_substitutes(
         # Exclude variants (e.g. "melted butter" when original is "butter")
         if orig_lower and orig_lower in name_lower and len(name_lower) <= len(orig_lower) + 15:
             continue
-        out.append({
-            "ingredient_id": rid,
-            "name": str(name),
-            "reason": "Semantically similar ingredient",
-            "source": "semantic",
-            "score": float(r.score_raw),
-        })
+        out.append(
+            {
+                "ingredient_id": rid,
+                "name": str(name),
+                "reason": "Semantically similar ingredient",
+                "source": "semantic",
+                "score": float(r.score_raw),
+            }
+        )
         if len(out) >= limit:
             break
     return out
@@ -280,13 +285,15 @@ Return a JSON array only, no markdown, e.g.:
         out = []
         for i, item in enumerate(arr[:limit]):
             if isinstance(item, dict) and item.get("name"):
-                out.append({
-                    "ingredient_id": "",
-                    "name": str(item["name"]),
-                    "reason": str(item.get("reason", "LLM suggestion")),
-                    "source": "llm",
-                    "score": 0.9 - (i * 0.1),
-                })
+                out.append(
+                    {
+                        "ingredient_id": "",
+                        "name": str(item["name"]),
+                        "reason": str(item.get("reason", "LLM suggestion")),
+                        "source": "llm",
+                        "score": 0.9 - (i * 0.1),
+                    }
+                )
         return out
     except Exception as e:
         logger.warning("llm_substitution_fallback failed: %s", e)
@@ -387,14 +394,16 @@ def run_ingredient_substitution(
             if not nc["substitute"] and nc["original"]:
                 nc["substitute"] = {}
 
-        substitutions.append({
-            "ingredient_id": sub_id,
-            "name": c.get("name", ""),
-            "reason": c.get("reason", ""),
-            "source": c.get("source", "unknown"),
-            "nutritionComparison": nc,
-            "allergenSafe": bool(candidates),
-        })
+        substitutions.append(
+            {
+                "ingredient_id": sub_id,
+                "name": c.get("name", ""),
+                "reason": c.get("reason", ""),
+                "source": c.get("source", "unknown"),
+                "nutritionComparison": nc,
+                "allergenSafe": bool(candidates),
+            }
+        )
 
     result: dict[str, Any] = {"substitutions": substitutions}
     if debug_info is not None:

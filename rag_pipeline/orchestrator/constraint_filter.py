@@ -24,9 +24,9 @@ Zero-results fallback:
 
 from __future__ import annotations
 
-import re
 import logging
 import os
+import re
 from typing import Any
 
 from neo4j import Driver
@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
 
 def _recipe_ids_from_fused(fused: list[dict[str, Any]]) -> list[str]:
     """
@@ -87,6 +88,7 @@ def _key_for_item(item: dict[str, Any]) -> str:
 # and the filter should be skipped to avoid dropping all results.
 _VALID_MEAL_TYPES: set[str] = {"breakfast", "lunch", "dinner", "snack", "dessert"}
 
+
 def _filter_course(
     fused: list[dict[str, Any]],
     course: str,
@@ -111,7 +113,8 @@ def _filter_course(
     if course_lower not in _VALID_MEAL_TYPES:
         logger.info(
             "Course filter skipped: '%s' is not a valid meal_type (valid: %s)",
-            course, ", ".join(sorted(_VALID_MEAL_TYPES)),
+            course,
+            ", ".join(sorted(_VALID_MEAL_TYPES)),
         )
         return fused
 
@@ -136,7 +139,9 @@ def _filter_course(
             dropped += 1
             logger.debug(
                 "Course filter dropped recipe: title=%s meal_type=%s required=%s",
-                item.get("title", "?"), meal_type, course,
+                item.get("title", "?"),
+                meal_type,
+                course,
             )
 
     if dropped:
@@ -145,6 +150,7 @@ def _filter_course(
 
 
 # ── Filter B — Allergen exclusion (one batched Neo4j call) ────────────────────
+
 
 def _fetch_allergen_violating_ids(
     driver: Driver,
@@ -189,7 +195,8 @@ def _fetch_allergen_violating_ids(
         # On DB error: fail open (keep all results) — better to show potentially
         # unsafe results than to silently return nothing.
         logger.warning(
-            "Allergen filter DB call failed — skipping filter: %s", e,
+            "Allergen filter DB call failed — skipping filter: %s",
+            e,
             extra={"component": "constraint_filter"},
         )
         return set()
@@ -248,7 +255,8 @@ def _filter_exclude_by_title(
         if any(term in title_lower for term in terms_to_check):
             logger.debug(
                 "Exclude-by-title dropped: title=%s (exclude=%s)",
-                title[:60], exclude_terms,
+                title[:60],
+                exclude_terms,
             )
             continue
         kept.append(item)
@@ -280,13 +288,7 @@ def _filter_allergens(
     for item in result:
         payload = item.get("payload") or {}
         nested = payload.get("payload") or {}
-        rid = str(
-            payload.get("id")
-            or payload.get("r.id")
-            or nested.get("id")
-            or nested.get("r.id")
-            or ""
-        )
+        rid = str(payload.get("id") or payload.get("r.id") or nested.get("id") or nested.get("r.id") or "")
 
         if not rid:
             # No UUID — cannot verify; keep but mark
@@ -300,7 +302,8 @@ def _filter_allergens(
             dropped += 1
             logger.info(
                 "Allergen filter dropped recipe: id=%s title=%s",
-                rid, item.get("title", "?"),
+                rid,
+                item.get("title", "?"),
             )
         else:
             kept.append(item)
@@ -308,7 +311,9 @@ def _filter_allergens(
     if dropped:
         logger.info(
             "Allergen filter: dropped %d / %d results (allergens=%s)",
-            dropped, len(result), allergens,
+            dropped,
+            len(result),
+            allergens,
         )
     return kept
 
@@ -335,7 +340,11 @@ def _fetch_calorie_violating_ids(
         return set()
 
     _CALORIE_NUTRIENT_NAMES = [
-        "Energy", "Calories/Energy", "Calories", "Energy (kcal)", "Energy, calories",
+        "Energy",
+        "Calories/Energy",
+        "Calories",
+        "Energy (kcal)",
+        "Energy, calories",
     ]
     cal_names_lc = [n.lower() for n in _CALORIE_NUTRIENT_NAMES]
     _uuid_re = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
@@ -429,7 +438,8 @@ def _fetch_calorie_violating_ids(
             violating.update(no_data)
             logger.info(
                 "Calorie filter: dropped %d recipes lacking calorie data (limit=%s)",
-                len(no_data), cal_limit,
+                len(no_data),
+                cal_limit,
                 extra={"component": "constraint_filter"},
             )
         else:
@@ -437,7 +447,8 @@ def _fetch_calorie_violating_ids(
             logger.warning(
                 "Calorie filter: no recipes matched in Neo4j (verified=%d, violating=%d). "
                 "Check Recipe.id format matches retrieval payload. Keeping results.",
-                len(verified_ok), len(violating),
+                len(verified_ok),
+                len(violating),
                 extra={"component": "constraint_filter", "recipe_count": len(recipe_set)},
             )
     return violating
@@ -473,7 +484,6 @@ def _filter_calories(
     recipe_ids = _recipe_ids_from_fused(fused)
     violating_ids = _fetch_calorie_violating_ids(driver, recipe_ids, cal_limit, database)
 
-    cal_f = float(cal_limit)
     kept: list[dict[str, Any]] = []
     dropped = 0
     for item in fused:
@@ -484,13 +494,16 @@ def _filter_calories(
             dropped += 1
             logger.debug(
                 "Calorie filter dropped (no ID): title=%s (limit=%s)",
-                item.get("title", "?"), cal_limit,
+                item.get("title", "?"),
+                cal_limit,
             )
         elif rid in violating_ids:
             dropped += 1
             logger.info(
                 "Calorie filter dropped recipe: id=%s title=%s (limit=%s)",
-                rid, item.get("title", "?"), cal_limit,
+                rid,
+                item.get("title", "?"),
+                cal_limit,
             )
         else:
             kept.append(item)
@@ -498,7 +511,9 @@ def _filter_calories(
     if dropped:
         logger.info(
             "Calorie filter: dropped %d / %d results (limit=%s kcal)",
-            dropped, len(fused), cal_limit,
+            dropped,
+            len(fused),
+            cal_limit,
             extra={
                 "component": "constraint_filter",
                 "counter": "calorie_filter_dropped_count",
@@ -510,6 +525,7 @@ def _filter_calories(
 
 # ── Filter D — Dietary preference compliance (FORBIDDEN relationships) ──────
 # Schema: (Dietary_Preferences)-[:FORBIDDEN]->(Ingredient), (Recipe)-[:USES_INGREDIENT]->(Ingredient)
+
 
 def _fetch_diet_violating_ids(
     driver: Driver,
@@ -577,16 +593,45 @@ def _fetch_diet_violating_ids(
 
 
 # Meat/fish terms — violates both Vegan and Vegetarian
-_MEAT_FISH_TERMS: frozenset[str] = frozenset({
-    "duck", "steak", "beef", "pork", "bacon", "ham", "sausage", "venison",
-    "lamb", "chicken", "turkey", "fish", "salmon", "tuna", "shrimp", "lobster",
-    "crab", "scallop", "meat", "seafood",
-})
+_MEAT_FISH_TERMS: frozenset[str] = frozenset(
+    {
+        "duck",
+        "steak",
+        "beef",
+        "pork",
+        "bacon",
+        "ham",
+        "sausage",
+        "venison",
+        "lamb",
+        "chicken",
+        "turkey",
+        "fish",
+        "salmon",
+        "tuna",
+        "shrimp",
+        "lobster",
+        "crab",
+        "scallop",
+        "meat",
+        "seafood",
+    }
+)
 # Extra terms for Vegan only (eggs, broths, etc. — vegetarian allows eggs/dairy)
-_VEGAN_EXTRA_TERMS: frozenset[str] = frozenset({
-    "egg", "eggs", "chicken broth", "beef broth", "fish broth", "bone broth",
-    "anchovy", "anchovies", "gelatin", "honey",
-})
+_VEGAN_EXTRA_TERMS: frozenset[str] = frozenset(
+    {
+        "egg",
+        "eggs",
+        "chicken broth",
+        "beef broth",
+        "fish broth",
+        "bone broth",
+        "anchovy",
+        "anchovies",
+        "gelatin",
+        "honey",
+    }
+)
 
 
 def _filter_diet_by_title(
@@ -624,7 +669,8 @@ def _filter_diet_by_title(
         if any(term in text_to_check for term in blocklist):
             logger.debug(
                 "Diet-by-title dropped: title=%s (diets=%s)",
-                str(title or "?")[:60], list(diet_set),
+                str(title or "?")[:60],
+                list(diet_set),
             )
             continue
         kept.append(item)
@@ -662,13 +708,16 @@ def _filter_diet_compliance(
             dropped += 1
             logger.debug(
                 "Diet filter dropped (no ID): title=%s (diets=%s)",
-                item.get("title", "?"), diets,
+                item.get("title", "?"),
+                diets,
             )
         elif rid in violating_ids:
             dropped += 1
             logger.info(
                 "Diet filter dropped recipe: id=%s title=%s (diets=%s)",
-                rid, item.get("title", "?"), diets,
+                rid,
+                item.get("title", "?"),
+                diets,
             )
         else:
             kept.append(item)
@@ -676,7 +725,9 @@ def _filter_diet_compliance(
     if dropped:
         logger.info(
             "Diet filter: dropped %d / %d results (diets=%s)",
-            dropped, len(fused), diets,
+            dropped,
+            len(fused),
+            diets,
         )
     return kept
 
@@ -685,10 +736,17 @@ def _filter_diet_compliance(
 
 # Nutrient names that use Recipe.percent_calories_* (percentage of calories).
 # Extractor passes values as percentages for these; Cypher layer matches.
-_PERCENT_CALORIE_NUTRIENTS: frozenset[str] = frozenset({
-    "protein", "total fat", "fat",
-    "carbohydrate", "carbohydrates", "carb", "carbs",
-})
+_PERCENT_CALORIE_NUTRIENTS: frozenset[str] = frozenset(
+    {
+        "protein",
+        "total fat",
+        "fat",
+        "carbohydrate",
+        "carbohydrates",
+        "carb",
+        "carbs",
+    }
+)
 
 
 def _fetch_nutrient_threshold_violating_ids(
@@ -789,7 +847,8 @@ def _fetch_nutrient_threshold_violating_ids(
             return {str(row["flagged_id"]) for row in rows}
     except Exception as e:
         logger.warning(
-            "Nutrient threshold filter DB call failed — skipping: %s", e,
+            "Nutrient threshold filter DB call failed — skipping: %s",
+            e,
             extra={"component": "constraint_filter", "nutrient": nutrient},
         )
         return set()
@@ -809,22 +868,14 @@ def _filter_nutrient_threshold(
         return fused
 
     recipe_ids = _recipe_ids_from_fused(fused)
-    violating_ids = _fetch_nutrient_threshold_violating_ids(
-        driver, recipe_ids, nutrient, operator, value, database
-    )
+    violating_ids = _fetch_nutrient_threshold_violating_ids(driver, recipe_ids, nutrient, operator, value, database)
 
     kept: list[dict[str, Any]] = []
     dropped = 0
     for item in fused:
         payload = item.get("payload") or {}
         nested = payload.get("payload") or {}
-        rid = str(
-            payload.get("id")
-            or payload.get("r.id")
-            or nested.get("id")
-            or nested.get("r.id")
-            or ""
-        )
+        rid = str(payload.get("id") or payload.get("r.id") or nested.get("id") or nested.get("r.id") or "")
         if not rid:
             item = dict(item)
             sources = list(item.get("sources", []))
@@ -836,7 +887,10 @@ def _filter_nutrient_threshold(
             dropped += 1
             logger.debug(
                 "Nutrient filter dropped: id=%s (nutrient=%s %s %s)",
-                rid, nutrient, operator, value,
+                rid,
+                nutrient,
+                operator,
+                value,
             )
         else:
             kept.append(item)
@@ -844,7 +898,11 @@ def _filter_nutrient_threshold(
     if dropped:
         logger.info(
             "Nutrient threshold filter: dropped %d / %d (nutrient=%s %s %s)",
-            dropped, len(fused), nutrient, operator, value,
+            dropped,
+            len(fused),
+            nutrient,
+            operator,
+            value,
         )
     return kept
 
@@ -961,11 +1019,11 @@ def apply_usda_food_group_bonus(
 # Maps health_goal strings to (payload_field, min_value, boost_multiplier).
 # percent_calories_protein/fat/carbs are inline Recipe properties (0–100).
 _GOAL_BOOST_MAP: dict[str, tuple[str, float, float]] = {
-    "weight_loss":    ("percent_calories_protein", 25.0, 1.15),
-    "muscle_gain":    ("percent_calories_protein", 30.0, 1.20),
-    "heart_health":   ("percent_calories_fat",     0.0,  1.0),   # handled via low-fat penalty below
-    "energy_boost":   ("percent_calories_carbs",   40.0, 1.10),
-    "balanced":       ("percent_calories_protein", 15.0, 1.05),
+    "weight_loss": ("percent_calories_protein", 25.0, 1.15),
+    "muscle_gain": ("percent_calories_protein", 30.0, 1.20),
+    "heart_health": ("percent_calories_fat", 0.0, 1.0),  # handled via low-fat penalty below
+    "energy_boost": ("percent_calories_carbs", 40.0, 1.10),
+    "balanced": ("percent_calories_protein", 15.0, 1.05),
 }
 
 
@@ -1024,10 +1082,7 @@ def contextual_rerank(
         base = float(item.get("rrf_score", item.get("score", 0.5)))
 
         payload = item.get("payload") or {}
-        recipe_id = str(
-            payload.get("id")
-            or item.get("key", "")
-        ).strip().lower()
+        recipe_id = str(payload.get("id") or item.get("key", "")).strip().lower()
 
         mult = 1.0
         if recipe_id and recipe_id in exclude_ids:
@@ -1090,6 +1145,7 @@ def contextual_rerank(
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
+
 
 def apply_hard_constraints(
     fused: list[dict[str, Any]],
@@ -1169,6 +1225,7 @@ def apply_hard_constraints(
 
 # ── Zero-results fallback message builder ─────────────────────────────────────
 
+
 def build_zero_results_message(
     entities: dict[str, Any],
     intent: str,
@@ -1207,9 +1264,7 @@ def build_zero_results_message(
         search_parts.append(f"under {cal_limit} calories")
     if nutrient_threshold and isinstance(nutrient_threshold, dict):
         op = "at least" if nutrient_threshold.get("operator") == "gt" else "at most"
-        search_parts.append(
-            f"with {op} {nutrient_threshold.get('value')} {nutrient_threshold.get('nutrient', '')}"
-        )
+        search_parts.append(f"with {op} {nutrient_threshold.get('value')} {nutrient_threshold.get('nutrient', '')}")
 
     searched_for = " ".join(search_parts)
 
@@ -1242,13 +1297,11 @@ def build_zero_results_message(
         lines.append(f"Try {hint_str} to find more options.")
         if allergens:
             lines.append(
-                f"Note: allergen restrictions ({', '.join(allergens)}) cannot be relaxed "
-                "and will always be enforced."
+                f"Note: allergen restrictions ({', '.join(allergens)}) cannot be relaxed and will always be enforced."
             )
     else:
         lines.append(
-            "Try broadening your search — for example, remove the meal type filter "
-            "or search for a different cuisine."
+            "Try broadening your search — for example, remove the meal type filter or search for a different cuisine."
         )
 
     # Clarifying question
@@ -1258,6 +1311,7 @@ def build_zero_results_message(
 
 
 # ── Safety compliance checker (for eval) ───────────────────────────────────────
+
 
 def check_safety_compliance(
     fused: list[dict[str, Any]],
@@ -1293,59 +1347,41 @@ def check_safety_compliance(
             meal_type_raw = payload.get("meal_type")
             meal_type = str(meal_type_raw).strip().lower() if meal_type_raw is not None else ""
             if not meal_type:
-                violations.append(
-                    f"course_missing_meal_type: required={course_lower} "
-                    f"(title={item.get('title', '?')})"
-                )
+                violations.append(f"course_missing_meal_type: required={course_lower} (title={item.get('title', '?')})")
             elif meal_type != course_lower:
                 violations.append(
-                    f"course_mismatch: meal_type={meal_type} required={course_lower} "
-                    f"(title={item.get('title', '?')})"
+                    f"course_mismatch: meal_type={meal_type} required={course_lower} (title={item.get('title', '?')})"
                 )
 
     # B: Allergens
     allergens: list[str] = entities.get("exclude_ingredient") or []
     if allergens and recipe_ids:
-        expanded = list(
-            {v for t in allergens for v in _expand_exclude_term_variants(t)}
-        )
-        violating_ids = _fetch_allergen_violating_ids(
-            driver, recipe_ids, expanded, database
-        )
+        expanded = list({v for t in allergens for v in _expand_exclude_term_variants(t)})
+        violating_ids = _fetch_allergen_violating_ids(driver, recipe_ids, expanded, database)
         for item in fused:
             rid = _get_recipe_id(item)
             if rid and rid in violating_ids:
-                violations.append(
-                    f"allergen_violation: recipe_id={rid} (exclude={allergens})"
-                )
+                violations.append(f"allergen_violation: recipe_id={rid} (exclude={allergens})")
 
     # C: Calorie limit
     cal_limit = entities.get("cal_upper_limit")
     if cal_limit is not None and recipe_ids:
-        calorie_violating = _fetch_calorie_violating_ids(
-            driver, recipe_ids, cal_limit, database
-        )
+        calorie_violating = _fetch_calorie_violating_ids(driver, recipe_ids, cal_limit, database)
         for item in fused:
             rid = _get_recipe_id(item)
             if rid and rid in calorie_violating:
-                violations.append(
-                    f"calorie_violation: recipe_id={rid} exceeds limit={cal_limit}"
-                )
+                violations.append(f"calorie_violation: recipe_id={rid} exceeds limit={cal_limit}")
 
     # D: Diet compliance
     diets = entities.get("diet") or []
     if isinstance(diets, str):
         diets = [diets] if diets else []
     if diets and recipe_ids:
-        diet_violating = _fetch_diet_violating_ids(
-            driver, recipe_ids, diets, database
-        )
+        diet_violating = _fetch_diet_violating_ids(driver, recipe_ids, diets, database)
         for item in fused:
             rid = _get_recipe_id(item)
             if rid and rid in diet_violating:
-                violations.append(
-                    f"diet_violation: recipe_id={rid} (diet={diets})"
-                )
+                violations.append(f"diet_violation: recipe_id={rid} (diet={diets})")
 
     # Title-based diet blocklist (vegan/vegetarian)
     if diets:
@@ -1363,7 +1399,7 @@ def check_safety_compliance(
                 )
                 if title:
                     title_lower = str(title).lower()
-                    if any(term in title_lower for term in _VEGAN_VEGETARIAN_BLOCKLIST):
+                    if any(term in title_lower for term in _VEGAN_VEGETARIAN_BLOCKLIST):  # noqa: F821
                         violations.append(
                             f"diet_title_violation: title contains meat/fish "
                             f"for diet={list(diet_set)} (title={str(title)[:60]})"
@@ -1378,10 +1414,5 @@ def _get_recipe_id(item: dict[str, Any]) -> str | None:
     """Extract recipe UUID from a fused item."""
     payload = item.get("payload") or {}
     nested = payload.get("payload") or {}
-    rid = (
-        payload.get("id")
-        or payload.get("r.id")
-        or nested.get("id")
-        or nested.get("r.id")
-    )
+    rid = payload.get("id") or payload.get("r.id") or nested.get("id") or nested.get("r.id")
     return str(rid) if rid else None

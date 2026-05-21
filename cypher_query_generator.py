@@ -39,7 +39,6 @@ NOTE: There is NO Course node and no BELONGS_TO_COURSE relationship.
 
 import json
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -114,9 +113,7 @@ def _build_find_recipe(entities: dict, limit: int = 50) -> tuple[str, dict]:
     # pattern that produced near-zero results on a sparse graph.
     diets = entities.get("diet", [])
     if diets:
-        clauses.append(
-            "OPTIONAL MATCH (cu_diet:B2C_Customer)-[:FOLLOWS_DIET]->(dp_diet:Dietary_Preferences)"
-        )
+        clauses.append("OPTIONAL MATCH (cu_diet:B2C_Customer)-[:FOLLOWS_DIET]->(dp_diet:Dietary_Preferences)")
         where_parts.append("dp_diet.name IN $diets")
         where_parts.append("EXISTS { MATCH (cu_diet)-[:SAVED|VIEWED]->(r) }")
         params["diets"] = [str(d) for d in diets]
@@ -202,9 +199,7 @@ def _build_find_recipe(entities: dict, limit: int = 50) -> tuple[str, dict]:
     # diet-matching users who saved/viewed each recipe. When no diets are
     # supplied (cu_diet never bound), count() returns 0 for all recipes.
     # Recipes with no collaborative data still appear — just ranked lower.
-    clauses.append(
-        "WITH r, count(DISTINCT cu_diet) AS collab_score"
-    )
+    clauses.append("WITH r, count(DISTINCT cu_diet) AS collab_score")
     clauses.append(
         "RETURN r.id AS id, r.title AS title, r.meal_type AS meal_type,\n"
         "       r.total_time_minutes AS total_time_minutes,\n"
@@ -470,21 +465,25 @@ def _build_get_substitution_suggestion(entities: dict) -> tuple[str, dict]:
     ]
 
     if diet_context:
-        cypher_lines.extend([
-            "MATCH (diet:Dietary_Preferences {name: $diet_context})",
-            "WHERE NOT EXISTS {",
-            "  MATCH (diet)-[:FORBIDDEN]->(candidate)",
-            "}",
-        ])
+        cypher_lines.extend(
+            [
+                "MATCH (diet:Dietary_Preferences {name: $diet_context})",
+                "WHERE NOT EXISTS {",
+                "  MATCH (diet)-[:FORBIDDEN]->(candidate)",
+                "}",
+            ]
+        )
         params["diet_context"] = diet_context
 
-    cypher_lines.extend([
-        "RETURN candidate.name AS suggested_substitute,",
-        "       candidate.calories AS calories_per_100g,",
-        "       candidate.protein_g AS protein_g_per_100g",
-        "ORDER BY candidate.name",
-        "LIMIT 10",
-    ])
+    cypher_lines.extend(
+        [
+            "RETURN candidate.name AS suggested_substitute,",
+            "       candidate.calories AS calories_per_100g,",
+            "       candidate.protein_g AS protein_g_per_100g",
+            "ORDER BY candidate.name",
+            "LIMIT 10",
+        ]
+    )
 
     return "\n".join(cypher_lines), params
 
@@ -507,7 +506,7 @@ def _build_rank_results(entities: dict) -> tuple[str, dict]:
     # Map criteria to expression + sort direction
     criterion_map = {
         "protein_to_calorie_ratio": ("r.percent_calories_protein", "DESC"),
-        "lowest_fat":               ("r.percent_calories_fat",     "ASC"),
+        "lowest_fat": ("r.percent_calories_fat", "ASC"),
         "lowest_calories": None,  # handled specially below (needs NutritionValue join)
     }
 
@@ -522,9 +521,7 @@ def _build_rank_results(entities: dict) -> tuple[str, dict]:
             "ORDER BY calories ASC"
         )
     else:
-        prop, direction = criterion_map.get(
-            criterion, ("r.percent_calories_protein", "DESC")
-        )
+        prop, direction = criterion_map.get(criterion, ("r.percent_calories_protein", "DESC"))
         cypher = (
             "MATCH (r:Recipe)\n"
             "WHERE r.id IN $recipe_ids\n"
@@ -625,11 +622,9 @@ def _build_nutrient_in_foods(entities: dict) -> tuple[str, dict]:
         "vitamin d": ("i.vitamin_d_mcg", "vitamin_d_mcg"),
     }
     prop_expr = None
-    prop_alias = None
     for k, (expr, alias) in prop_map.items():
         if k in nutrient_lower:
             prop_expr = expr
-            prop_alias = alias
             break
     if prop_expr:
         cypher = (
@@ -701,12 +696,7 @@ def _build_product_nutrients(entities: dict) -> tuple[str, dict]:
             "p.name AS product, p.calories, p.protein_g, p.total_fat_g, p.total_carbs_g, "
             "p.dietary_fiber_g, p.sodium_mg, p.iron_mg, p.calcium_mg"
         )
-    cypher = (
-        "MATCH (p:Product)\n"
-        "WHERE toLower(p.name) CONTAINS toLower($product_name)\n"
-        f"RETURN {cols}\n"
-        "LIMIT 5"
-    )
+    cypher = f"MATCH (p:Product)\nWHERE toLower(p.name) CONTAINS toLower($product_name)\nRETURN {cols}\nLIMIT 5"
     params["product_name"] = product
     return cypher, params
 
@@ -747,28 +737,28 @@ def _build_noop_cypher(entities: dict) -> tuple[str, dict]:
 # ---------------------------------------------------------------------------
 
 _INTENT_BUILDERS = {
-    "find_recipe":                  _build_find_recipe,
-    "find_recipe_by_pantry":        _build_find_recipe_by_pantry,
-    "similar_recipes":              _build_noop_cypher,
-    "recipes_for_cuisine":          _build_recipes_for_cuisine,
-    "recipes_by_nutrient":          _build_recipes_by_nutrient,
-    "get_nutritional_info":         _build_get_nutritional_info,
-    "nutrient_in_foods":            _build_nutrient_in_foods,
-    "nutrient_category":            _build_nutrient_category,
-    "compare_foods":                _build_compare_foods,
-    "check_diet_compliance":        _build_check_diet_compliance,
-    "check_substitution":           _build_check_substitution,
-    "get_substitution_suggestion":  _build_get_substitution_suggestion,
-    "similar_ingredients":          _build_noop_cypher,
-    "ingredient_in_recipes":        _build_ingredient_in_recipes,
-    "ingredient_nutrients":         _build_ingredient_nutrients,
-    "find_product":                 _build_noop_cypher,
-    "product_nutrients":            _build_product_nutrients,
-    "cuisine_recipes":              _build_recipes_for_cuisine,
-    "cuisine_hierarchy":            _build_cuisine_hierarchy,
-    "cross_reactive_allergens":     _build_cross_reactive_allergens,
-    "general_nutrition":            _build_noop_cypher,
-    "out_of_scope":                 _build_noop_cypher,
+    "find_recipe": _build_find_recipe,
+    "find_recipe_by_pantry": _build_find_recipe_by_pantry,
+    "similar_recipes": _build_noop_cypher,
+    "recipes_for_cuisine": _build_recipes_for_cuisine,
+    "recipes_by_nutrient": _build_recipes_by_nutrient,
+    "get_nutritional_info": _build_get_nutritional_info,
+    "nutrient_in_foods": _build_nutrient_in_foods,
+    "nutrient_category": _build_nutrient_category,
+    "compare_foods": _build_compare_foods,
+    "check_diet_compliance": _build_check_diet_compliance,
+    "check_substitution": _build_check_substitution,
+    "get_substitution_suggestion": _build_get_substitution_suggestion,
+    "similar_ingredients": _build_noop_cypher,
+    "ingredient_in_recipes": _build_ingredient_in_recipes,
+    "ingredient_nutrients": _build_ingredient_nutrients,
+    "find_product": _build_noop_cypher,
+    "product_nutrients": _build_product_nutrients,
+    "cuisine_recipes": _build_recipes_for_cuisine,
+    "cuisine_hierarchy": _build_cuisine_hierarchy,
+    "cross_reactive_allergens": _build_cross_reactive_allergens,
+    "general_nutrition": _build_noop_cypher,
+    "out_of_scope": _build_noop_cypher,
 }
 
 
@@ -804,10 +794,7 @@ def generate_cypher_query(
     """
     builder = _INTENT_BUILDERS.get(intent)
     if builder is None:
-        raise ValueError(
-            f"Unknown intent '{intent}'. "
-            f"Supported intents: {sorted(_INTENT_BUILDERS.keys())}"
-        )
+        raise ValueError(f"Unknown intent '{intent}'. Supported intents: {sorted(_INTENT_BUILDERS.keys())}")
     if intent in _RECIPE_INTENT_BUILDERS:
         return builder(entities, limit=limit)
     return builder(entities)
@@ -843,7 +830,8 @@ if __name__ == "__main__":
     demos = [
         {
             "label": "find_recipe — Keto main dish with Chicken, no dairy, <600 kcal",
-            'intent': 'find_recipe', 'entities': {'include_ingredient': ['olive oil']},
+            "intent": "find_recipe",
+            "entities": {"include_ingredient": ["olive oil"]},
         },
         {
             "label": "find_recipe — High-protein breakfast with nutrient_threshold",

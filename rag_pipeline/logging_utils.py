@@ -23,9 +23,7 @@ COMPONENT = "component"
 REQUEST_ID = "request_id"
 
 # Context var for request_id; set at CLI/API entry, available to all loggers
-_request_id_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "request_id", default=None
-)
+_request_id_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_id", default=None)
 
 
 def set_request_id(request_id: str | None) -> None:
@@ -46,6 +44,7 @@ class RequestIdFilter(logging.Filter):
         if rid is not None:
             record.request_id = rid
         return True
+
 
 # Default truncation for PII-sensitive fields
 DEFAULT_TRUNCATE_QUERY_MAX = 200
@@ -92,10 +91,28 @@ class JsonFormatter(logging.Formatter):
     """
 
     _SKIP_ATTRS = {
-        "name", "msg", "args", "created", "filename", "funcName", "levelname",
-        "levelno", "lineno", "module", "msecs", "pathname", "process",
-        "processName", "relativeCreated", "stack_info", "exc_info", "exc_text",
-        "thread", "threadName", "message", "taskName",
+        "name",
+        "msg",
+        "args",
+        "created",
+        "filename",
+        "funcName",
+        "levelname",
+        "levelno",
+        "lineno",
+        "module",
+        "msecs",
+        "pathname",
+        "process",
+        "processName",
+        "relativeCreated",
+        "stack_info",
+        "exc_info",
+        "exc_text",
+        "thread",
+        "threadName",
+        "message",
+        "taskName",
     }
 
     def format(self, record: logging.LogRecord) -> str:
@@ -140,7 +157,6 @@ def setup_pipeline_logging(
 
     log_level = level or cfg.get("level", "INFO")
     fmt = format_type or cfg.get("format", "human")
-    truncate_max = cfg.get("truncate_query_max", DEFAULT_TRUNCATE_QUERY_MAX)
 
     root = logging.getLogger()
     if not force and root.handlers:
@@ -156,9 +172,7 @@ def setup_pipeline_logging(
     if fmt == "json":
         handler.setFormatter(JsonFormatter())
     else:
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        )
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
 
     if not root.handlers:
         root.addHandler(handler)
