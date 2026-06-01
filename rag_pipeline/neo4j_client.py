@@ -3,8 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from neo4j import GraphDatabase
-from neo4j import Driver
+from neo4j import Driver, GraphDatabase
 
 
 @dataclass(frozen=True)
@@ -43,4 +42,3 @@ def create_neo4j_driver(
     if connection_timeout is not None:
         kwargs["connection_timeout"] = connection_timeout
     return GraphDatabase.driver(settings.uri, auth=(settings.username, settings.password), **kwargs)
-

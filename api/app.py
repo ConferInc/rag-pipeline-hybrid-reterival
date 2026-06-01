@@ -16,51 +16,20 @@ import os
 import random
 import re
 import time
-from itertools import combinations
 from contextlib import asynccontextmanager
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
 import yaml
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Header, Depends, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from neo4j import Driver
 from openai import OpenAI
 from pydantic import BaseModel, Field
-
-from rag_pipeline.augmentation.fusion import apply_rrf
-from rag_pipeline.augmentation.response_sanitizer import sanitize_response
-from rag_pipeline.config import load_embedding_config
-from rag_pipeline.embeddings.caching_embedder import CachingQueryEmbedder
-from rag_pipeline.embeddings.openai_embedder import OpenAIQueryEmbedder
-from rag_pipeline.neo4j_client import create_neo4j_driver, neo4j_settings_from_env
-from rag_pipeline.profile import aggregate_profile, get_household_id_for_customer, get_household_type, resolve_profile_for_recommendation
-from rag_pipeline.nlu.intents import CHATBOT_DATA_INTENTS, DATA_INTENTS_NEEDING_RETRIEVAL
-from rag_pipeline.orchestrator.constraint_filter import (
-    apply_hard_constraints,
-    apply_usda_food_group_bonus,
-    build_zero_results_message,
-    contextual_rerank,
-)
-from rag_pipeline.orchestrator.cypher_runner import run_cypher_retrieval
-from rag_pipeline.orchestrator.profile_enrichment import merge_profile_into_entities
-from rag_pipeline.orchestrator.orchestrator import orchestrate, OrchestratorResult
-from rag_pipeline.orchestrator.food_group_audit import (
-    audit_candidate_set,
-    build_audit_warnings,
-)
-from rag_pipeline.orchestrator.usda_guidelines import (
-    guidelines_to_jsonable,
-    infer_food_groups_for_ingredients,
-    load_usda_guidelines,
-    load_usda_soft_guidelines,
-)
-from rag_pipeline.retrieval.service import retrieve_semantic, SemanticRetrievalRequest
-from rag_pipeline.retrieval.similar_constraint import retrieve_recipes_from_similar_constraint_users
-from rag_pipeline.retrieval.structural import get_seed_embedding, structural_search_with_expansion
 
 from chatbot.action_orchestrator import (
     is_confirmation_message,
@@ -83,12 +52,48 @@ from chatbot.response_generator import (
     generate_chat_response,
     get_template_response,
 )
-from chatbot.session import get_or_create_session, cleanup_expired
-from .ingredient_substitution import run_ingredient_substitution
-from .product_recommendation import run_recommend_products, run_recommend_alternatives
-from .notification_generator import generate_notification
-from .rate_limit import check_rate_limit
+from chatbot.session import cleanup_expired, get_or_create_session
+from rag_pipeline.augmentation.fusion import apply_rrf
+from rag_pipeline.augmentation.response_sanitizer import sanitize_response
+from rag_pipeline.config import load_embedding_config
+from rag_pipeline.embeddings.caching_embedder import CachingQueryEmbedder
+from rag_pipeline.embeddings.openai_embedder import OpenAIQueryEmbedder
+from rag_pipeline.neo4j_client import create_neo4j_driver, neo4j_settings_from_env
+from rag_pipeline.nlu.intents import CHATBOT_DATA_INTENTS, DATA_INTENTS_NEEDING_RETRIEVAL
+from rag_pipeline.orchestrator.constraint_filter import (
+    apply_hard_constraints,
+    apply_usda_food_group_bonus,
+    build_zero_results_message,
+    contextual_rerank,
+)
+from rag_pipeline.orchestrator.cypher_runner import run_cypher_retrieval
+from rag_pipeline.orchestrator.food_group_audit import (
+    audit_candidate_set,
+    build_audit_warnings,
+)
+from rag_pipeline.orchestrator.orchestrator import OrchestratorResult, orchestrate
+from rag_pipeline.orchestrator.profile_enrichment import merge_profile_into_entities
+from rag_pipeline.orchestrator.usda_guidelines import (
+    guidelines_to_jsonable,
+    infer_food_groups_for_ingredients,
+    load_usda_guidelines,
+    load_usda_soft_guidelines,
+)
+from rag_pipeline.profile import (
+    aggregate_profile,
+    get_household_id_for_customer,
+    get_household_type,
+    resolve_profile_for_recommendation,
+)
+from rag_pipeline.retrieval.service import SemanticRetrievalRequest, retrieve_semantic
+from rag_pipeline.retrieval.similar_constraint import retrieve_recipes_from_similar_constraint_users
+from rag_pipeline.retrieval.structural import get_seed_embedding, structural_search_with_expansion
+
 from .b2b import router as b2b_router
+from .ingredient_substitution import run_ingredient_substitution
+from .notification_generator import generate_notification
+from .product_recommendation import run_recommend_alternatives, run_recommend_products
+from .rate_limit import check_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +223,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 # ── Auth ───────────────────────────────────────────────────────────────────
 
+
 async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
     """
     Service-to-service authentication.
@@ -237,15 +243,22 @@ app.include_router(b2b_router, dependencies=[Depends(verify_api_key)])
 
 # ── Request/Response Schemas ───────────────────────────────────────────────
 
+
 class SearchRequest(BaseModel):
     """Natural language search query from the B2C search page."""
+
     query: str = Field(..., max_length=500, description="User's search text")
     customer_id: str | None = Field(None, description="B2C customer UUID (for personalization)")
     filters: dict[str, Any] = Field(default_factory=dict, description="Structured filters")
     limit: int = Field(20, ge=1, le=50)
     household_id: str | None = Field(None, description="Household UUID for family-scoped profile resolution")
-    scope: str | None = Field(None, description="Profile scope: individual | couple | family (default inferred from household_type)")
-    household_type: str | None = Field(None, description="Household type: individual | couple | family (overrides Neo4j lookup)")
+    scope: str | None = Field(
+        None,
+        description="Profile scope: individual | couple | family (default inferred from household_type)",
+    )
+    household_type: str | None = Field(
+        None, description="Household type: individual | couple | family (overrides Neo4j lookup)"
+    )
     member_id: str | None = Field(None, description="Active household member UUID (when different from customer_id)")
     total_members: int | None = Field(None, description="Number of household members")
     member_profile: dict[str, Any] | None = Field(
@@ -257,12 +270,18 @@ class SearchRequest(BaseModel):
 
 class FeedRequest(BaseModel):
     """Personalized recipe feed — no user query needed, driven by customer profile."""
+
     customer_id: str = Field(..., description="B2C customer UUID (required for personalization)")
     meal_type: str | None = Field(None, description="Optional meal type hint: breakfast/lunch/dinner/snack")
     limit: int = Field(50, ge=1, le=50)
     household_id: str | None = Field(None, description="Household UUID for family-scoped profile resolution")
-    scope: str | None = Field(None, description="Profile scope: individual | couple | family (default inferred from household_type)")
-    household_type: str | None = Field(None, description="Household type: individual | couple | family (overrides Neo4j lookup)")
+    scope: str | None = Field(
+        None,
+        description="Profile scope: individual | couple | family (default inferred from household_type)",
+    )
+    household_type: str | None = Field(
+        None, description="Household type: individual | couple | family (overrides Neo4j lookup)"
+    )
     member_id: str | None = Field(None, description="Active household member UUID (when different from customer_id)")
     total_members: int | None = Field(None, description="Number of household members")
     preferences: dict[str, Any] | None = Field(
@@ -282,14 +301,22 @@ class MealCandidateRequest(BaseModel):
     Supports household scope: individual (self), couple (both primary adults), family (all members).
     B2C can send members[] (per-member profiles) or member_profile/household_id; Neo4j used as fallback.
     """
+
     customer_id: str = Field(..., description="B2C customer UUID")
-    meal_history: list[str] = Field(default_factory=list, description="Recipe IDs to exclude (e.g. from PostgreSQL meal_logs)")
+    meal_history: list[str] = Field(
+        default_factory=list, description="Recipe IDs to exclude (e.g. from PostgreSQL meal_logs)"
+    )
     meal_type: str | None = Field(None, description="Optional: breakfast/lunch/dinner/snack")
     exclude_ids: list[str] = Field(default_factory=list, description="Additional recipe IDs to exclude (e.g. for swap)")
     limit: int = Field(50, ge=1, le=100)
     household_id: str | None = Field(None, description="Household UUID for family-scoped profile resolution")
-    scope: str | None = Field(None, description="Profile scope: individual | couple | family (default inferred from household_type)")
-    household_type: str | None = Field(None, description="Household type: individual | couple | family (overrides Neo4j lookup)")
+    scope: str | None = Field(
+        None,
+        description="Profile scope: individual | couple | family (default inferred from household_type)",
+    )
+    household_type: str | None = Field(
+        None, description="Household type: individual | couple | family (overrides Neo4j lookup)"
+    )
     member_id: str | None = Field(None, description="Active household member UUID")
     total_members: int | None = Field(None, description="Number of household members")
     members: list[dict[str, Any]] | None = Field(
@@ -313,6 +340,7 @@ class MealCandidateRequest(BaseModel):
 
 class MealCandidateItem(BaseModel):
     """Single recipe candidate with score and reasons."""
+
     recipe_id: str
     title: str
     score: float
@@ -337,16 +365,23 @@ class MealCandidateResponse(BaseModel):
         None,
         description="Structured insufficiency explanation when USDA strict mode is enabled and coverage is infeasible.",
     )
-    daily_calorie_target: float | None = Field(None, description="Profile daily calorie target used for plan calibration")
-    selected_total_calories: float | None = Field(None, description="Sum of calories for selected meals in this response")
+    daily_calorie_target: float | None = Field(
+        None, description="Profile daily calorie target used for plan calibration"
+    )
+    selected_total_calories: float | None = Field(
+        None, description="Sum of calories for selected meals in this response"
+    )
     calorie_delta: float | None = Field(None, description="selected_total_calories - daily_calorie_target")
     calorie_tolerance: float | None = Field(None, description="Allowed absolute deviation for calorie compliance")
-    calorie_compliance: str | None = Field(None, description='"adequate" | "partial" based on calorie_delta and tolerance')
+    calorie_compliance: str | None = Field(
+        None, description='"adequate" | "partial" based on calorie_delta and tolerance'
+    )
     calorie_phase: str = Field("phase_1_2_3", description="Calorie calibration implementation phase marker")
 
 
 class RecommendationResult(BaseModel):
     """Single recommendation with explainability."""
+
     id: str
     score: float
     reasons: list[str] = Field(default_factory=list)
@@ -364,8 +399,10 @@ class SearchResponse(BaseModel):
 
 # ── Ingredient substitution schemas ────────────────────────────────────────
 
+
 class IngredientSubstitutionRequest(BaseModel):
     """Request for POST /substitutions/ingredient."""
+
     ingredient_id: str = Field(..., description="Ingredient UUID or elementId")
     ingredient_name: str | None = Field(None, description="Ingredient name (optional, resolved from id if missing)")
     customer_allergens: list[str] = Field(default_factory=list, description="Allergen IDs or names for safety filter")
@@ -376,6 +413,7 @@ class IngredientSubstitutionRequest(BaseModel):
 
 class IngredientSubstitutionItem(BaseModel):
     """Single substitute suggestion."""
+
     ingredient_id: str
     name: str
     reason: str
@@ -386,14 +424,17 @@ class IngredientSubstitutionItem(BaseModel):
 
 class IngredientSubstitutionResponse(BaseModel):
     """Response from POST /substitutions/ingredient."""
+
     substitutions: list[IngredientSubstitutionItem]
     debug_info: dict[str, Any] | None = None
 
 
 # ── Product recommendation schemas ──────────────────────────────────────────
 
+
 class ProductsRequest(BaseModel):
     """Request for POST /recommend/products (grocery list)."""
+
     ingredient_ids: list[str] = Field(..., description="Ingredient UUIDs to match products for")
     customer_allergens: list[str] = Field(default_factory=list, description="Allergen IDs/names for safety filter")
     quality_preferences: list[str] | None = Field(
@@ -415,6 +456,7 @@ class ProductsRequest(BaseModel):
 
 class ProductMatchItem(BaseModel):
     """Single product match for an ingredient."""
+
     ingredient_id: str
     product_id: str
     product_name: str
@@ -430,13 +472,16 @@ class ProductMatchItem(BaseModel):
 
 class ProductsResponse(BaseModel):
     """Response from POST /recommend/products."""
+
     products: list[ProductMatchItem]
 
 
 # ── Notification generation (PRD-29) ────────────────────────────────────────
 
+
 class NotificationGenerateRequest(BaseModel):
     """Request for POST /notifications/generate (PRD-29)."""
+
     customer_id: str = Field(..., description="B2C customer UUID")
     trigger_type: str = Field(..., description="e.g. missed_breakfast, suggest_breakfast")
     meal_log_summary: dict[str, Any] = Field(default_factory=dict)
@@ -446,6 +491,7 @@ class NotificationGenerateRequest(BaseModel):
 
 class NotificationGenerateResponse(BaseModel):
     """Response from POST /notifications/generate."""
+
     title: str
     body: str
     action_url: str
@@ -455,6 +501,7 @@ class NotificationGenerateResponse(BaseModel):
 
 class AlternativesRequest(BaseModel):
     """Request for POST /recommend/alternatives (scanner)."""
+
     product_id: str = Field(..., description="Scanned product UUID")
     customer_allergens: list[str] = Field(default_factory=list, description="Allergen IDs/names for safety filter")
     limit: int = Field(5, ge=1, le=20)
@@ -462,6 +509,7 @@ class AlternativesRequest(BaseModel):
 
 class AlternativeItem(BaseModel):
     """Single alternative product."""
+
     product_id: str
     name: str
     brand: str = ""
@@ -475,19 +523,24 @@ class AlternativeItem(BaseModel):
 
 class AlternativesResponse(BaseModel):
     """Response from POST /recommend/alternatives."""
+
     alternatives: list[AlternativeItem]
 
 
 # ── Chatbot schemas ────────────────────────────────────────────────────────
 
+
 class ChatProcessRequest(BaseModel):
     """Chatbot message from Express (POST /chat/process)."""
+
     message: str = Field(..., min_length=1, max_length=1000, description="User message")
     customer_id: str = Field(..., description="B2C customer UUID")
     session_id: str | None = Field(None, description="Existing session UUID (null for new session)")
     display_name: str | None = Field(None, description="Customer name from auth/PostgreSQL if Neo4j has none")
     household_id: str | None = Field(None, description="Household UUID for family-scoped profile resolution")
-    household_type: str | None = Field(None, description="Household type: individual | couple | family (overrides Neo4j lookup)")
+    household_type: str | None = Field(
+        None, description="Household type: individual | couple | family (overrides Neo4j lookup)"
+    )
     member_id: str | None = Field(None, description="Active household member UUID (for profile resolution)")
     total_members: int | None = Field(None, description="Number of household members")
     member_profile: dict[str, Any] | None = Field(
@@ -499,6 +552,7 @@ class ChatProcessRequest(BaseModel):
 
 class ChatRecipeItem(BaseModel):
     """Recipe returned in chat response (e.g. find_recipe intent)."""
+
     id: str
     title: str
     score: float = 0.0
@@ -506,6 +560,7 @@ class ChatRecipeItem(BaseModel):
 
 class PendingActionResponse(BaseModel):
     """Action awaiting user confirmation."""
+
     type: str = Field(..., description="Action type, e.g. log_meal, plan_meals")
     params: dict[str, Any] = Field(default_factory=dict, description="Action parameters")
     action_id: str | None = Field(None, description="Unique ID for matching confirmation")
@@ -513,6 +568,7 @@ class PendingActionResponse(BaseModel):
 
 class ChatProcessResponse(BaseModel):
     """Chatbot response to Express."""
+
     response: str = Field(..., description="Natural language or template response")
     intent: str = Field(..., description="Detected intent")
     session_id: str = Field(..., description="Session UUID for follow-up messages")
@@ -530,6 +586,7 @@ class ChatProcessResponse(BaseModel):
 
 
 # ── Profile helpers (feed / meal-candidates) ───────────────────────────────
+
 
 def fetch_customer_profile(
     driver: Driver,
@@ -581,8 +638,12 @@ def fetch_customer_profile(
                 logger.warning("fetch_customer_profile: no record for customer_id=%s", customer_id)
                 return {
                     "display_name": None,
-                    "diets": [], "allergens": [], "health_conditions": [],
-                    "health_goal": None, "activity_level": None, "recent_recipes": [],
+                    "diets": [],
+                    "allergens": [],
+                    "health_conditions": [],
+                    "health_goal": None,
+                    "activity_level": None,
+                    "recent_recipes": [],
                 }
             name = record["display_name"]
             if isinstance(name, str) and name.strip():
@@ -592,20 +653,24 @@ def fetch_customer_profile(
             diets_raw = record["diets"] or []
             diets_clean = [d for d in diets_raw if d and isinstance(d, str)]
             return {
-                "display_name":    name,
-                "diets":           diets_clean,
-                "allergens":       list(record["allergens"] or []),
+                "display_name": name,
+                "diets": diets_clean,
+                "allergens": list(record["allergens"] or []),
                 "health_conditions": list(record["health_conditions"] or []),
-                "health_goal":     record["health_goal"],
-                "activity_level":  record["activity_level"],
-                "recent_recipes":  list(record["recent_recipes"] or []),
+                "health_goal": record["health_goal"],
+                "activity_level": record["activity_level"],
+                "recent_recipes": list(record["recent_recipes"] or []),
             }
     except Exception as e:
         logger.warning("fetch_customer_profile failed: %s", e)
         return {
             "display_name": None,
-            "diets": [], "allergens": [], "health_conditions": [],
-            "health_goal": None, "activity_level": None, "recent_recipes": [],
+            "diets": [],
+            "allergens": [],
+            "health_conditions": [],
+            "health_goal": None,
+            "activity_level": None,
+            "recent_recipes": [],
         }
 
 
@@ -615,6 +680,7 @@ def _preferences_to_profile(preferences: dict[str, Any]) -> dict[str, Any]:
     Supports: dietIds/diets, allergenIds/allergens, conditionIds/health_conditions.
     B2C may send IDs or names; we use names when present, else IDs (Cypher may match both).
     """
+
     def _list(v: Any) -> list[str]:
         if not v:
             return []
@@ -623,8 +689,12 @@ def _preferences_to_profile(preferences: dict[str, Any]) -> dict[str, Any]:
         return []
 
     diets = _list(preferences.get("diets") or preferences.get("dietNames") or preferences.get("dietIds"))
-    allergens = _list(preferences.get("allergens") or preferences.get("allergenNames") or preferences.get("allergenIds"))
-    conditions = _list(preferences.get("health_conditions") or preferences.get("conditionNames") or preferences.get("conditionIds"))
+    allergens = _list(
+        preferences.get("allergens") or preferences.get("allergenNames") or preferences.get("allergenIds")
+    )
+    conditions = _list(
+        preferences.get("health_conditions") or preferences.get("conditionNames") or preferences.get("conditionIds")
+    )
     dislikes = _list(preferences.get("dislikes"))
     # dislikes can be added to exclude_ingredient; for now we merge into allergens-like exclusion
     exclude = list(set(allergens) | set(dislikes)) if dislikes else allergens
@@ -640,7 +710,9 @@ def _preferences_to_profile(preferences: dict[str, Any]) -> dict[str, Any]:
         "allergens": exclude,
         "health_conditions": conditions,
         "health_goal": preferences.get("health_goal") if isinstance(preferences.get("health_goal"), str) else None,
-        "activity_level": preferences.get("activity_level") if isinstance(preferences.get("activity_level"), str) else None,
+        "activity_level": preferences.get("activity_level")
+        if isinstance(preferences.get("activity_level"), str)
+        else None,
         "recent_recipes": [],
         "household_type": ht,
     }
@@ -651,7 +723,16 @@ def _merge_b2c_with_neo4j(b2c: dict[str, Any], neo4j: dict[str, Any]) -> dict[st
     Merge B2C profile with Neo4j profile. B2C takes precedence when non-empty; Neo4j fills gaps.
     """
     result: dict[str, Any] = {}
-    for k in ("display_name", "diets", "allergens", "health_conditions", "health_goal", "activity_level", "recent_recipes", "household_type"):
+    for k in (
+        "display_name",
+        "diets",
+        "allergens",
+        "health_conditions",
+        "health_goal",
+        "activity_level",
+        "recent_recipes",
+        "household_type",
+    ):
         b_val = b2c.get(k)
         n_val = neo4j.get(k)
         if k in ("diets", "allergens", "health_conditions", "recent_recipes"):
@@ -662,7 +743,9 @@ def _merge_b2c_with_neo4j(b2c: dict[str, Any], neo4j: dict[str, Any]) -> dict[st
             else:
                 result[k] = []
         elif k == "household_type":
-            result[k] = b_val if (b_val and isinstance(b_val, str)) else (n_val if (n_val and isinstance(n_val, str)) else None)
+            result[k] = (
+                b_val if (b_val and isinstance(b_val, str)) else (n_val if (n_val and isinstance(n_val, str)) else None)
+            )
         else:
             result[k] = b_val if (b_val is not None and b_val != "") else n_val
     return result
@@ -773,7 +856,10 @@ def _resolve_profile(
     effective_scope = (scope or "").strip() or None
     if not effective_scope:
         effective_scope = _infer_default_scope(
-            driver, customer_id, household_id, database,
+            driver,
+            customer_id,
+            household_id,
+            database,
             household_type_override=household_type_override,
         )
     fs = family_scope
@@ -796,10 +882,10 @@ def _resolve_profile(
 
 
 _GOAL_WORDS: dict[str, str] = {
-    "weight_loss":   "low calorie",
-    "muscle_gain":   "high protein",
-    "heart_health":  "low fat",
-    "energy":        "energizing",
+    "weight_loss": "low calorie",
+    "muscle_gain": "high protein",
+    "heart_health": "low fat",
+    "energy": "energizing",
     "general_health": "healthy",
 }
 
@@ -849,6 +935,7 @@ def build_feed_query_text(
 
 # ── Reason generation ──────────────────────────────────────────────────────
 
+
 def _build_reasons(
     item: dict[str, Any],
     entities: dict[str, Any],
@@ -897,6 +984,7 @@ def _build_reasons(
 
 
 # ── Merge helpers ──────────────────────────────────────────────────────────
+
 
 def _is_uuid(val: str) -> bool:
     """Return True if val looks like a UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)."""
@@ -998,17 +1086,20 @@ def _lookup_uuid_from_neo4j(
                 val = (title or name or "").strip()
                 if not val:
                     return None
-                cypher = (
-                    f"MATCH (n:{label}) WHERE toLower(n.{prop}) = toLower($val) "
-                    "RETURN n.id AS id LIMIT 1"
-                )
+                cypher = f"MATCH (n:{label}) WHERE toLower(n.{prop}) = toLower($val) RETURN n.id AS id LIMIT 1"
                 rec = session.run(cypher, val=val).single()
                 if rec and rec["id"]:
                     return str(rec["id"])
     except Exception as e:
         logger.warning(
             "UUID lookup failed",
-            extra={"element_id": element_id, "label": label, "title": title, "name": name, "error": str(e)},
+            extra={
+                "element_id": element_id,
+                "label": label,
+                "title": title,
+                "name": name,
+                "error": str(e),
+            },
         )
     return None
 
@@ -1019,10 +1110,7 @@ def _resolve_id(payload: dict[str, Any], key: str) -> str:
     Returns only what is in payload; does not perform DB lookup.
     Priority: payload.id > nested payload.id (temporary migration fallback) > key fallback.
     """
-    uid = (
-        payload.get("id")
-        or (payload.get("payload") or {}).get("id")
-    )
+    uid = payload.get("id") or (payload.get("payload") or {}).get("id")
     if uid:
         return str(uid)
     return key or str(id(payload))
@@ -1288,8 +1376,14 @@ def _safe_float(v: Any) -> float | None:
 
 
 _CAL_LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\b(?:under|below|less than|at most|upto|up to)\s*(\d{2,5}(?:\.\d+)?)\s*(?:kcal|calories?|cal)\b", re.I),
-    re.compile(r"\b(\d{2,5}(?:\.\d+)?)\s*(?:kcal|calories?|cal)\s*(?:or less|or below|max(?:imum)?)\b", re.I),
+    re.compile(
+        r"\b(?:under|below|less than|at most|upto|up to)\s*(\d{2,5}(?:\.\d+)?)\s*(?:kcal|calories?|cal)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(\d{2,5}(?:\.\d+)?)\s*(?:kcal|calories?|cal)\s*(?:or less|or below|max(?:imum)?)\b",
+        re.I,
+    ),
 )
 
 
@@ -1408,16 +1502,19 @@ def _select_best_calorie_set(
     calorie_target: float | None,
     meals_per_day: int,
     tolerance: float,
+    legacy_pool_size: int = 20,
 ) -> tuple[list["MealCandidateItem"], float | None, float | None, str | None]:
     """
     Phase 3: choose a meal set whose total calories best matches target.
     Returns reordered candidates (selected first), selected_total, delta, compliance.
+    legacy_pool_size controls how many candidates are searched (default 20; callers
+    can pass a larger value for a second-pass pool expansion).
     """
     if not candidates or calorie_target is None or calorie_target <= 0:
         return candidates, None, None, None
 
     meals = max(1, meals_per_day)
-    pool = candidates[: min(len(candidates), 20)]
+    pool = candidates[: min(len(candidates), legacy_pool_size)]
     indexed = [(idx, c, _safe_float(c.calories)) for idx, c in enumerate(pool)]
     with_cal = [(idx, c, cal) for idx, c, cal in indexed if cal is not None]
     if len(with_cal) < meals:
@@ -1578,6 +1675,7 @@ def _merge_results_with_profile(
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
+
 def _merge_results(
     orch: OrchestratorResult,
     *,
@@ -1691,6 +1789,7 @@ def _merge_results(
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
+
 @app.get("/debug/profile", dependencies=[Depends(verify_api_key)])
 async def debug_profile(customer_id: str):
     """Debug: return raw profile for a customer_id to verify Neo4j lookup."""
@@ -1744,7 +1843,8 @@ async def search_hybrid(req: SearchRequest):
     if nlu_result.intent in _NON_SEARCH_INTENTS:
         logger.info(
             "Search-context intent override: %s → find_recipe (query=%s)",
-            nlu_result.intent, req.query,
+            nlu_result.intent,
+            req.query,
         )
         nlu_result.intent = "find_recipe"
         # Preserve any extracted entities; add dish fallback if empty
@@ -1765,7 +1865,6 @@ async def search_hybrid(req: SearchRequest):
     if meal_type_filter and isinstance(meal_type_filter, str) and meal_type_filter.strip():
         nlu_result.entities["course"] = meal_type_filter.strip().lower()
 
-
     # Resolve profile: B2C (member_profile) primary, Neo4j fallback via merge
     customer_profile = None
     if req.customer_id:
@@ -1774,7 +1873,10 @@ async def search_hybrid(req: SearchRequest):
             effective_scope_for_profile = "family"
         if not effective_scope_for_profile:
             effective_scope_for_profile = _infer_default_scope(
-                _driver, req.customer_id, req.household_id, database,
+                _driver,
+                req.customer_id,
+                req.household_id,
+                database,
                 household_type_override=req.household_type,
             )
         if req.member_profile and isinstance(req.member_profile, dict):
@@ -1813,7 +1915,10 @@ async def search_hybrid(req: SearchRequest):
         effective_scope = "family"
     if not effective_scope:
         effective_scope = _infer_default_scope(
-            _driver, req.customer_id, req.household_id, database,
+            _driver,
+            req.customer_id,
+            req.household_id,
+            database,
             household_type_override=req.household_type,
         )
     is_aggregated = _is_aggregated_profile(
@@ -1854,7 +1959,12 @@ async def search_hybrid(req: SearchRequest):
     latency_ms = (time.time() - start) * 1000
     logger.info(
         "search_hybrid complete",
-        extra={"endpoint": "search_hybrid", "identity": f"{identity[:8]}..." if len(identity) > 8 else identity, "intent": result.intent, "latency_ms": round(latency_ms)},
+        extra={
+            "endpoint": "search_hybrid",
+            "identity": f"{identity[:8]}..." if len(identity) > 8 else identity,
+            "intent": result.intent,
+            "latency_ms": round(latency_ms),
+        },
     )
     return SearchResponse(
         results=recommendations,
@@ -1890,7 +2000,10 @@ async def recommend_feed(req: FeedRequest):
     logger.info("recommend_feed context=%s", req.context)
 
     effective_scope = (req.scope or "").strip() or _infer_default_scope(
-        _driver, req.customer_id, req.household_id, database,
+        _driver,
+        req.customer_id,
+        req.household_id,
+        database,
         household_type_override=req.household_type,
     )
     # B2C primary: member_profile > preferences; merge with Neo4j for gaps (fallback)
@@ -1911,7 +2024,11 @@ async def recommend_feed(req: FeedRequest):
         )
         profile = _merge_b2c_with_neo4j(b2c_profile, neo4j_profile)
         # Apply household_type override from request
-        if req.household_type and req.household_type.strip().lower() in ("individual", "couple", "family"):
+        if req.household_type and req.household_type.strip().lower() in (
+            "individual",
+            "couple",
+            "family",
+        ):
             profile["household_type"] = req.household_type.strip().lower()
     else:
         profile = _resolve_profile(
@@ -1931,7 +2048,7 @@ async def recommend_feed(req: FeedRequest):
         profile["context"] = req.context
 
     entities: dict[str, Any] = {
-        "diet":               profile["diets"],
+        "diet": profile["diets"],
         "exclude_ingredient": profile["allergens"],
     }
     if req.meal_type:
@@ -2053,9 +2170,7 @@ async def recommend_feed(req: FeedRequest):
                                 len(pop_items),
                             )
                 except Exception as _pop_err:
-                    logger.warning(
-                        "recommend_feed: popularity fallback also failed: %s", _pop_err
-                    )
+                    logger.warning("recommend_feed: popularity fallback also failed: %s", _pop_err)
     except Exception as e:
         logger.warning("recommend_feed: structural/similar-constraint retrieval failed: %s", e)
 
@@ -2094,7 +2209,11 @@ async def recommend_feed(req: FeedRequest):
 
     # ── Hard constraints: allergens/exclude_ingredient, course, calories ───
     fused = apply_hard_constraints(
-        fused, entities, "find_recipe", _driver, database=database,
+        fused,
+        entities,
+        "find_recipe",
+        _driver,
+        database=database,
     )
 
     # ── Fix #5: Minimum result fallback — relax allergen constraint and retry ──
@@ -2162,9 +2281,7 @@ async def recommend_feed(req: FeedRequest):
             def _should_exclude(item: dict[str, Any]) -> bool:
                 payload = item.get("payload") or {}
                 key = item.get("key", "")
-                rec_id = _resolve_id_with_lookup(
-                    payload, key, item, _driver, label="Recipe", database=database
-                )
+                rec_id = _resolve_id_with_lookup(payload, key, item, _driver, label="Recipe", database=database)
                 return rec_id is not None and str(rec_id).lower() in exclude_ids
 
             fused = [f for f in fused if not _should_exclude(f)]
@@ -2174,7 +2291,9 @@ async def recommend_feed(req: FeedRequest):
             fused = [f for f in fused if (f.get("title") or "").lower() not in recent]
 
     recommendations = _merge_results_with_profile(
-        fused, entities, profile,
+        fused,
+        entities,
+        profile,
         driver=_driver,
         database=database,
         label="Recipe",
@@ -2186,7 +2305,14 @@ async def recommend_feed(req: FeedRequest):
         zero_explanation = build_zero_results_message(entities, "find_recipe")
     latency_ms = (time.time() - start) * 1000
     identity = (req.customer_id or "").strip() or "anonymous"
-    logger.info("recommend_feed complete", extra={"endpoint": "recommend_feed", "identity": f"{identity[:8]}..." if len(identity) > 8 else identity, "latency_ms": round(latency_ms)})
+    logger.info(
+        "recommend_feed complete",
+        extra={
+            "endpoint": "recommend_feed",
+            "identity": f"{identity[:8]}..." if len(identity) > 8 else identity,
+            "latency_ms": round(latency_ms),
+        },
+    )
     return SearchResponse(
         results=recommendations,
         intent="find_recipe",
@@ -2196,7 +2322,11 @@ async def recommend_feed(req: FeedRequest):
     )
 
 
-@app.post("/recommend/meal-candidates", response_model=MealCandidateResponse, dependencies=[Depends(verify_api_key)])
+@app.post(
+    "/recommend/meal-candidates",
+    response_model=MealCandidateResponse,
+    dependencies=[Depends(verify_api_key)],
+)
 async def recommend_meal_candidates(req: MealCandidateRequest):
     """
     Pre-scored recipe candidates for meal plan generation (single customer).
@@ -2218,7 +2348,10 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
     logger.info("recommend_meal_candidates context=%s", req.context)
 
     effective_scope = (req.scope or "").strip() or _infer_default_scope(
-        _driver, req.customer_id, req.household_id, database,
+        _driver,
+        req.customer_id,
+        req.household_id,
+        database,
         household_type_override=req.household_type,
     )
     # B2C primary: members[] > member_profile; merge with Neo4j for gaps
@@ -2230,6 +2363,7 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
         if start_d and end_d:
             try:
                 from datetime import datetime
+
                 d1 = datetime.strptime(str(start_d)[:10], "%Y-%m-%d")
                 d2 = datetime.strptime(str(end_d)[:10], "%Y-%m-%d")
                 days = max(1, (d2 - d1).days + 1)
@@ -2256,7 +2390,11 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
             household_type_override=req.household_type,
         )
         profile = _merge_b2c_with_neo4j(b2c_profile, neo4j_profile)
-        if req.household_type and req.household_type.strip().lower() in ("individual", "couple", "family"):
+        if req.household_type and req.household_type.strip().lower() in (
+            "individual",
+            "couple",
+            "family",
+        ):
             profile["household_type"] = req.household_type.strip().lower()
     else:
         profile = _resolve_profile(
@@ -2365,7 +2503,11 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
 
     # ── Hard constraints: allergens/exclude_ingredient, course, calories ───
     fused = apply_hard_constraints(
-        fused, entities, "find_recipe", _driver, database=database,
+        fused,
+        entities,
+        "find_recipe",
+        _driver,
+        database=database,
     )
     fused = apply_usda_food_group_bonus(fused, entities, "find_recipe")
     fused = contextual_rerank(fused, entities)
@@ -2397,7 +2539,7 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
     if calorie_target_raw is None and isinstance(profile, dict):
         calorie_target_raw = profile.get("calorie_target")
     calorie_target = _safe_float(calorie_target_raw)
-    calorie_tolerance = (max(100.0, (calorie_target or 0.0) * 0.08) if calorie_target else None)
+    calorie_tolerance = max(100.0, (calorie_target or 0.0) * 0.08) if calorie_target else None
 
     calorie_cache: dict[str, float | None] = {}
     # Phase 2: calorie-aware soft rerank before response mapping.
@@ -2417,7 +2559,9 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
 
     # ── Map to MealCandidateItem format ────────────────────────────────────
     recs = _merge_results_with_profile(
-        fused, entities, profile,
+        fused,
+        entities,
+        profile,
         driver=_driver,
         database=database,
         label="Recipe",
@@ -2454,8 +2598,7 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
     food_group_audit: list[dict[str, Any]] = []
     strict_mode_insufficiency: dict[str, Any] | None = None
     strict_mode_enabled = (
-        os.getenv("USDA_STRICT_MODE", "").strip() == "1"
-        or os.getenv("USDA_GUIDELINES_STRICT", "").strip() == "1"
+        os.getenv("USDA_STRICT_MODE", "").strip() == "1" or os.getenv("USDA_GUIDELINES_STRICT", "").strip() == "1"
     )
     try:
         candidate_rows = [
@@ -2518,7 +2661,14 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
     if not candidates:
         zero_explanation = build_zero_results_message(entities, "find_recipe")
     latency_ms = (time.time() - start) * 1000
-    logger.info("recommend_meal_candidates complete", extra={"endpoint": "recommend_meal_candidates", "identity": f"{identity[:8]}..." if len(identity) > 8 else identity, "latency_ms": round(latency_ms)})
+    logger.info(
+        "recommend_meal_candidates complete",
+        extra={
+            "endpoint": "recommend_meal_candidates",
+            "identity": f"{identity[:8]}..." if len(identity) > 8 else identity,
+            "latency_ms": round(latency_ms),
+        },
+    )
     return MealCandidateResponse(
         candidates=candidates,
         retrieval_time_ms=latency_ms,
@@ -2536,7 +2686,11 @@ async def recommend_meal_candidates(req: MealCandidateRequest):
     )
 
 
-@app.post("/substitutions/ingredient", response_model=IngredientSubstitutionResponse, dependencies=[Depends(verify_api_key)])
+@app.post(
+    "/substitutions/ingredient",
+    response_model=IngredientSubstitutionResponse,
+    dependencies=[Depends(verify_api_key)],
+)
 async def substitutions_ingredient(req: IngredientSubstitutionRequest):
     """
     Get ingredient substitution suggestions.
@@ -2571,7 +2725,14 @@ async def substitutions_ingredient(req: IngredientSubstitutionRequest):
         for s in result.get("substitutions", [])
     ]
     latency_ms = (time.time() - start) * 1000
-    logger.info("substitutions_ingredient complete", extra={"endpoint": "substitutions_ingredient", "identity": "anonymous", "latency_ms": round(latency_ms)})
+    logger.info(
+        "substitutions_ingredient complete",
+        extra={
+            "endpoint": "substitutions_ingredient",
+            "identity": "anonymous",
+            "latency_ms": round(latency_ms),
+        },
+    )
     return IngredientSubstitutionResponse(
         substitutions=substitutions,
         debug_info=result.get("debug_info") if req.debug else None,
@@ -2614,11 +2775,22 @@ async def recommend_products(req: ProductsRequest):
         )
         for p in result.get("products", [])
     ]
-    logger.info("recommend_products complete", extra={"endpoint": "recommend_products", "identity": "anonymous", "latency_ms": round((time.time() - start) * 1000)})
+    logger.info(
+        "recommend_products complete",
+        extra={
+            "endpoint": "recommend_products",
+            "identity": "anonymous",
+            "latency_ms": round((time.time() - start) * 1000),
+        },
+    )
     return ProductsResponse(products=products)
 
 
-@app.post("/recommend/alternatives", response_model=AlternativesResponse, dependencies=[Depends(verify_api_key)])
+@app.post(
+    "/recommend/alternatives",
+    response_model=AlternativesResponse,
+    dependencies=[Depends(verify_api_key)],
+)
 async def recommend_alternatives(req: AlternativesRequest):
     """
     Find alternative products for a scanned product (allergen-safe, cheaper).
@@ -2649,11 +2821,22 @@ async def recommend_alternatives(req: AlternativesRequest):
         )
         for a in result.get("alternatives", [])
     ]
-    logger.info("recommend_alternatives complete", extra={"endpoint": "recommend_alternatives", "identity": "anonymous", "latency_ms": round((time.time() - start) * 1000)})
+    logger.info(
+        "recommend_alternatives complete",
+        extra={
+            "endpoint": "recommend_alternatives",
+            "identity": "anonymous",
+            "latency_ms": round((time.time() - start) * 1000),
+        },
+    )
     return AlternativesResponse(alternatives=alternatives)
 
 
-@app.post("/notifications/generate", response_model=NotificationGenerateResponse, dependencies=[Depends(verify_api_key)])
+@app.post(
+    "/notifications/generate",
+    response_model=NotificationGenerateResponse,
+    dependencies=[Depends(verify_api_key)],
+)
 async def notifications_generate(req: NotificationGenerateRequest):
     """
     Generate notification copy for PRD-29 auto-notifications.
@@ -2748,11 +2931,7 @@ async def chat_process(req: ChatProcessRequest):
         session.pending_action = None
 
     # Expand follow-up queries using conversation context (e.g. "Can I use soy then?" -> full query)
-    history_pairs = [
-        (m.role, m.content)
-        for m in session.history[:-1]
-        if m.role in ("user", "assistant")
-    ]
+    history_pairs = [(m.role, m.content) for m in session.history[:-1] if m.role in ("user", "assistant")]
     effective_msg = expand_query_with_context(msg, history_pairs) if history_pairs else msg
 
     # NLU: intent + entities (rules first, LLM fallback). Pass history for session-based
@@ -2886,7 +3065,10 @@ async def chat_process(req: ChatProcessRequest):
             )
             if not chat_scope:
                 chat_scope = _infer_default_scope(
-                    _driver, req.customer_id, req.household_id, database,
+                    _driver,
+                    req.customer_id,
+                    req.household_id,
+                    database,
                     household_type_override=req.household_type,
                 )
             if req.member_profile and isinstance(req.member_profile, dict):
@@ -2951,11 +3133,7 @@ async def chat_process(req: ChatProcessRequest):
             )
 
             # Build conversation history from session (exclude current user message)
-            history_pairs = [
-                (m.role, m.content)
-                for m in session.history[:-1]
-                if m.role in ("user", "assistant")
-            ]
+            history_pairs = [(m.role, m.content) for m in session.history[:-1] if m.role in ("user", "assistant")]
             history_text = format_conversation_history(history_pairs)
 
             _response = generate_chat_response(
@@ -3001,7 +3179,15 @@ async def chat_process(req: ChatProcessRequest):
                 ]
 
             latency_ms = (time.time() - start) * 1000
-            logger.info("chat_process complete", extra={"endpoint": "chat_process", "identity": f"{identity[:8]}..." if len(identity) > 8 else identity, "intent": nlu_result.intent, "latency_ms": round(latency_ms)})
+            logger.info(
+                "chat_process complete",
+                extra={
+                    "endpoint": "chat_process",
+                    "identity": f"{identity[:8]}..." if len(identity) > 8 else identity,
+                    "intent": nlu_result.intent,
+                    "latency_ms": round(latency_ms),
+                },
+            )
             return ChatProcessResponse(
                 response=_response,
                 intent=nlu_result.intent,

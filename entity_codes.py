@@ -13,12 +13,30 @@ import re
 
 # ── Allergens (DB codes, snake_case) ──────────────────────────────────────────
 
-ALLOWED_ALLERGENS: frozenset[str] = frozenset({
-    "seeds", "other_legumes", "egg", "corn", "sesame", "buckwheat",
-    "alpha_gal_syndrome", "tree_nuts", "fish", "spices_herbs", "peanut",
-    "insect", "soy", "oral_allergy_syndrome", "celery", "wheat_gluten_cereals",
-    "gelatin", "molluscs", "shellfish", "milk_dairy",
-})
+ALLOWED_ALLERGENS: frozenset[str] = frozenset(
+    {
+        "seeds",
+        "other_legumes",
+        "egg",
+        "corn",
+        "sesame",
+        "buckwheat",
+        "alpha_gal_syndrome",
+        "tree_nuts",
+        "fish",
+        "spices_herbs",
+        "peanut",
+        "insect",
+        "soy",
+        "oral_allergy_syndrome",
+        "celery",
+        "wheat_gluten_cereals",
+        "gelatin",
+        "molluscs",
+        "shellfish",
+        "milk_dairy",
+    }
+)
 
 # Keyword/phrase -> DB code (for heuristic extraction)
 ALLERGEN_KEYWORDS: dict[str, str] = {
@@ -87,13 +105,25 @@ ALLERGEN_ALIASES: dict[str, str] = {
 
 # ── Health conditions (DB codes) ──────────────────────────────────────────────
 
-ALLOWED_CONDITIONS: frozenset[str] = frozenset({
-    "food_allergy_other", "diabetics_type_2", "hyperlipidemia", "kidney_disease",
-    "liver_disease", "non_celiac_gluten_sensitivity", "type_1_diabetics",
-    "celiac_diseases", "hypertension", "lactose_intolerance",
-    "irritable_bowel_syndrome", "gout", "heart_disease", "oral_allergy_syndrome",
-    "gerd",
-})
+ALLOWED_CONDITIONS: frozenset[str] = frozenset(
+    {
+        "food_allergy_other",
+        "diabetics_type_2",
+        "hyperlipidemia",
+        "kidney_disease",
+        "liver_disease",
+        "non_celiac_gluten_sensitivity",
+        "type_1_diabetics",
+        "celiac_diseases",
+        "hypertension",
+        "lactose_intolerance",
+        "irritable_bowel_syndrome",
+        "gout",
+        "heart_disease",
+        "oral_allergy_syndrome",
+        "gerd",
+    }
+)
 
 CONDITION_KEYWORDS: dict[str, str] = {
     "food allergy": "food_allergy_other",
@@ -156,16 +186,44 @@ CONDITION_ALIASES: dict[str, str] = {
 
 # ── Diets (DB codes / display names) ──────────────────────────────────────────
 
-ALLOWED_DIETS: frozenset[str] = frozenset({
-    "kosher", "sesame_free", "vegan", "egg_free", "renal_kidney_support",
-    "carnivore", "flexitarian", "halal", "hindu_no_beef", "high_protein",
-    "hyperlipidemia", "low_carb", "diabetes_friendly", "alpha_gal_syndrome",
-    "oral_allergy_syndrome", "low_fat", "vegetarian_lacto_ovo", "fish_free",
-    "whole_foods", "low_fodmap", "corn_free", "shellfish_free", "paleo",
-    "non_celiac_gluten_sensitivity", "ketogenic", "legume_free", "mediterranean",
-    "pescatarian", "dairy_free", "strict_gluten_free", "heart_healthy",
-    "peanut_tree_nut_free", "soy_free", "jain_vegetarian",
-})
+ALLOWED_DIETS: frozenset[str] = frozenset(
+    {
+        "kosher",
+        "sesame_free",
+        "vegan",
+        "egg_free",
+        "renal_kidney_support",
+        "carnivore",
+        "flexitarian",
+        "halal",
+        "hindu_no_beef",
+        "high_protein",
+        "hyperlipidemia",
+        "low_carb",
+        "diabetes_friendly",
+        "alpha_gal_syndrome",
+        "oral_allergy_syndrome",
+        "low_fat",
+        "vegetarian_lacto_ovo",
+        "fish_free",
+        "whole_foods",
+        "low_fodmap",
+        "corn_free",
+        "shellfish_free",
+        "paleo",
+        "non_celiac_gluten_sensitivity",
+        "ketogenic",
+        "legume_free",
+        "mediterranean",
+        "pescatarian",
+        "dairy_free",
+        "strict_gluten_free",
+        "heart_healthy",
+        "peanut_tree_nut_free",
+        "soy_free",
+        "jain_vegetarian",
+    }
+)
 
 DIET_KEYWORDS: dict[str, str] = {
     "kosher": "kosher",

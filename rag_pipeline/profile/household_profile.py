@@ -310,11 +310,13 @@ def fetch_household_profile(
             member_meta: list[dict[str, Any]] = []
             for record in result:
                 r = dict(record)
-                member_meta.append({
-                    "customer_id": r.get("customer_id"),
-                    "role": r.get("role"),
-                    "display_name": r.get("display_name"),
-                })
+                member_meta.append(
+                    {
+                        "customer_id": r.get("customer_id"),
+                        "role": r.get("role"),
+                        "display_name": r.get("display_name"),
+                    }
+                )
                 member_profiles.append(_record_to_profile(r))
             return (member_profiles, member_meta)
     except Exception as e:

@@ -8,7 +8,6 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
 
 TTL_SECONDS = 30 * 60  # 30 min
 
@@ -35,6 +34,7 @@ _sessions: dict[str, B2BSession] = {}
 
 def get_or_create_session(session_id: str | None, vendor_id: str) -> B2BSession:
     import uuid
+
     sid = session_id or str(uuid.uuid4())
     if sid in _sessions:
         s = _sessions[sid]

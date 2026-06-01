@@ -16,7 +16,6 @@ from typing import Any
 
 from entity_codes import (
     ALLERGEN_KEYWORDS,
-    ALLOWED_ALLERGENS,
     CONDITION_KEYWORDS,
     DIET_KEYWORDS,
     normalize_to_allergen,
@@ -31,6 +30,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class NLUResult:
     """Intent and entity extraction result."""
+
     intent: str
     entities: dict[str, Any]
     source: str  # "rules" | "llm" | "fallback" — for debugging and cost tracking
@@ -166,23 +166,16 @@ B2B_RULE_PATTERNS: dict[str, str] = {
         r"(list|show|find|how many)\b.*(customer|client).*"
         r"(with|have|having)\b.*(diabet|allerg|hypertens|intoleran|celiac)"
     ),
-    "b2b_customer_recommendations": (
-        r"(recommend|suggest|what product).*(for|to)\b.*[A-Za-z]"
-    ),
-    "b2b_analytics": (
-        r"(how many|count|percentage|stats?|analytics?)\b.*(customer|client|product)"
-    ),
+    "b2b_customer_recommendations": (r"(recommend|suggest|what product).*(for|to)\b.*[A-Za-z]"),
+    "b2b_analytics": (r"(how many|count|percentage|stats?|analytics?)\b.*(customer|client|product)"),
     "b2b_product_compliance": (
         r"(is|are|check|verify)\b.*(product|item)\b.*"
         r"(safe|compliant|suitable|ok)\b.*(for|with)"
     ),
-    "b2b_product_nutrition": (
-        r"(nutrition|nutritional|macros)\b.*(product|item)"
-    ),
-    "b2b_generate_report": (
-        r"(generate|create)\b.*(report|summary|matrix)"
-    ),
+    "b2b_product_nutrition": (r"(nutrition|nutritional|macros)\b.*(product|item)"),
+    "b2b_generate_report": (r"(generate|create)\b.*(report|summary|matrix)"),
 }
+
 
 def _needs_entity_llm_fallback(intent: str, entities: dict[str, Any], message: str) -> bool:
     """
@@ -191,25 +184,70 @@ def _needs_entity_llm_fallback(intent: str, entities: dict[str, Any], message: s
     low = message.lower()
 
     # Allergen-related intents: need allergens, query has allergy words
-    if intent in ("b2b_products_allergen_free", "b2b_customers_with_condition", "b2b_product_compliance"):
-        has_allergy_words = any(w in low for w in ("allergy", "allergic", "allergen", "intolerance", "free from", "without", "no "))
+    if intent in (
+        "b2b_products_allergen_free",
+        "b2b_customers_with_condition",
+        "b2b_product_compliance",
+    ):
+        has_allergy_words = any(
+            w in low
+            for w in (
+                "allergy",
+                "allergic",
+                "allergen",
+                "intolerance",
+                "free from",
+                "without",
+                "no ",
+            )
+        )
         rule_allergens = entities.get("allergens") or entities.get("exclude_ingredient") or []
         if has_allergy_words and not rule_allergens:
             return True
 
     # Condition-related intents
-    if intent in ("b2b_products_for_condition", "b2b_customers_with_condition", "b2b_product_compliance"):
-        has_condition_words = any(w in low for w in (
-            "diabetic", "diabetes", "hypertension", "celiac", "kidney", "lactose",
-            "ibs", "gout", "gerd", "heart", "condition", "disease", "cholesterol",
-        ))
+    if intent in (
+        "b2b_products_for_condition",
+        "b2b_customers_with_condition",
+        "b2b_product_compliance",
+    ):
+        has_condition_words = any(
+            w in low
+            for w in (
+                "diabetic",
+                "diabetes",
+                "hypertension",
+                "celiac",
+                "kidney",
+                "lactose",
+                "ibs",
+                "gout",
+                "gerd",
+                "heart",
+                "condition",
+                "disease",
+                "cholesterol",
+            )
+        )
         rule_conditions = entities.get("health_conditions") or []
         if has_condition_words and not rule_conditions:
             return True
 
     # Diet-related intents
     if intent == "b2b_products_for_diet":
-        has_diet_words = any(w in low for w in ("keto", "vegan", "vegetarian", "gluten", "paleo", "diet", "low carb", "high protein"))
+        has_diet_words = any(
+            w in low
+            for w in (
+                "keto",
+                "vegan",
+                "vegetarian",
+                "gluten",
+                "paleo",
+                "diet",
+                "low carb",
+                "high protein",
+            )
+        )
         rule_diets = entities.get("diet") or []
         if has_diet_words and not rule_diets:
             return True
@@ -293,7 +331,7 @@ def _merge_b2b_entities(rules_entities: dict[str, Any], llm_entities: dict[str, 
             merged[key] = llm_val
         elif rule_val and llm_val:
             combined = list(rule_val) if isinstance(rule_val, list) else [rule_val]
-            for x in (llm_val if isinstance(llm_val, list) else [llm_val]):
+            for x in llm_val if isinstance(llm_val, list) else [llm_val]:
                 if x and x not in combined:
                     combined.append(x)
             merged[key] = combined
@@ -372,9 +410,7 @@ def _extract_b2b_entities_by_rules(message: str, intent: str) -> dict[str, Any] 
 
     # Customer recommendations (named customer)
     if intent == "b2b_customer_recommendations":
-        for m in re.finditer(
-            r"(?:for|to)\s+([A-Za-z][a-z]*(?:\s+[A-Za-z][a-z]*)?)", message, re.IGNORECASE
-        ):
+        for m in re.finditer(r"(?:for|to)\s+([A-Za-z][a-z]*(?:\s+[A-Za-z][a-z]*)?)", message, re.IGNORECASE):
             name = m.group(1).strip()
             if len(name) > 1:
                 return {"customer_name": name}

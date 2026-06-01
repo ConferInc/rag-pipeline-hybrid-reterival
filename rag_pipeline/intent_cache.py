@@ -62,7 +62,11 @@ class IntentCache:
                 self._cache.move_to_end(key)
                 logger.debug(
                     "Intent cache hit",
-                    extra={"component": "intent_cache", "key": key[:100], "cache_size": len(self._cache)},
+                    extra={
+                        "component": "intent_cache",
+                        "key": key[:100],
+                        "cache_size": len(self._cache),
+                    },
                 )
                 return self._cache[key]
         return None

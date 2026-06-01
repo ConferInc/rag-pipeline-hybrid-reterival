@@ -100,20 +100,22 @@ def keyword_search(
                 rid = row["id"]
                 if not rid:
                     continue
-                results.append({
-                    "key": str(rid),
-                    "source": "keyword",
-                    "label": "Recipe",
-                    "title": row["title"] or "",
-                    "bm25_score": float(row["bm25_score"]),
-                    "payload": {
-                        "id": str(rid),
-                        "title": row["title"],
-                        "meal_type": row.get("meal_type"),
-                        "total_time_minutes": row.get("total_time_minutes"),
-                        "cuisine_code": row.get("cuisine_code"),
-                    },
-                })
+                results.append(
+                    {
+                        "key": str(rid),
+                        "source": "keyword",
+                        "label": "Recipe",
+                        "title": row["title"] or "",
+                        "bm25_score": float(row["bm25_score"]),
+                        "payload": {
+                            "id": str(rid),
+                            "title": row["title"],
+                            "meal_type": row.get("meal_type"),
+                            "total_time_minutes": row.get("total_time_minutes"),
+                            "cuisine_code": row.get("cuisine_code"),
+                        },
+                    }
+                )
         logger.info(
             "Keyword search complete",
             extra={
@@ -127,7 +129,8 @@ def keyword_search(
         )
     except Exception as e:
         logger.warning(
-            "Keyword search failed (fail-open): %s", e,
+            "Keyword search failed (fail-open): %s",
+            e,
             extra={"component": "keyword", "query": query[:50]},
         )
     return results

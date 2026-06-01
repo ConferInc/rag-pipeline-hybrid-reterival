@@ -71,9 +71,7 @@ def load_embedding_config(path: str | Path) -> EmbeddingConfig:
     )
 
 
-def get_semantic_index_spec(
-    cfg: EmbeddingConfig, *, label: str, require_index_name: bool = True
-) -> VectorIndexSpec:
+def get_semantic_index_spec(cfg: EmbeddingConfig, *, label: str, require_index_name: bool = True) -> VectorIndexSpec:
     matches = [s for s in cfg.semantic_vector_indexes if s.label == label]
     if not matches:
         raise KeyError(f"No semantic vector index configured for label={label!r}")
@@ -89,9 +87,7 @@ def get_semantic_index_spec(
     return spec
 
 
-def get_structural_index_spec(
-    cfg: EmbeddingConfig, *, label: str, require_index_name: bool = True
-) -> VectorIndexSpec:
+def get_structural_index_spec(cfg: EmbeddingConfig, *, label: str, require_index_name: bool = True) -> VectorIndexSpec:
     matches = [s for s in cfg.structural_vector_indexes if s.label == label]
     if not matches:
         raise KeyError(f"No structural vector index configured for label={label!r}")
@@ -184,4 +180,3 @@ def get_default_usda_guidelines() -> USDAGuidelineConfig:
         )
 
     return USDAGuidelineConfig(version="usda_2025_default_v1", groups=groups)
-

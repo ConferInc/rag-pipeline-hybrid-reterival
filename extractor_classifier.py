@@ -9,9 +9,10 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+from openai import OpenAI
+
 from entity_codes import CONDITION_KEYWORDS, normalize_to_allergen
 from rag_pipeline.nlu.intents import VALID_INTENTS, VALID_INTENTS_WITH_B2B
-from openai import OpenAI
 
 try:
     from rag_pipeline.llm_retry import with_retry
@@ -79,77 +80,100 @@ def _keyword_result(intent: str, entities: dict[str, Any]) -> dict[str, Any]:
 # Diet labels map to existing Dietary_Preferences nodes via FORBIDS/ALLOWS edges.
 _HEALTH_TO_DIET_MAP: dict[str, list[str]] = {
     # Type 1 Diabetes / Type 2 Diabetes
-    "diabetic":          ["Low-Carb", "Low-Fat"],
-    "diabetes":          ["Low-Carb", "Low-Fat"],
-    "type 1 diabetes":   ["Low-Carb", "Low-Fat"],
-    "type 2 diabetes":   ["Low-Carb", "Low-Fat"],
-    "type 1":            ["Low-Carb", "Low-Fat"],
-    "type 2":            ["Low-Carb", "Low-Fat"],
+    "diabetic": ["Low-Carb", "Low-Fat"],
+    "diabetes": ["Low-Carb", "Low-Fat"],
+    "type 1 diabetes": ["Low-Carb", "Low-Fat"],
+    "type 2 diabetes": ["Low-Carb", "Low-Fat"],
+    "type 1": ["Low-Carb", "Low-Fat"],
+    "type 2": ["Low-Carb", "Low-Fat"],
     # Hyperlipidemia / High Cholesterol
-    "hyperlipidemia":    ["Low-Fat"],
-    "high cholesterol":  ["Low-Fat"],
-    "cholesterol":       ["Low-Fat"],
+    "hyperlipidemia": ["Low-Fat"],
+    "high cholesterol": ["Low-Fat"],
+    "cholesterol": ["Low-Fat"],
     # Kidney Disease (Chronic Kidney Disease)
-    "kidney disease":    ["Low-Fat", "Low-Carb"],
-    "chronic kidney":    ["Low-Fat", "Low-Carb"],
-    "ckd":               ["Low-Fat", "Low-Carb"],
-    "kidney":            ["Low-Fat", "Low-Carb"],
+    "kidney disease": ["Low-Fat", "Low-Carb"],
+    "chronic kidney": ["Low-Fat", "Low-Carb"],
+    "ckd": ["Low-Fat", "Low-Carb"],
+    "kidney": ["Low-Fat", "Low-Carb"],
     # Liver Disease
-    "liver disease":     ["Low-Fat"],
-    "liver":             ["Low-Fat"],
+    "liver disease": ["Low-Fat"],
+    "liver": ["Low-Fat"],
     # Non-Celiac Gluten Sensitivity
-    "gluten sensitivity":     ["Gluten-Free"],
-    "non-celiac":             ["Gluten-Free"],
-    "non celiac":             ["Gluten-Free"],
-    "gluten sensitive":       ["Gluten-Free"],
-    "gluten intolerant":      ["Gluten-Free"],
-    "gluten intolerance":     ["Gluten-Free"],
+    "gluten sensitivity": ["Gluten-Free"],
+    "non-celiac": ["Gluten-Free"],
+    "non celiac": ["Gluten-Free"],
+    "gluten sensitive": ["Gluten-Free"],
+    "gluten intolerant": ["Gluten-Free"],
+    "gluten intolerance": ["Gluten-Free"],
     # Celiac Disease
-    "celiac":            ["Gluten-Free"],
-    "celiac disease":    ["Gluten-Free"],
-    "coeliac":           ["Gluten-Free"],
+    "celiac": ["Gluten-Free"],
+    "celiac disease": ["Gluten-Free"],
+    "coeliac": ["Gluten-Free"],
     # Hypertension (High Blood Pressure)
-    "hypertension":           ["Low-Carb"],
-    "high blood pressure":    ["Low-Carb"],
-    "blood pressure":         ["Low-Carb"],
-    "hypertensive":           ["Low-Carb"],
+    "hypertension": ["Low-Carb"],
+    "high blood pressure": ["Low-Carb"],
+    "blood pressure": ["Low-Carb"],
+    "hypertensive": ["Low-Carb"],
     # Lactose Intolerance
-    "lactose intolerance":    ["Dairy-Free"],
-    "lactose intolerant":     ["Dairy-Free"],
-    "lactose":                ["Dairy-Free"],
+    "lactose intolerance": ["Dairy-Free"],
+    "lactose intolerant": ["Dairy-Free"],
+    "lactose": ["Dairy-Free"],
     # Irritable Bowel Syndrome (IBS)
-    "ibs":               ["Gluten-Free"],
-    "irritable bowel":   ["Gluten-Free"],
+    "ibs": ["Gluten-Free"],
+    "irritable bowel": ["Gluten-Free"],
     "irritable bowel syndrome": ["Gluten-Free"],
     # Gout
-    "gout":              ["Low-Fat", "Low-Carb"],
+    "gout": ["Low-Fat", "Low-Carb"],
     # Heart Disease / Cardiovascular Disease
-    "heart disease":          ["Low-Fat"],
-    "cardiovascular":         ["Low-Fat"],
+    "heart disease": ["Low-Fat"],
+    "cardiovascular": ["Low-Fat"],
     "cardiovascular disease": ["Low-Fat"],
-    "heart condition":        ["Low-Fat"],
-    "cardiac":                ["Low-Fat"],
+    "heart condition": ["Low-Fat"],
+    "cardiac": ["Low-Fat"],
     # Oral Allergy Syndrome (OAS)
-    "oral allergy":           [],   # no direct diet label mapping — falls to LLM
-    "oas":                    [],
+    "oral allergy": [],  # no direct diet label mapping — falls to LLM
+    "oas": [],
     # GERD / Acid Reflux
-    "gerd":              ["Low-Fat"],
-    "acid reflux":       ["Low-Fat"],
-    "reflux":            ["Low-Fat"],
-    "heartburn":         ["Low-Fat"],
+    "gerd": ["Low-Fat"],
+    "acid reflux": ["Low-Fat"],
+    "reflux": ["Low-Fat"],
+    "heartburn": ["Low-Fat"],
     # Food Allergy (Other) — generic, no specific diet label
-    "food allergy":      [],        # falls to LLM for specifics
+    "food allergy": [],  # falls to LLM for specifics
 }
 
 # All health-related words that should be recognised as food-context words
 # (prevents them from triggering out_of_scope)
 _HEALTH_WORDS: set[str] = {
-    "diabetic", "diabetes", "cholesterol", "hyperlipidemia", "kidney",
-    "liver", "celiac", "coeliac", "hypertension", "hypertensive",
-    "lactose", "ibs", "gout", "cardiac", "cardiovascular", "gerd",
-    "reflux", "heartburn", "allergy", "allergic", "condition", "patient",
-    "patients", "disease", "syndrome", "intolerance", "intolerant",
-    "sensitive", "sensitivity",
+    "diabetic",
+    "diabetes",
+    "cholesterol",
+    "hyperlipidemia",
+    "kidney",
+    "liver",
+    "celiac",
+    "coeliac",
+    "hypertension",
+    "hypertensive",
+    "lactose",
+    "ibs",
+    "gout",
+    "cardiac",
+    "cardiovascular",
+    "gerd",
+    "reflux",
+    "heartburn",
+    "allergy",
+    "allergic",
+    "condition",
+    "patient",
+    "patients",
+    "disease",
+    "syndrome",
+    "intolerance",
+    "intolerant",
+    "sensitive",
+    "sensitivity",
 } | set(CONDITION_KEYWORDS.keys())
 
 _DIET_MAP: dict[str, str] = {
@@ -197,16 +221,52 @@ _COURSE_MAP: dict[str, str] = {
 }
 
 _CUISINE_SET: set[str] = {
-    "italian", "mexican", "indian", "mediterranean", "asian", "chinese",
-    "japanese", "thai", "french", "greek", "american", "middle eastern",
-    "spanish", "korean", "vietnamese", "turkish", "moroccan", "lebanese",
-    "persian", "ethiopian", "caribbean", "brazilian", "german", "british",
-    "swedish", "danish", "polish", "russian", "hungarian", "norwegian",
+    "italian",
+    "mexican",
+    "indian",
+    "mediterranean",
+    "asian",
+    "chinese",
+    "japanese",
+    "thai",
+    "french",
+    "greek",
+    "american",
+    "middle eastern",
+    "spanish",
+    "korean",
+    "vietnamese",
+    "turkish",
+    "moroccan",
+    "lebanese",
+    "persian",
+    "ethiopian",
+    "caribbean",
+    "brazilian",
+    "german",
+    "british",
+    "swedish",
+    "danish",
+    "polish",
+    "russian",
+    "hungarian",
+    "norwegian",
 }
 
 _RECIPE_TRIGGERS: set[str] = {
-    "recipe", "recipes", "meal", "meals", "dish", "dishes",
-    "food", "cook", "cooking", "make", "prepare", "bake", "baking",
+    "recipe",
+    "recipes",
+    "meal",
+    "meals",
+    "dish",
+    "dishes",
+    "food",
+    "cook",
+    "cooking",
+    "make",
+    "prepare",
+    "bake",
+    "baking",
 }
 
 _NUTRIENT_MAP: dict[str, str] = {
@@ -235,9 +295,26 @@ _NUTRIENT_MAP: dict[str, str] = {
 }
 
 _PRODUCT_TYPES: set[str] = {
-    "bread", "milk", "butter", "cheese", "yogurt", "yoghurt", "cream",
-    "flour", "oil", "sauce", "pasta", "cereal", "bar", "powder",
-    "supplement", "drink", "beverage", "snack", "chips", "crackers",
+    "bread",
+    "milk",
+    "butter",
+    "cheese",
+    "yogurt",
+    "yoghurt",
+    "cream",
+    "flour",
+    "oil",
+    "sauce",
+    "pasta",
+    "cereal",
+    "bar",
+    "powder",
+    "supplement",
+    "drink",
+    "beverage",
+    "snack",
+    "chips",
+    "crackers",
 }
 
 _FOOD_WORDS: set[str] = (
@@ -249,16 +326,58 @@ _FOOD_WORDS: set[str] = (
     | _PRODUCT_TYPES
     | _HEALTH_WORDS
     | {
-        "ingredient", "ingredients", "food", "foods", "nutrition", "nutritional",
-        "nutrient", "nutrients", "calorie", "calories", "diet", "allergen",
-        "allergy", "allergic", "substitute", "substitution", "replace",
-        "cuisine", "cook", "cooking", "eat", "eating", "healthy", "health",
-        "cross-reactive", "cross", "reactive", "cross-reactivity",
-        "macronutrients", "macronutrient", "micronutrients", "micronutrient",
-        "glycemic", "antioxidants", "probiotics", "prebiotics", "cholesterol",
-        "alternatives", "alternative", "similar", "compare", "comparison",
-        "vitamin", "vitamins", "mineral", "minerals", "omega",
-        "hungry", "hunger", "crave", "craving", "starving",
+        "ingredient",
+        "ingredients",
+        "food",
+        "foods",
+        "nutrition",
+        "nutritional",
+        "nutrient",
+        "nutrients",
+        "calorie",
+        "calories",
+        "diet",
+        "allergen",
+        "allergy",
+        "allergic",
+        "substitute",
+        "substitution",
+        "replace",
+        "cuisine",
+        "cook",
+        "cooking",
+        "eat",
+        "eating",
+        "healthy",
+        "health",
+        "cross-reactive",
+        "cross",
+        "reactive",
+        "cross-reactivity",
+        "macronutrients",
+        "macronutrient",
+        "micronutrients",
+        "micronutrient",
+        "glycemic",
+        "antioxidants",
+        "probiotics",
+        "prebiotics",
+        "cholesterol",
+        "alternatives",
+        "alternative",
+        "similar",
+        "compare",
+        "comparison",
+        "vitamin",
+        "vitamins",
+        "mineral",
+        "minerals",
+        "omega",
+        "hungry",
+        "hunger",
+        "crave",
+        "craving",
+        "starving",
     }
 )
 
@@ -304,7 +423,9 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         r"\b(?:below|under|less\s+than|max|maximum|at\s+most)\s+(\d+)\s*(?:kcal|cal|calories?)\b",
         q,
     )
-    if cal_limit_match and (words & _RECIPE_TRIGGERS or any(w in q for w in ["recipe", "recipes", "meal", "meals", "dish", "food"])):
+    if cal_limit_match and (
+        words & _RECIPE_TRIGGERS or any(w in q for w in ["recipe", "recipes", "meal", "meals", "dish", "food"])
+    ):
         cal_val = int(cal_limit_match.group(1))
         entities: dict[str, Any] = {"cal_upper_limit": cal_val}
         course = _extract_course(q)
@@ -358,9 +479,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         ref = sim_recipe_early.group(1).strip()
         return _keyword_result("similar_recipes", {"recipe_reference": ref})
 
-    sim_ingr_early = re.search(
-        r"(?:ingredients?\s+like\s+|similar\s+ingredients?\s+to\s+)(.+?)(?:\?|$)", q
-    )
+    sim_ingr_early = re.search(r"(?:ingredients?\s+like\s+|similar\s+ingredients?\s+to\s+)(.+?)(?:\?|$)", q)
     if sim_ingr_early:
         ingr = sim_ingr_early.group(1).strip()
         return _keyword_result("similar_ingredients", {"ingredient": ingr})
@@ -371,8 +490,15 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
 
     # ── cross_reactive_allergens ───────────────────────────────────────────────
     if "cross-reactive" in q or "cross reactive" in q or "cross-reactivity" in q:
-        allergen = _extract_after(q, ["cross-reactive with", "cross reactive with",
-                                      "cross-reactivity with", "reactive with"])
+        allergen = _extract_after(
+            q,
+            [
+                "cross-reactive with",
+                "cross reactive with",
+                "cross-reactivity with",
+                "reactive with",
+            ],
+        )
         entities = {}
         if allergen:
             entities["allergen"] = allergen
@@ -393,8 +519,11 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         return _keyword_result("rank_results", entities)
 
     # ── cuisine_hierarchy ──────────────────────────────────────────────────────
-    if re.search(r"\b(types?|subtypes?|kinds?|categories|taxonomy|hierarchy)\s+of\b.*(cuisine|food)", q) \
-            or "cuisine taxonomy" in q or "cuisine hierarchy" in q:
+    if (
+        re.search(r"\b(types?|subtypes?|kinds?|categories|taxonomy|hierarchy)\s+of\b.*(cuisine|food)", q)
+        or "cuisine taxonomy" in q
+        or "cuisine hierarchy" in q
+    ):
         cuisine = _extract_cuisine(q)
         entities = {}
         if cuisine:
@@ -403,7 +532,10 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
 
     # ── compare_foods ──────────────────────────────────────────────────────────
     # "X vs Y" — stop before nutrition/protein/carb/? to avoid capturing trailing words
-    vs_match = re.search(r"([a-z][\w\s]{1,15}?)\s+vs\.?\s+([a-z][\w]{1,15})(?:\s+nutrition|\s+protein|\s+carb|\?|$)", q)
+    vs_match = re.search(
+        r"([a-z][\w\s]{1,15}?)\s+vs\.?\s+([a-z][\w]{1,15})(?:\s+nutrition|\s+protein|\s+carb|\?|$)",
+        q,
+    )
     compare_match = re.search(r"compare\s+(.+?)\s+and\s+(.+?)(?:\s+nutrition|\s+protein|\s+carb|$)", q)
     which_match = re.search(r"which\s+has\s+more\s+(\w+)[,\s]+(.+?)\s+or\s+(.+?)(?:\?|$)", q)
     if vs_match or compare_match or which_match:
@@ -429,9 +561,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
             return _keyword_result("compare_foods", entities)
 
     # ── check_substitution: "can I substitute X with Y" / "use X instead of Y" ─
-    sub_with = re.search(
-        r"(?:substitute|replace|swap)\s+(.+?)\s+(?:with|for)\s+(.+?)(?:\?|$|\s+in\b)", q
-    )
+    sub_with = re.search(r"(?:substitute|replace|swap)\s+(.+?)\s+(?:with|for)\s+(.+?)(?:\?|$|\s+in\b)", q)
     # "use X instead of Y" → X is the substitute, Y is the original
     instead_of = re.search(r"(?:use\s+)?(.+?)\s+instead\s+of\s+(.+?)(?:\?|$)", q)
     if sub_with or instead_of:
@@ -467,12 +597,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         q,
     )
     if compliance_match:
-        ingredient = (
-            compliance_match.group(1)
-            or compliance_match.group(2)
-            or compliance_match.group(3)
-            or ""
-        ).strip()
+        ingredient = (compliance_match.group(1) or compliance_match.group(2) or compliance_match.group(3) or "").strip()
         diets = _extract_diets(q)
         entities = {}
         if ingredient:
@@ -486,9 +611,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         r"(?:i\s+have\s+|using\s+|with\s+)(.+?)(?:\s+what\s+can\s+i\s+(?:cook|make|prepare|bake)|\s+recipe|\?|$)",
         q,
     )
-    have_and_cook = re.search(
-        r"what\s+can\s+i\s+(?:cook|make|prepare|bake)\s+with\s+(.+?)(?:\?|$)", q
-    )
+    have_and_cook = re.search(r"what\s+can\s+i\s+(?:cook|make|prepare|bake)\s+with\s+(.+?)(?:\?|$)", q)
     if pantry_match or have_and_cook:
         raw = (pantry_match.group(1) if pantry_match else have_and_cook.group(1)).strip()
         # Split on commas, "and", "or"
@@ -502,15 +625,16 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
 
     # ── similar_ingredients: "alternatives to X" (ingredient context) ────────
     # Note: "recipes like X" / "something like X" already handled before out_of_scope check.
-    sim_ingr = re.search(
-        r"(?:alternatives?\s+to\s+)(.+?)(?:\?|$)", q
-    )
+    sim_ingr = re.search(r"(?:alternatives?\s+to\s+)(.+?)(?:\?|$)", q)
     if sim_ingr:
         ingr = sim_ingr.group(1).strip()
         return _keyword_result("similar_ingredients", {"ingredient": ingr})
 
     # ── nutrient_category: "types of vitamins/minerals/macronutrients" ─────────
-    if re.search(r"\b(macronutrients?|micronutrients?|nutrient\s+categor|types?\s+of\s+(?:vitamins?|minerals?|nutrients?)|what\s+are\s+(?:vitamins?|minerals?|macronutrients?|micronutrients?))\b", q):
+    if re.search(
+        r"\b(macronutrients?|micronutrients?|nutrient\s+categor|types?\s+of\s+(?:vitamins?|minerals?|nutrients?)|what\s+are\s+(?:vitamins?|minerals?|macronutrients?|micronutrients?))\b",
+        q,
+    ):
         return _keyword_result("nutrient_category", {})
 
     # ── nutrient_in_foods: "foods high/rich in X" / "sources of X" ────────────
@@ -610,10 +734,28 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
         concept = general.group(1).strip()
         # If the concept is a known nutrient concept (not a food), treat as general_nutrition
         nutrition_concepts = {
-            "fiber", "fibre", "protein", "carbohydrate", "carbohydrates", "fat", "fats",
-            "calories", "macronutrients", "micronutrients", "vitamins", "minerals",
-            "antioxidants", "probiotics", "prebiotics", "glycemic index", "omega-3",
-            "omega 3", "cholesterol", "saturated fat", "trans fat", "sodium",
+            "fiber",
+            "fibre",
+            "protein",
+            "carbohydrate",
+            "carbohydrates",
+            "fat",
+            "fats",
+            "calories",
+            "macronutrients",
+            "micronutrients",
+            "vitamins",
+            "minerals",
+            "antioxidants",
+            "probiotics",
+            "prebiotics",
+            "glycemic index",
+            "omega-3",
+            "omega 3",
+            "cholesterol",
+            "saturated fat",
+            "trans fat",
+            "sodium",
         }
         if concept in nutrition_concepts or any(nc in concept for nc in nutrition_concepts):
             return _keyword_result("general_nutrition", {"nutrient": concept})
@@ -660,7 +802,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
             elif "carb" in (nword or ""):
                 default_val = 20 if is_low else 40  # % of calories
             elif "fiber" in (nword or ""):
-                default_val = 2 if is_low else 5   # grams
+                default_val = 2 if is_low else 5  # grams
             else:
                 default_val = 20 if is_low else 25
             entities["nutrient_threshold"] = {
@@ -690,12 +832,42 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
     course = _extract_course(q)
     has_recipe_trigger = bool(words & _RECIPE_TRIGGERS)
     exclude_ingredients = _extract_exclude_ingredients(q)
-    has_food_context = any(w in q for w in ["recipe", "recipes", "meal", "meals", "dish", "dishes",
-                                             "food", "foods", "dinner", "lunch", "breakfast",
-                                             "dessert", "desserts", "appetizer", "soup", "salad",
-                                             "snack", "cook", "make", "prepare", "eat", "eating",
-                                             "healthy", "ideas", "patient", "patients",
-                                             "hungry", "hunger", "crave", "craving", "starving"])
+    has_food_context = any(
+        w in q
+        for w in [
+            "recipe",
+            "recipes",
+            "meal",
+            "meals",
+            "dish",
+            "dishes",
+            "food",
+            "foods",
+            "dinner",
+            "lunch",
+            "breakfast",
+            "dessert",
+            "desserts",
+            "appetizer",
+            "soup",
+            "salad",
+            "snack",
+            "cook",
+            "make",
+            "prepare",
+            "eat",
+            "eating",
+            "healthy",
+            "ideas",
+            "patient",
+            "patients",
+            "hungry",
+            "hunger",
+            "crave",
+            "craving",
+            "starving",
+        ]
+    )
 
     # Health condition with no diet mapping → let LLM handle it (unless we extracted exclude_ingredient)
     has_health_word = bool(words & _HEALTH_WORDS)
@@ -722,6 +894,7 @@ def _keyword_extract(text: str) -> dict[str, Any] | None:
 
 
 # ── Entity extraction helpers ──────────────────────────────────────────────────
+
 
 def _extract_diets(q: str) -> list[str]:
     """Extract all diet labels present in the query."""
@@ -753,7 +926,7 @@ def _extract_after(q: str, phrases: list[str]) -> str | None:
     for phrase in phrases:
         idx = q.find(phrase)
         if idx != -1:
-            rest = q[idx + len(phrase):].strip().rstrip("?").strip()
+            rest = q[idx + len(phrase) :].strip().rstrip("?").strip()
             if rest:
                 return rest.split()[0] if " " in rest else rest
     return None
@@ -789,7 +962,10 @@ def _extract_exclude_ingredients(q: str) -> list[str]:
                 found.append(val)
 
     # "without X" / "without X and Y"
-    for m in re.finditer(r"\bwithout\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
+    for m in re.finditer(
+        r"\bwithout\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)",
+        q,
+    ):
         _add(m.group(1))
         if m.group(2):
             _add(m.group(2))
@@ -801,31 +977,46 @@ def _extract_exclude_ingredients(q: str) -> list[str]:
             _add(m.group(2))
 
     # "avoid X"
-    for m in re.finditer(r"\bavoid(?:ing)?\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
+    for m in re.finditer(
+        r"\bavoid(?:ing)?\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)",
+        q,
+    ):
         _add(m.group(1))
         if m.group(2):
             _add(m.group(2))
 
     # "allergic to X" / "allergy to X"
-    for m in re.finditer(r"\ballerg(?:ic|y)\s+to\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
+    for m in re.finditer(
+        r"\ballerg(?:ic|y)\s+to\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)",
+        q,
+    ):
         _add(m.group(1))
         if m.group(2):
             _add(m.group(2))
 
     # "don't want X" / "do not want X"
-    for m in re.finditer(r"\b(?:don't|dont|do\s+not)\s+want\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
+    for m in re.finditer(
+        r"\b(?:don't|dont|do\s+not)\s+want\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)",
+        q,
+    ):
         _add(m.group(1))
         if m.group(2):
             _add(m.group(2))
 
     # "free of X" (but not "nut-free", "gluten-free" which are diets)
-    for m in re.finditer(r"\bfree\s+of\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
+    for m in re.finditer(
+        r"\bfree\s+of\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)",
+        q,
+    ):
         _add(m.group(1))
         if m.group(2):
             _add(m.group(2))
 
     # "excluding X"
-    for m in re.finditer(r"\bexcluding\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", q):
+    for m in re.finditer(
+        r"\bexcluding\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)",
+        q,
+    ):
         _add(m.group(1))
         if m.group(2):
             _add(m.group(2))
@@ -839,7 +1030,10 @@ def _extract_include_ingredients(q: str, exclude_words: set[str] | None = None) 
     Returns a list only when the signal is unambiguous (single ingredient after 'with').
     """
     exclude_words = exclude_words or set()
-    match = re.search(r"\bwith\s+([a-z][\w\s]{1,20}?)(?:\s+and\s+([a-z][\w\s]{1,20}))?(?:\?|$|\s+recipe|\s+dish)", q)
+    match = re.search(
+        r"\bwith\s+([a-z][\w\s]{1,20}?)(?:\s+and\s+([a-z][\w\s]{1,20}))?(?:\?|$|\s+recipe|\s+dish)",
+        q,
+    )
     if match:
         results = []
         for grp in [match.group(1), match.group(2)]:
@@ -1097,6 +1291,7 @@ def extract_intent_with_retry(
     for _ in range(max_retries):
         client = _get_client()
         m = model or os.environ.get("INTENT_MODEL", "gpt-4o-mini")
+
         def _retry_call():
             return client.chat.completions.create(
                 model=m,
@@ -1107,6 +1302,7 @@ def extract_intent_with_retry(
                 ],
                 temperature=0,
             )
+
         retry_cfg = _load_llm_retry_config(config_path)
         if with_retry and retry_cfg:
             response = with_retry(
@@ -1214,7 +1410,9 @@ def sanity_check_b2b(output_json) -> bool | tuple[bool, str]:
 
 if __name__ == "__main__":
     import sys
+
     from dotenv import load_dotenv
+
     load_dotenv()
 
     # Usage:
@@ -1232,7 +1430,7 @@ if __name__ == "__main__":
         # Always show keyword filter result first
         kw = _keyword_extract(query)
         if kw is not None:
-            print(f"[KEYWORD HIT — 0 LLM tokens]")
+            print("[KEYWORD HIT — 0 LLM tokens]")
             print(json.dumps(kw, indent=2))
             check = sanity_check(kw)
             print(f"Sanity check: {'OK' if check is True else check[1]}")

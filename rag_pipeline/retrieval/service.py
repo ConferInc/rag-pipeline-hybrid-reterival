@@ -28,13 +28,39 @@ def _infer_label_heuristics(query: str) -> str | None:
     # Order matters: more specific patterns first
     if any(w in q for w in ["customer", "similar users", "like me", "my profile", "user"]):
         return "B2C_Customer"
-    if any(w in q for w in ["ingredient", "nutrient", "nutrition", "protein", "calories", "sodium", "fiber", "vitamin", "mineral"]):
+    if any(
+        w in q
+        for w in [
+            "ingredient",
+            "nutrient",
+            "nutrition",
+            "protein",
+            "calories",
+            "sodium",
+            "fiber",
+            "vitamin",
+            "mineral",
+        ]
+    ):
         return "Ingredient"
     if any(w in q for w in ["product", "brand"]):
         return "Product"
     if any(w in q for w in ["cuisine", "italian", "mexican", "indian", "mediterranean", "american", "asian"]):
         return "Cuisine"
-    if any(w in q for w in ["recipe", "meal", "dish", "dinner", "breakfast", "lunch", "cook", "bake", "prepare"]):
+    if any(
+        w in q
+        for w in [
+            "recipe",
+            "meal",
+            "dish",
+            "dinner",
+            "breakfast",
+            "lunch",
+            "cook",
+            "bake",
+            "prepare",
+        ]
+    ):
         return "Recipe"
     return None
 
@@ -146,4 +172,3 @@ def retrieve_semantic(
         top_k=request.top_k,
         database=database,
     )
-

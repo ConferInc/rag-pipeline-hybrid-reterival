@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smoke tests for intent/entity extraction failure handling."""
 
-from extractor_classifier import parse_extractor_output, sanity_check
+from extractor_classifier import parse_extractor_output
 
 # Test parse_extractor_output - valid JSON
 valid = '{"intent":"find_recipe","entities":{"course":"lunch"}}'

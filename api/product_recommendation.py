@@ -32,6 +32,33 @@ QUALITY_TO_CERTIFICATION: dict[str, str] = {
 BRAND_BOOST = 0.2
 
 
+def get_match_confidence(
+    *,
+    ingredient_id_returned: str,
+    ingredient_name_returned: str,
+    iid: str,
+    iname: str,
+) -> str:
+    """
+    Classify how well a graph ingredient node matched the caller's search term.
+
+    Returns one of:
+      "id_match"     — graph node ID equals the search ID (exact database lookup)
+      "name_exact"   — graph node name exactly equals the search name (case-insensitive)
+      "name_partial" — one name contains the other (case-insensitive substring)
+      "name_unknown" — no reliable match signal found
+    """
+    if ingredient_id_returned and iid and ingredient_id_returned == iid:
+        return "id_match"
+    a = ingredient_name_returned.lower().strip()
+    b = iname.lower().strip()
+    if a and b and a == b:
+        return "name_exact"
+    if a and b and (a in b or b in a):
+        return "name_partial"
+    return "name_unknown"
+
+
 def _product_data_available(driver: Driver, database: str | None = None) -> bool:
     """Check if Product nodes exist (CONTAINS_INGREDIENT checked per-query)."""
     cypher = "MATCH (p:Product) RETURN 1 AS x LIMIT 1"
@@ -221,17 +248,32 @@ def run_recommend_products(
                 if (iid, pid) in seen:
                     continue
                 seen.add((iid, pid))
-                candidates.append({
-                    "ingredient_id": iid,
-                    "product_id": pid,
-                    "product_name": row["product_name"] or "",
-                    "brand": row["brand"] or "",
-                    "price": float(row["price"]) if row["price"] is not None else None,
-                    "currency": row["currency"] or "USD",
-                    "weight_g": int(row["weight_g"]) if row["weight_g"] is not None else None,
-                    "category": row["category"] or "",
-                    "image_url": row["image_url"] or "",
-                })
+                # graph_ingredient_id is the graph node's own ID (may differ from iid
+                # when the match was found by name rather than by our stored UUID)
+                _graph_iid_raw = row.get("graph_ingredient_id") if hasattr(row, "get") else None
+                graph_iid = str(_graph_iid_raw or row["ingredient_id"] or "")
+                iname = name_map.get(iid, "")
+                ingredient_name_returned = str(row.get("ingredient_name") or "" if hasattr(row, "get") else "")
+                confidence = get_match_confidence(
+                    ingredient_id_returned=graph_iid,
+                    ingredient_name_returned=ingredient_name_returned,
+                    iid=iid,
+                    iname=iname,
+                )
+                candidates.append(
+                    {
+                        "ingredient_id": iid,
+                        "product_id": pid,
+                        "product_name": row["product_name"] or "",
+                        "brand": row["brand"] or "",
+                        "price": float(row["price"]) if row["price"] is not None else None,
+                        "currency": row["currency"] or "USD",
+                        "weight_g": int(row["weight_g"]) if row["weight_g"] is not None else None,
+                        "category": row["category"] or "",
+                        "image_url": row["image_url"] or "",
+                        "match_confidence": confidence,
+                    }
+                )
     except Exception as e:
         logger.warning("run_recommend_products query failed: %s", e)
         return {"products": []}
@@ -260,9 +302,7 @@ def run_recommend_products(
     # Phase 2: Certification filter (hard constraint, two-phase)
     if has_quality_prefs:
         product_ids = list({c["product_id"] for c in candidates})
-        certified_ids = _filter_products_by_certification(
-            driver, product_ids, quality_codes, database
-        )
+        certified_ids = _filter_products_by_certification(driver, product_ids, quality_codes, database)
         certified_candidates = [c for c in candidates if c["product_id"] in certified_ids]
         if certified_candidates:
             candidates = certified_candidates
@@ -277,11 +317,7 @@ def run_recommend_products(
     # Apply brand boost (soft) and select best per ingredient
     for c in candidates:
         brand_val = (c.get("brand") or "").strip()
-        is_preferred_brand = (
-            brand_val.lower() in brands_lower
-            if brands_lower
-            else False
-        )
+        is_preferred_brand = brand_val.lower() in brands_lower if brands_lower else False
         base_price = c.get("price") or 999999.0
         score = 1.0 / (float(base_price) + 0.01)
         if is_preferred_brand:
@@ -363,16 +399,18 @@ def run_recommend_alternatives(
                             savings = None
                     except (TypeError, ValueError):
                         pass
-                candidates.append({
-                    "product_id": pid,
-                    "name": row["name"] or "",
-                    "brand": row["brand"] or "",
-                    "price": float(alt_price) if alt_price is not None else None,
-                    "image_url": row["image_url"] or "",
-                    "category": row["category"] or "",
-                    "savings": savings,
-                    "reason": "Graph substitution",
-                })
+                candidates.append(
+                    {
+                        "product_id": pid,
+                        "name": row["name"] or "",
+                        "brand": row["brand"] or "",
+                        "price": float(alt_price) if alt_price is not None else None,
+                        "image_url": row["image_url"] or "",
+                        "category": row["category"] or "",
+                        "savings": savings,
+                        "reason": "Graph substitution",
+                    }
+                )
     except Exception:
         candidates = []
 
@@ -407,16 +445,18 @@ def run_recommend_alternatives(
                                 savings = None
                         except (TypeError, ValueError):
                             pass
-                    candidates.append({
-                        "product_id": pid,
-                        "name": row["name"] or "",
-                        "brand": row["brand"] or "",
-                        "price": float(alt_price) if alt_price is not None else None,
-                        "image_url": row["image_url"] or "",
-                        "category": row["category"] or "",
-                        "savings": savings,
-                        "reason": "Same category alternative",
-                    })
+                    candidates.append(
+                        {
+                            "product_id": pid,
+                            "name": row["name"] or "",
+                            "brand": row["brand"] or "",
+                            "price": float(alt_price) if alt_price is not None else None,
+                            "image_url": row["image_url"] or "",
+                            "category": row["category"] or "",
+                            "savings": savings,
+                            "reason": "Same category alternative",
+                        }
+                    )
         except Exception as e:
             logger.debug("run_recommend_alternatives category fallback failed: %s", e)
 

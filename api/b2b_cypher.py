@@ -66,7 +66,7 @@ AND NOT EXISTS {
     cypher = f"""
 MATCH (c:B2BCustomer {{id: $customer_id}})-[:BELONGS_TO_VENDOR]->(v:Vendor {{id: $vendor_id}})
 MATCH (p:Product)-[:SOLD_BY]->(v)
-WHERE {' AND '.join(where_parts)}
+WHERE {" AND ".join(where_parts)}
 {allergen_filter}
 
 WITH p
@@ -185,7 +185,7 @@ def build_b2b_search_products(
 
     cypher = f"""
 MATCH (p:Product)-[:SOLD_BY]->(v:Vendor {{id: $vendor_id}})
-WHERE {' AND '.join(where_parts)}
+WHERE {" AND ".join(where_parts)}
 RETURN p.id AS id, p.name AS name, p.brand AS brand,
        p.calories AS calories, p.protein_g AS protein_g,
        0.9 AS score

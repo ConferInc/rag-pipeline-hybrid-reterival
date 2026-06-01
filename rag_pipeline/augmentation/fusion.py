@@ -18,9 +18,7 @@ def _is_uuid(val: Any) -> bool:
     """Return True if val looks like a UUID."""
     if not val or not isinstance(val, str):
         return False
-    return bool(
-        re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", val.lower())
-    )
+    return bool(re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", val.lower()))
 
 
 def _normalize_title(value: Any) -> str:
@@ -55,8 +53,12 @@ def _get_key_from_structural(item: dict[str, Any]) -> str | None:
     if uid and _is_uuid(str(uid)):
         return str(uid)
     key = _normalize_title(
-        payload.get("title") or payload.get("name") or payload.get("code")
-        or item.get("title") or item.get("name") or item.get("code")
+        payload.get("title")
+        or payload.get("name")
+        or payload.get("code")
+        or item.get("title")
+        or item.get("name")
+        or item.get("code")
     )
     return key if key else None
 
@@ -67,20 +69,35 @@ def _get_key_from_cypher(row: dict[str, Any], intent: str) -> str | None:
     Prefers r.id (UUID) for recipe intents so the API returns hydration-ready IDs.
     Falls back to normalized title for non-recipe intents.
     """
-    if intent in ("find_recipe", "find_recipe_by_pantry", "rank_results", "recipes_for_cuisine", "recipes_by_nutrient", "ingredient_in_recipes"):
+    if intent in (
+        "find_recipe",
+        "find_recipe_by_pantry",
+        "rank_results",
+        "recipes_for_cuisine",
+        "recipes_by_nutrient",
+        "ingredient_in_recipes",
+    ):
         # Prefer UUID id; fall back to title for fusion matching with semantic results
         uuid_key = row.get("id")
         if uuid_key:
             return str(uuid_key)
         key = _normalize_title(row.get("title"))
-    elif intent in ("get_nutritional_info", "compare_foods", "check_diet_compliance", "nutrient_in_foods", "ingredient_nutrients"):
+    elif intent in (
+        "get_nutritional_info",
+        "compare_foods",
+        "check_diet_compliance",
+        "nutrient_in_foods",
+        "ingredient_nutrients",
+    ):
         key = _normalize_title(row.get("ingredient") or row.get("name"))
     elif intent in ("check_substitution", "get_substitution_suggestion"):
         key = _normalize_title(row.get("suggested_substitute") or row.get("substitute") or row.get("original"))
     elif intent in ("find_product", "product_nutrients"):
         key = _normalize_title(row.get("product") or row.get("p.name") or row.get("name"))
     elif intent in ("cuisine_recipes", "cuisine_hierarchy"):
-        key = _normalize_title(row.get("cuisine_name") or row.get("c.name") or row.get("name") or row.get("parent_cuisine"))
+        key = _normalize_title(
+            row.get("cuisine_name") or row.get("c.name") or row.get("name") or row.get("parent_cuisine")
+        )
     elif intent == "cross_reactive_allergens":
         key = _normalize_title(row.get("a.name") or row.get("name"))
     elif intent == "nutrient_category":
@@ -127,7 +144,14 @@ def apply_rrf(
         contrib = weight * (1.0 / (k + rank))
         scores[key] = scores.get(key, 0.0) + contrib
         if key not in items:
-            items[key] = {"key": key, "rrf_score": 0.0, "sources": [], "label": "Unknown", "title": "", "payload": {}}
+            items[key] = {
+                "key": key,
+                "rrf_score": 0.0,
+                "sources": [],
+                "label": "Unknown",
+                "title": "",
+                "payload": {},
+            }
         items[key]["rrf_score"] = scores[key]
         if source not in items[key]["sources"]:
             items[key]["sources"].append(source)
@@ -140,7 +164,14 @@ def apply_rrf(
                 items[key]["title"] = item_data.get("title") or item_data.get("name") or key
             else:
                 # Keep first payload as base, but backfill missing canonical fields.
-                for field in ("id", "title", "meal_type", "total_time_minutes", "cuisine_code", "calories"):
+                for field in (
+                    "id",
+                    "title",
+                    "meal_type",
+                    "total_time_minutes",
+                    "cuisine_code",
+                    "calories",
+                ):
                     if items[key]["payload"].get(field) in (None, "") and item_data.get(field) not in (None, ""):
                         items[key]["payload"][field] = item_data.get(field)
 
@@ -170,12 +201,25 @@ def apply_rrf(
                 key,
                 rank,
                 "structural",
-                {"label": label, "title": title, "relationship": item.get("relationship"), **payload},
+                {
+                    "label": label,
+                    "title": title,
+                    "relationship": item.get("relationship"),
+                    **payload,
+                },
             )
 
     # Cypher
     def _cypher_label(intent: str, row: dict) -> str:
-        if intent in ("find_recipe", "find_recipe_by_pantry", "rank_results", "recipes_for_cuisine", "recipes_by_nutrient", "ingredient_in_recipes", "cuisine_recipes"):
+        if intent in (
+            "find_recipe",
+            "find_recipe_by_pantry",
+            "rank_results",
+            "recipes_for_cuisine",
+            "recipes_by_nutrient",
+            "ingredient_in_recipes",
+            "cuisine_recipes",
+        ):
             return "Recipe"
         if intent in ("find_product", "product_nutrients"):
             return "Product"
@@ -191,9 +235,14 @@ def apply_rrf(
         key = _get_key_from_cypher(row, intent)
         if key:
             title = str(
-                row.get("title") or row.get("ingredient")
-                or row.get("product") or row.get("cuisine_name") or row.get("c.name")
-                or row.get("a.name") or row.get("category_name") or row.get("display_name")
+                row.get("title")
+                or row.get("ingredient")
+                or row.get("product")
+                or row.get("cuisine_name")
+                or row.get("c.name")
+                or row.get("a.name")
+                or row.get("category_name")
+                or row.get("display_name")
                 or key
             )
             label = _cypher_label(intent, row)

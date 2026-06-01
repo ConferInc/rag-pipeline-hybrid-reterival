@@ -68,7 +68,7 @@ def with_retry(
             if not _is_retriable(e) or attempt >= max_attempts - 1:
                 raise
             delay_ms = min(
-                initial_delay_ms * (2 ** attempt),
+                initial_delay_ms * (2**attempt),
                 max_delay_ms,
             )
             if jitter:

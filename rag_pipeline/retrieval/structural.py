@@ -41,8 +41,7 @@ def structural_search_by_label(
     vector = list(seed_vector)
     if len(vector) != spec.dimensions:
         raise ValueError(
-            f"Seed vector dimension mismatch for label={label!r}: "
-            f"expected {spec.dimensions}, got {len(vector)}"
+            f"Seed vector dimension mismatch for label={label!r}: expected {spec.dimensions}, got {len(vector)}"
         )
 
     cypher = """
@@ -195,13 +194,15 @@ def expand_from_seeds(
                         extra={"component": "structural", "connected_id": str(row["connected_id"])},
                     )
                     continue
-            results.append({
-                "seed_id": str(row["seed_id"]),
-                "connected_id": str(row["connected_id"]),
-                "connected_labels": connected_labels,
-                "relationship": str(row["relationship"]),
-                "payload": payload,
-            })
+            results.append(
+                {
+                    "seed_id": str(row["seed_id"]),
+                    "connected_id": str(row["connected_id"]),
+                    "connected_labels": connected_labels,
+                    "relationship": str(row["relationship"]),
+                    "payload": payload,
+                }
+            )
 
     return results
 
@@ -318,9 +319,7 @@ def _build_structural_payload(label: str, node_properties: dict[str, Any]) -> di
     return payload
 
 
-def _canonicalize_recipe_payload(
-    payload: dict[str, Any], node_properties: dict[str, Any]
-) -> dict[str, Any] | None:
+def _canonicalize_recipe_payload(payload: dict[str, Any], node_properties: dict[str, Any]) -> dict[str, Any] | None:
     """
     Ensure structural Recipe payload follows canonical contract.
 
@@ -337,9 +336,7 @@ def _canonicalize_recipe_payload(
     payload["id"] = recipe_id
     payload["title"] = title
     payload["meal_type"] = meal_type
-    payload["total_time_minutes"] = payload.get(
-        "total_time_minutes", node_properties.get("total_time_minutes")
-    )
+    payload["total_time_minutes"] = payload.get("total_time_minutes", node_properties.get("total_time_minutes"))
     payload["cuisine_code"] = (
         payload.get("cuisine_code")
         or payload.get("cuisine")

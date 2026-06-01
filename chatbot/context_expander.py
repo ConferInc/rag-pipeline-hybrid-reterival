@@ -13,7 +13,6 @@ import logging
 import os
 import re
 import time
-from typing import Any
 
 from openai import OpenAI
 
@@ -43,10 +42,7 @@ def _looks_like_follow_up(message: str) -> bool:
     if not msg:
         return False
     word_count = len(msg.split())
-    return (
-        word_count <= _MAX_WORDS_FOR_FOLLOW_UP
-        or _FOLLOW_UP_CUES.search(msg) is not None
-    )
+    return word_count <= _MAX_WORDS_FOR_FOLLOW_UP or _FOLLOW_UP_CUES.search(msg) is not None
 
 
 def _is_substitution_context(history: list[tuple[str, str]]) -> bool:
@@ -54,9 +50,7 @@ def _is_substitution_context(history: list[tuple[str, str]]) -> bool:
     for role, content in reversed(history):
         if role == "assistant":
             c = content.lower()
-            return any(
-                kw in c for kw in ("substitute", "alternatives", "instead of", "you can use", "replace")
-            )
+            return any(kw in c for kw in ("substitute", "alternatives", "instead of", "you can use", "replace"))
     return False
 
 
@@ -199,5 +193,9 @@ Reformulate the user's current message into a clear, standalone query that captu
             return fallback
 
     if last_error:
-        logger.warning("Query expansion failed after %d retries, using original: %s", max_retries + 1, last_error)
+        logger.warning(
+            "Query expansion failed after %d retries, using original: %s",
+            max_retries + 1,
+            last_error,
+        )
     return message

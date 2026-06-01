@@ -29,8 +29,7 @@ def semantic_search_by_label(
     vector = list(query_vector)
     if len(vector) != spec.dimensions:
         raise ValueError(
-            f"Query vector dimension mismatch for label={label!r}: "
-            f"expected {spec.dimensions}, got {len(vector)}"
+            f"Query vector dimension mismatch for label={label!r}: expected {spec.dimensions}, got {len(vector)}"
         )
 
     cypher = """
@@ -80,9 +79,7 @@ def semantic_search_by_label(
     return results
 
 
-def _build_payload_from_rules(
-    cfg: EmbeddingConfig, label: str, node_properties: dict[str, Any]
-) -> dict[str, Any]:
+def _build_payload_from_rules(cfg: EmbeddingConfig, label: str, node_properties: dict[str, Any]) -> dict[str, Any]:
     rules = cfg.semantic.label_text_rules.get(label) or {}
     props = rules.get("properties")
     if not props:
@@ -95,9 +92,7 @@ def _build_payload_from_rules(
     return payload
 
 
-def _canonicalize_recipe_payload(
-    payload: dict[str, Any], node_properties: dict[str, Any]
-) -> dict[str, Any] | None:
+def _canonicalize_recipe_payload(payload: dict[str, Any], node_properties: dict[str, Any]) -> dict[str, Any] | None:
     """
     Build canonical recipe payload fields from semantic hit properties.
 
@@ -114,9 +109,7 @@ def _canonicalize_recipe_payload(
     payload["id"] = recipe_id
     payload["title"] = title
     payload["meal_type"] = meal_type
-    payload["total_time_minutes"] = payload.get(
-        "total_time_minutes", node_properties.get("total_time_minutes")
-    )
+    payload["total_time_minutes"] = payload.get("total_time_minutes", node_properties.get("total_time_minutes"))
     payload["cuisine_code"] = (
         payload.get("cuisine_code")
         or payload.get("cuisine")
@@ -125,4 +118,3 @@ def _canonicalize_recipe_payload(
     )
     payload["calories"] = payload.get("calories", node_properties.get("calories"))
     return payload
-

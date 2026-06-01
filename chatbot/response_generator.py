@@ -17,7 +17,6 @@ from rag_pipeline.augmentation.prompt_builder import build_augmented_prompt
 from rag_pipeline.generation.generator import generate_response
 from rag_pipeline.orchestrator.orchestrator import OrchestratorResult
 
-
 # Intents that use canned template responses (no LLM)
 TEMPLATE_INTENTS = frozenset({"greeting", "help", "farewell", "out_of_scope"})
 
