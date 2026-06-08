@@ -90,22 +90,40 @@ def _filter_allergen_unsafe_product_ids(
     product_ids: list[str],
     allergens: list[str],
     database: str | None = None,
-) -> set[str]:
-    """Return product IDs that contain any customer allergen via Ingredient-CONTAINS_ALLERGEN->Allergens."""
+) -> dict[str, dict[str, list[str]]]:
+    """Return a map of unsafe products → matched allergen detail.
+
+    For every product that contains any of the supplied customer allergens (via
+    Product-CONTAINS_INGREDIENT->Ingredient-CONTAINS_ALLERGEN->Allergens), the
+    map holds::
+
+        { product_id: {"matching_allergens": [name, ...], "allergen_codes": [code, ...]} }
+
+    Backward-compatible with the previous ``set[str]`` return: callers that test
+    ``pid in result`` / ``pid not in result`` are unaffected because membership
+    tests against a dict check its keys. Callers that need the matched-allergen
+    detail (PRD-40 safety annotation) read the values. Returns ``{}`` on error or
+    when there is nothing to check.
+    """
     if not product_ids or not allergens:
-        return set()
+        return {}
     allergens_clean = [a for a in allergens if a and isinstance(a, str)]
     allergens_lower = [a.lower() for a in allergens_clean]
 
+    # NOTE: the live graph uses Ingredient-[:HAS_ALLERGEN]->Allergens (verified via
+    # neo4j_schema_dump.json); historical code/docs used CONTAINS_ALLERGEN. We match
+    # BOTH via relationship alternation so safety works regardless of which exists.
     cypher = """
     UNWIND $product_ids AS pid
     MATCH (p:Product)
     WHERE p.id = pid OR elementId(p) = pid
-    MATCH (p)-[:CONTAINS_INGREDIENT]->(i:Ingredient)-[:CONTAINS_ALLERGEN]->(a:Allergens)
+    MATCH (p)-[:CONTAINS_INGREDIENT]->(i:Ingredient)-[:HAS_ALLERGEN|CONTAINS_ALLERGEN]->(a:Allergens)
     WHERE a.id IN $allergens
        OR toLower(coalesce(a.name, '')) IN $allergens_lower
        OR toLower(coalesce(a.code, '')) IN $allergens_lower
-    RETURN DISTINCT coalesce(p.id, elementId(p)) AS flagged_id
+    RETURN coalesce(p.id, elementId(p)) AS flagged_id,
+           collect(DISTINCT a.name) AS matching_allergens,
+           collect(DISTINCT a.code) AS allergen_codes
     """
     try:
         with driver.session(database=database) as session:
@@ -115,10 +133,64 @@ def _filter_allergen_unsafe_product_ids(
                 allergens=allergens_clean,
                 allergens_lower=allergens_lower,
             )
-            return {str(row["flagged_id"]) for row in rows if row["flagged_id"]}
+            result: dict[str, dict[str, list[str]]] = {}
+            for row in rows:
+                fid = row["flagged_id"]
+                if not fid:
+                    continue
+                result[str(fid)] = {
+                    "matching_allergens": [x for x in (row["matching_allergens"] or []) if x],
+                    "allergen_codes": [x for x in (row["allergen_codes"] or []) if x],
+                }
+            return result
     except Exception as e:
         logger.warning("_filter_allergen_unsafe_product_ids failed: %s", e)
-        return set()
+        return {}
+
+
+def run_explain_allergens(
+    driver: Driver,
+    *,
+    product_id: str,
+    allergen_codes: list[str] | None = None,
+    database: str | None = None,
+) -> dict[str, Any]:
+    """Explain how a product's allergens are detected via the ingredient graph.
+
+    Returns ``{ allergens: [{ code, allergen, ingredients: [names] }] }``. When
+    ``allergen_codes`` is empty, returns ALL allergens the product carries.
+    Matches both HAS_ALLERGEN (live graph) and CONTAINS_ALLERGEN (legacy).
+    """
+    if not product_id:
+        return {"allergens": []}
+    codes = [c for c in (allergen_codes or []) if c and isinstance(c, str)]
+    codes_lower = [c.lower() for c in codes]
+    cypher = """
+    MATCH (p:Product)
+    WHERE p.id = $product_id OR elementId(p) = $product_id
+    MATCH (p)-[:CONTAINS_INGREDIENT]->(i:Ingredient)-[:HAS_ALLERGEN|CONTAINS_ALLERGEN]->(a:Allergens)
+    WHERE size($codes) = 0
+       OR a.id IN $codes
+       OR toLower(coalesce(a.name, '')) IN $codes_lower
+       OR toLower(coalesce(a.code, '')) IN $codes_lower
+    RETURN coalesce(a.code, a.name) AS code, a.name AS allergen,
+           collect(DISTINCT i.name) AS ingredients
+    ORDER BY allergen
+    """
+    try:
+        with driver.session(database=database) as session:
+            rows = session.run(cypher, product_id=product_id, codes=codes, codes_lower=codes_lower)
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                out.append({
+                    "code": r["code"],
+                    "allergen": r["allergen"],
+                    "ingredients": [x for x in (r["ingredients"] or []) if x],
+                })
+            return {"allergens": out}
+    except Exception as e:
+        logger.warning("run_explain_allergens failed: %s", e)
+        return {"allergens": []}
 
 
 def _map_quality_to_cert_codes(quality_preferences: list[str] | None) -> list[str]:

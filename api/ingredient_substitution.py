@@ -134,13 +134,13 @@ def filter_allergen_violating_ingredients(
     if not allergens_lower:
         return set()
 
-    # Try graph: (Ingredient)-[:CONTAINS_ALLERGEN]->(Allergen/Allergens)
-    # Support both allergen IDs and names
+    # Try graph: (Ingredient)-[:HAS_ALLERGEN|CONTAINS_ALLERGEN]->(Allergen/Allergens)
+    # Live graph uses HAS_ALLERGEN; match both via alternation. Support IDs + names.
     cypher_graph = """
     UNWIND $ingredient_ids AS iid
     MATCH (i:Ingredient)
     WHERE (i.id = iid OR elementId(i) = iid)
-    MATCH (i)-[:CONTAINS_ALLERGEN]->(a)
+    MATCH (i)-[:HAS_ALLERGEN|CONTAINS_ALLERGEN]->(a)
     WHERE a.id IN $allergens
        OR toLower(coalesce(a.name, '')) IN $allergens_lower
        OR toLower(coalesce(a.code, '')) IN $allergens_lower

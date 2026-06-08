@@ -92,7 +92,8 @@ from rag_pipeline.retrieval.structural import get_seed_embedding, structural_sea
 from .b2b import router as b2b_router
 from .ingredient_substitution import run_ingredient_substitution
 from .notification_generator import generate_notification
-from .product_recommendation import run_recommend_alternatives, run_recommend_products
+from .product_recommendation import run_recommend_alternatives, run_recommend_products, run_explain_allergens
+from .product_search import run_search_products
 from .rate_limit import check_rate_limit
 
 logger = logging.getLogger(__name__)
@@ -525,6 +526,63 @@ class AlternativesResponse(BaseModel):
     """Response from POST /recommend/alternatives."""
 
     alternatives: list[AlternativeItem]
+
+
+# ── Product search schemas (PRD-40) ─────────────────────────────────────────
+
+class ProductSearchRequest(BaseModel):
+    """Request for POST /search/products. Provide `query` and/or `seed_product_ids`."""
+    query: str | None = Field(None, description="Free-text query for semantic search")
+    seed_product_ids: list[str] | None = Field(
+        None, description="Product IDs to annotate (e.g. backend Tier-1 lexical hits)"
+    )
+    customer_allergens: list[str] = Field(
+        default_factory=list, description="Household allergen union (IDs/names/codes) for the hard safety filter"
+    )
+    household_members: list[dict[str, Any]] | None = Field(
+        None, description="Per-member allergen map [{id, allergen_ids|allergens|allergen_codes}] for affected_members"
+    )
+    household_id: str | None = Field(None, description="Optional; RAG best-effort fetches member allergens when household_members is absent")
+    vendor_ids: list[str] | None = None
+    category_ids: list[str] | None = None
+    diet_ids: list[str] | None = None
+    annotate_only: bool = Field(False, description="Skip semantic search even when query is present")
+    limit: int = Field(30, ge=1, le=100)
+    exclude_ids: list[str] | None = None
+
+
+class AnnotatedProductItem(BaseModel):
+    """A single annotated product in the search result."""
+    product_id: str
+    semantic_score: float | None = None
+    safety: str = Field("safe", description="safe | warning")
+    matching_allergens: list[str] = Field(default_factory=list)
+    affected_members: list[str] = Field(default_factory=list, description="b2c_customer_id[] — backend resolves to display_name")
+    match_source: str = Field("seed", description="seed | semantic | both")
+
+
+class ProductSearchResult(BaseModel):
+    """Response from POST /search/products."""
+    products: list[AnnotatedProductItem]
+    query_interpretation: str | None = None
+
+
+# ── Allergen explain schemas (PRD-40 "See who's affected") ──────────────────
+
+class AllergenExplainRequest(BaseModel):
+    """Request for POST /allergens/explain."""
+    product_id: str = Field(..., description="Product UUID")
+    allergen_codes: list[str] | None = Field(None, description="Allergen IDs/names/codes to explain; empty = all the product carries")
+
+
+class AllergenExplainItem(BaseModel):
+    code: str
+    allergen: str
+    ingredients: list[str] = Field(default_factory=list)
+
+
+class AllergenExplainResult(BaseModel):
+    allergens: list[AllergenExplainItem]
 
 
 # ── Chatbot schemas ────────────────────────────────────────────────────────
@@ -2830,6 +2888,76 @@ async def recommend_alternatives(req: AlternativesRequest):
         },
     )
     return AlternativesResponse(alternatives=alternatives)
+
+
+@app.post("/search/products", response_model=ProductSearchResult, dependencies=[Depends(verify_api_key)])
+async def search_products(req: ProductSearchRequest):
+    """
+    Product search + household allergen-safety annotation (PRD-40).
+
+    Modes: search (query), annotate-only (seed_product_ids + annotate_only),
+    hybrid (both). Stock-blind — the backend re-validates availability against
+    Postgres and does final ranking. `/recommend/products` is unaffected.
+    """
+    if not (req.query and req.query.strip()) and not req.seed_product_ids:
+        raise HTTPException(status_code=400, detail="Must provide either `query` or `seed_product_ids`")
+
+    check_rate_limit("anonymous")
+    start = time.time()
+    database = os.getenv("NEO4J_DATABASE")
+    result = run_search_products(
+        _driver,
+        query=req.query,
+        seed_product_ids=req.seed_product_ids,
+        customer_allergens=req.customer_allergens or [],
+        household_members=req.household_members,
+        household_id=req.household_id,
+        vendor_ids=req.vendor_ids,
+        category_ids=req.category_ids,
+        diet_ids=req.diet_ids,
+        annotate_only=req.annotate_only,
+        limit=req.limit,
+        exclude_ids=req.exclude_ids,
+        embedder=_embedder,
+        database=database,
+    )
+    products = [
+        AnnotatedProductItem(
+            product_id=p.get("product_id", ""),
+            semantic_score=p.get("semantic_score"),
+            safety=p.get("safety", "safe"),
+            matching_allergens=p.get("matching_allergens", []),
+            affected_members=p.get("affected_members", []),
+            match_source=p.get("match_source", "seed"),
+        )
+        for p in result.get("products", [])
+    ]
+    logger.info("search_products complete", extra={"endpoint": "search_products", "identity": "anonymous", "latency_ms": round((time.time() - start) * 1000)})
+    return ProductSearchResult(products=products, query_interpretation=result.get("query_interpretation"))
+
+
+@app.post("/allergens/explain", response_model=AllergenExplainResult, dependencies=[Depends(verify_api_key)])
+async def allergens_explain(req: AllergenExplainRequest):
+    """
+    Explain how a product's flagged allergens are detected via the ingredient
+    graph (PRD-40 "See who's affected"). Returns per-allergen the product
+    ingredients that carry it. Empty allergen_codes → all allergens present.
+    """
+    if not req.product_id:
+        raise HTTPException(status_code=400, detail="product_id is required")
+    check_rate_limit("anonymous")
+    database = os.getenv("NEO4J_DATABASE")
+    result = run_explain_allergens(
+        _driver,
+        product_id=req.product_id,
+        allergen_codes=req.allergen_codes or [],
+        database=database,
+    )
+    items = [
+        AllergenExplainItem(code=a.get("code", ""), allergen=a.get("allergen", ""), ingredients=a.get("ingredients", []))
+        for a in result.get("allergens", [])
+    ]
+    return AllergenExplainResult(allergens=items)
 
 
 @app.post(
