@@ -427,12 +427,16 @@ def run_recommend_alternatives(
     product_id: str,
     customer_allergens: list[str] | None = None,
     limit: int = 5,
+    exclude_ids: list[str] | None = None,
     database: str | None = None,
 ) -> dict[str, Any]:
     """
     Find alternative products for a scanned product (allergen-safe, cheaper).
     Uses CAN_SUBSTITUTE first, then same-category fallback.
-    Returns {alternatives: [...]}. Empty when Product data not available.
+    `exclude_ids` drops specific products (e.g. the original + already-substituted
+    items in an OOS recovery flow — PRD-40.1 E13). Backward-compatible: defaults
+    to no exclusions. Returns {alternatives: [...]}. Empty when Product data
+    not available.
     """
     alternatives: list[dict[str, Any]] = []
     if not product_id:
@@ -442,6 +446,7 @@ def run_recommend_alternatives(
         return {"alternatives": alternatives}
 
     allergens = list(customer_allergens or [])
+    exclude = [str(x) for x in (exclude_ids or []) if x]
 
     # Path A: CAN_SUBSTITUTE
     cypher_can = """
@@ -449,6 +454,7 @@ def run_recommend_alternatives(
     WHERE orig.id = $product_id OR elementId(orig) = $product_id
     MATCH (orig)-[:CAN_SUBSTITUTE]-(alt:Product)
     WHERE alt.id <> orig.id AND alt <> orig
+      AND NOT coalesce(alt.id, elementId(alt)) IN $exclude_ids
     WITH orig, alt
     LIMIT $limit
     RETURN alt.id AS product_id, alt.name AS name, alt.brand AS brand,
@@ -457,7 +463,7 @@ def run_recommend_alternatives(
     """
     try:
         with driver.session(database=database) as session:
-            rows = session.run(cypher_can, product_id=product_id, limit=limit + 5)
+            rows = session.run(cypher_can, product_id=product_id, limit=limit + 5, exclude_ids=exclude)
             candidates = []
             for row in rows:
                 pid = str(row["product_id"] or "")
@@ -495,6 +501,7 @@ def run_recommend_alternatives(
         MATCH (alt:Product)
         WHERE alt <> orig
           AND (orig.category IS NOT NULL AND alt.category = orig.category)
+          AND NOT coalesce(alt.id, elementId(alt)) IN $exclude_ids
         WITH orig, alt
         ORDER BY coalesce(alt.price, 999999) ASC
         LIMIT $limit
@@ -504,7 +511,7 @@ def run_recommend_alternatives(
         """
         try:
             with driver.session(database=database) as session:
-                rows = session.run(cypher_cat, product_id=product_id, limit=limit + 5)
+                rows = session.run(cypher_cat, product_id=product_id, limit=limit + 5, exclude_ids=exclude)
                 for row in rows:
                     pid = str(row["product_id"] or "")
                     orig_price = row["orig_price"]

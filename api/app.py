@@ -501,11 +501,14 @@ class NotificationGenerateResponse(BaseModel):
 
 
 class AlternativesRequest(BaseModel):
-    """Request for POST /recommend/alternatives (scanner)."""
-
+    """Request for POST /recommend/alternatives (scanner / OOS recovery)."""
     product_id: str = Field(..., description="Scanned product UUID")
     customer_allergens: list[str] = Field(default_factory=list, description="Allergen IDs/names for safety filter")
-    limit: int = Field(5, ge=1, le=20)
+    limit: int = Field(5, ge=1, le=50)
+    exclude_ids: list[str] | None = Field(
+        None,
+        description="Product IDs to exclude (e.g. the original + already-substituted items in OOS recovery)",
+    )
 
 
 class AlternativeItem(BaseModel):
@@ -2863,6 +2866,7 @@ async def recommend_alternatives(req: AlternativesRequest):
         product_id=req.product_id,
         customer_allergens=req.customer_allergens or [],
         limit=req.limit,
+        exclude_ids=req.exclude_ids,
         database=database,
     )
     alternatives = [
