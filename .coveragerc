@@ -1,0 +1,23 @@
+[run]
+branch = True
+source =
+    rag_pipeline
+    api
+    chatbot
+omit =
+    */tests/*
+    */.venv/*
+    */venv/*
+    */__pycache__/*
+    debug_search_flow.py
+    run_eval.py
+    eval_llm_judge.py
+
+[report]
+show_missing = True
+skip_covered = False
+precision = 2
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError

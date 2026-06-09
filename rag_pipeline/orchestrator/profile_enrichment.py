@@ -9,8 +9,8 @@ personalised picture — the user never has to repeat their constraints in every
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
 from typing import Any
 
 # _HEALTH_TO_DIET_MAP lives in extractor_classifier.py at the repo root.
@@ -134,9 +134,7 @@ def merge_profile_into_entities(
     profile_diets: list[str] = list(profile.get("diets") or [])
 
     # ── 2. Convert health conditions → diet labels ────────────────────────────
-    condition_diets = _health_conditions_to_diets(
-        list(profile.get("health_conditions") or [])
-    )
+    condition_diets = _health_conditions_to_diets(list(profile.get("health_conditions") or []))
 
     # Union: query-extracted diets + profile diets + condition-derived diets
     existing_diets: list[str] = result.get("diet") or []
@@ -189,9 +187,7 @@ def merge_profile_into_entities(
                     "evening": "dinner",
                     "late_night": "snack",
                 }
-                result["course"] = _MT_TO_COURSE.get(
-                    context["mealTimeSlot"], context["mealTimeSlot"]
-                )
+                result["course"] = _MT_TO_COURSE.get(context["mealTimeSlot"], context["mealTimeSlot"])
         if context.get("season"):
             result["season"] = context["season"]
         if context.get("targetCalories") is not None:
@@ -199,11 +195,7 @@ def merge_profile_into_entities(
             # Derive per-recipe cap for Cypher / apply_hard_constraints when the user
             # did not ask for an explicit cal limit in the query (cal_upper_limit).
             if result.get("cal_upper_limit") is None:
-                meals_raw = (
-                    context.get("mealsPerDay")
-                    or context.get("meals_per_day")
-                    or profile.get("meals_per_day")
-                )
+                meals_raw = context.get("mealsPerDay") or context.get("meals_per_day") or profile.get("meals_per_day")
                 cap = _derive_cal_upper_limit_from_daily(
                     context["targetCalories"],
                     meals_per_day=meals_raw,

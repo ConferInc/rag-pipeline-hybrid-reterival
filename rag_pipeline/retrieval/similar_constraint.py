@@ -119,12 +119,14 @@ def retrieve_recipes_from_similar_constraint_users(
                 seen_ids.add(node_id)
                 payload = _build_recipe_payload(node_dict)
                 payload["id"] = node_dict.get("id") or node_id
-                expanded.append({
-                    "connected_id": node_id,
-                    "connected_labels": ["Recipe"],
-                    "relationship": "SAVED",
-                    "payload": payload,
-                })
+                expanded.append(
+                    {
+                        "connected_id": node_id,
+                        "connected_labels": ["Recipe"],
+                        "relationship": "SAVED",
+                        "payload": payload,
+                    }
+                )
             return {"similar_nodes": [], "expanded_context": expanded}
     except Exception as e:
         logger.warning("retrieve_recipes_from_similar_constraint_users failed: %s", e)

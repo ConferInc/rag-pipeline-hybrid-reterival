@@ -17,14 +17,14 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date
 from enum import Enum
 from typing import Any
 
 
 class ActionType(Enum):
     READ_ONLY = "read"  # Execute immediately, no confirmation
-    WRITE = "write"     # Requires user confirmation before execution
+    WRITE = "write"  # Requires user confirmation before execution
 
 
 # Map intent → ActionType. Unknown intents default to READ_ONLY (execute, no confirmation).
@@ -69,27 +69,59 @@ ACTION_REGISTRY: dict[str, ActionType] = {
 
 
 # Confirmation phrases — user agreeing to execute pending action (exact match)
-CONFIRMATION_PHRASES = frozenset({
-    "yes", "yeah", "yep", "sure", "ok", "okay", "confirm", "confirmed",
-    "go ahead", "do it", "please", "proceed", "absolutely", "yup",
-    "good to go", "go for it", "yes please", "yeah please", "please do",
-    "sure thing", "sure do it",
-})
+CONFIRMATION_PHRASES = frozenset(
+    {
+        "yes",
+        "yeah",
+        "yep",
+        "sure",
+        "ok",
+        "okay",
+        "confirm",
+        "confirmed",
+        "go ahead",
+        "do it",
+        "please",
+        "proceed",
+        "absolutely",
+        "yup",
+        "good to go",
+        "go for it",
+        "yes please",
+        "yeah please",
+        "please do",
+        "sure thing",
+        "sure do it",
+    }
+)
 
 # Prefixes for natural confirmations like "yes, please log item"
 # Must be followed by space, comma, or end (avoids "ok" matching "okra")
 CONFIRMATION_PREFIXES = ("yes", "yeah", "sure", "ok", "okay", "go ahead", "do it")
 
 # Rejection phrases — user explicitly declining the pending action
-REJECTION_PHRASES = frozenset({
-    "no", "nope", "cancel", "nevermind", "never mind", "don't", "stop",
-    "actually no", "forget it", "not now", "maybe later", "nah",
-})
+REJECTION_PHRASES = frozenset(
+    {
+        "no",
+        "nope",
+        "cancel",
+        "nevermind",
+        "never mind",
+        "don't",
+        "stop",
+        "actually no",
+        "forget it",
+        "not now",
+        "maybe later",
+        "nah",
+    }
+)
 
 
 @dataclass
 class ActionOrchestratorResult:
     """Result from route_intent — tells chat handler what to return."""
+
     action_required: bool
     confirmation_prompt: str | None
     pending_action: dict[str, Any] | None

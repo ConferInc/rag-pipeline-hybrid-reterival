@@ -20,7 +20,7 @@ jobs:
       requirements-file: requirements.txt
       run-ruff: false
       run-mypy: false
-      run-pytest: false
+      run-pytest: true
     secrets: inherit
 
   docker-validate:

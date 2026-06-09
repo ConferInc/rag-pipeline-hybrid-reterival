@@ -51,7 +51,11 @@ class CachingQueryEmbedder:
                 self._cache.move_to_end(key)
                 logger.debug(
                     "Embedding cache hit",
-                    extra={"component": "embedding_cache", "key": key[:100], "cache_size": len(self._cache)},
+                    extra={
+                        "component": "embedding_cache",
+                        "key": key[:100],
+                        "cache_size": len(self._cache),
+                    },
                 )
                 return self._cache[key].copy()
 

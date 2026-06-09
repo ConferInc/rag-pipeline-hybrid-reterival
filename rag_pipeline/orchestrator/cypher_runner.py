@@ -97,9 +97,7 @@ def run_cypher_retrieval(
         with driver.session(database=database) as session:
             rows = session.run(cypher, **params)
             for idx, row in enumerate(rows, start=1):
-                results.append(
-                    _canonicalize_cypher_row(dict(row), intent=intent, rank=idx)
-                )
+                results.append(_canonicalize_cypher_row(dict(row), intent=intent, rank=idx))
                 if max_rows is not None and len(results) >= max_rows:
                     break
         return results

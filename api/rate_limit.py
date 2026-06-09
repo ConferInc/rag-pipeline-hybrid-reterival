@@ -7,13 +7,13 @@ Uses per-minute sliding window. Prunes old entries to avoid unbounded growth.
 
 from __future__ import annotations
 
+# Config via env (read once at module load)
+import os
 import time
 from collections import defaultdict
 
 from fastapi import HTTPException
 
-# Config via env (read once at module load)
-import os
 _LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MINUTE", "25"))
 _LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "300"))
 _RETRY_AFTER_SEC = 60

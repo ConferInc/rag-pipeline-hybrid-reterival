@@ -147,7 +147,11 @@ def format_meal_history_response(rows: list[dict[str, Any]]) -> tuple[str, dict[
     if total_protein is not None:
         lines.append(f"Total protein: {total_protein} g")
 
-    return "\n".join(lines), {"items": items, "total_calories": total_cals, "total_protein_g": total_protein}
+    return "\n".join(lines), {
+        "items": items,
+        "total_calories": total_cals,
+        "total_protein_g": total_protein,
+    }
 
 
 # ── nutrition_summary ──────────────────────────────────────────────────────
@@ -185,7 +189,9 @@ def run_nutrition_summary(
         return None
 
 
-def format_nutrition_summary_response(data: dict[str, Any] | None) -> tuple[str, dict[str, Any] | None]:
+def format_nutrition_summary_response(
+    data: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any] | None]:
     """Format nutrition summary into human-readable text."""
     if not data:
         return "No nutrition data logged in the last week.", None

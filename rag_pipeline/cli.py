@@ -10,19 +10,17 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 import yaml
-
 from dotenv import load_dotenv
-
-from rag_pipeline.logging_utils import (
-    set_request_id,
-    setup_pipeline_logging,
-    truncate_for_log,
-)
 from openai import OpenAI
 
 from rag_pipeline.config import load_embedding_config
 from rag_pipeline.embeddings.caching_embedder import CachingQueryEmbedder
 from rag_pipeline.embeddings.openai_embedder import OpenAIQueryEmbedder
+from rag_pipeline.logging_utils import (
+    set_request_id,
+    setup_pipeline_logging,
+    truncate_for_log,
+)
 from rag_pipeline.neo4j_client import create_neo4j_driver, neo4j_settings_from_env
 from rag_pipeline.retrieval.service import SemanticRetrievalRequest, retrieve_semantic
 from rag_pipeline.retrieval.structural import (
@@ -51,8 +49,8 @@ def _maybe_wrap_embedder_with_cache(embedder: OpenAIQueryEmbedder, config_path: 
 
 def _print_structural_prompt_preview(condensed: list, *, user_query: str = "Recommend me some recipes") -> None:
     """Print how structural context appears in the augmented LLM prompt."""
-    from rag_pipeline.augmentation.prompt_builder import SYSTEM_PROMPT
     from rag_pipeline.augmentation.condense import format_context_as_text
+    from rag_pipeline.augmentation.prompt_builder import SYSTEM_PROMPT
 
     structural_text = format_context_as_text(
         condensed,
@@ -95,25 +93,47 @@ def build_parser() -> ArgumentParser:
     se.add_argument("--top-k", type=int, default=5, help="Top K similar nodes")
     se.add_argument("--intent", default=None, help="Intent filter (e.g., recommend_recipe, check_allergen)")
     se.add_argument("--filter-labels", default=None, help="Comma-separated labels to keep (overrides intent)")
-    se.add_argument("--filter-rels", default=None, help="Comma-separated relationships to keep (overrides intent)")
+    se.add_argument(
+        "--filter-rels",
+        default=None,
+        help="Comma-separated relationships to keep (overrides intent)",
+    )
     se.add_argument("--condense", action="store_true", help="Condense output for LLM (dedupe, rank, trim)")
-    se.add_argument("--format", choices=["json", "text"], default="json", help="Output format (json or text for LLM)")
+    se.add_argument(
+        "--format",
+        choices=["json", "text"],
+        default="json",
+        help="Output format (json or text for LLM)",
+    )
     se.add_argument("--max-items", type=int, default=10, help="Max items in condensed output")
-    se.add_argument("--show-prompt", action="store_true", help="Show how structural context appears in the augmented LLM prompt")
+    se.add_argument(
+        "--show-prompt",
+        action="store_true",
+        help="Show how structural context appears in the augmented LLM prompt",
+    )
 
     fr = sub.add_parser("full-retrieval", help="Run all 3 retrievals + build augmented LLM prompt")
     fr.add_argument("--config", default="embedding_config.yaml", help="Path to embedding config YAML")
     fr.add_argument("--query", required=True, help="User query text")
     fr.add_argument("--customer-id", default=None, help="Neo4j elementId of the customer (for structural)")
     fr.add_argument("--top-k", type=int, default=5, help="Top K results per retrieval")
-    fr.add_argument("--format", choices=["prompt", "json"], default="prompt", help="Output as augmented prompt or raw JSON")
+    fr.add_argument(
+        "--format",
+        choices=["prompt", "json"],
+        default="prompt",
+        help="Output as augmented prompt or raw JSON",
+    )
 
     ask = sub.add_parser("ask", help="End-to-end: retrieve + augment + generate answer")
     ask.add_argument("--config", default="embedding_config.yaml", help="Path to embedding config YAML")
     ask.add_argument("--query", required=True, help="User query text")
     ask.add_argument("--customer-id", default=None, help="Neo4j elementId of the customer (for structural)")
     ask.add_argument("--top-k", type=int, default=5, help="Top K results per retrieval")
-    ask.add_argument("--show-prompt", action="store_true", help="Also print the augmented prompt before the answer")
+    ask.add_argument(
+        "--show-prompt",
+        action="store_true",
+        help="Also print the augmented prompt before the answer",
+    )
     return p
 
 
@@ -164,6 +184,7 @@ def main() -> None:
 
         if args.format == "text":
             from rag_pipeline.augmentation.condense import format_semantic_results_as_text
+
             print(format_semantic_results_as_text(results, max_items=int(args.max_items)))
         else:
             print(json.dumps([r.to_dict() for r in results], indent=2, ensure_ascii=False))
@@ -217,6 +238,7 @@ def main() -> None:
 
         if args.intent and not (args.filter_labels or args.filter_rels):
             import yaml
+
             with open(args.config) as f:
                 raw_cfg = yaml.safe_load(f)
             intent_filters = raw_cfg.get("intent_filters", {})
@@ -273,8 +295,9 @@ def main() -> None:
 
     elif args.command == "full-retrieval":
         import asyncio
-        from rag_pipeline.orchestrator.orchestrator import orchestrate
+
         from rag_pipeline.augmentation.prompt_builder import build_augmented_prompt
+        from rag_pipeline.orchestrator.orchestrator import orchestrate
 
         cfg = load_embedding_config(Path(args.config))
 
@@ -297,16 +320,18 @@ def main() -> None:
         driver = create_neo4j_driver(neo_settings)
 
         try:
-            orch_result = asyncio.run(orchestrate(
-                driver,
-                cfg=cfg,
-                embedder=embedder,
-                user_query=str(args.query),
-                customer_node_id=args.customer_id,
-                top_k=int(args.top_k),
-                database=neo_settings.database,
-                config_path=str(args.config),
-            ))
+            orch_result = asyncio.run(
+                orchestrate(
+                    driver,
+                    cfg=cfg,
+                    embedder=embedder,
+                    user_query=str(args.query),
+                    customer_node_id=args.customer_id,
+                    top_k=int(args.top_k),
+                    database=neo_settings.database,
+                    config_path=str(args.config),
+                )
+            )
         finally:
             driver.close()
 
@@ -329,9 +354,10 @@ def main() -> None:
 
     elif args.command == "ask":
         import asyncio
-        from rag_pipeline.orchestrator.orchestrator import orchestrate
+
         from rag_pipeline.augmentation.prompt_builder import build_augmented_prompt
         from rag_pipeline.generation.generator import generate_response
+        from rag_pipeline.orchestrator.orchestrator import orchestrate
 
         setup_pipeline_logging(args.config)
         request_id = str(uuid.uuid4())
@@ -365,16 +391,18 @@ def main() -> None:
         t_start = time.perf_counter()
 
         try:
-            orch_result = asyncio.run(orchestrate(
-                driver,
-                cfg=cfg,
-                embedder=embedder,
-                user_query=str(args.query),
-                customer_node_id=args.customer_id,
-                top_k=int(args.top_k),
-                database=neo_settings.database,
-                config_path=str(args.config),
-            ))
+            orch_result = asyncio.run(
+                orchestrate(
+                    driver,
+                    cfg=cfg,
+                    embedder=embedder,
+                    user_query=str(args.query),
+                    customer_node_id=args.customer_id,
+                    top_k=int(args.top_k),
+                    database=neo_settings.database,
+                    config_path=str(args.config),
+                )
+            )
         finally:
             driver.close()
 
@@ -469,9 +497,8 @@ def main() -> None:
             pass
         if validation_cfg.get("enabled", False) and answer:
             from rag_pipeline.validation.response_validator import validate_response
-            is_valid, violations, validated = validate_response(
-                answer, orch_result.entities, validation_cfg
-            )
+
+            is_valid, violations, validated = validate_response(answer, orch_result.entities, validation_cfg)
             answer = validated
 
         if not answer:
@@ -483,7 +510,10 @@ def main() -> None:
                     "latency_ms": round(t_gen_ms, 1),
                 },
             )
-            print("[WARN] LLM returned an empty response. Check API key, model, and base URL.", file=sys.stderr)
+            print(
+                "[WARN] LLM returned an empty response. Check API key, model, and base URL.",
+                file=sys.stderr,
+            )
         else:
             t_total_ms = (time.perf_counter() - t_start) * 1000
             logger_cli.info(
@@ -501,4 +531,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

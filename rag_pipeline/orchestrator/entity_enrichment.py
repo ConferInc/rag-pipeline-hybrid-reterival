@@ -13,7 +13,18 @@ def _extract_exclude_ingredients_from_query(query_lower: str) -> list[str]:
     """
     found: list[str] = []
     seen: set[str] = set()
-    diet_words = {"vegan", "vegetarian", "keto", "paleo", "gluten", "dairy", "nut", "protein", "fat", "carb"}
+    diet_words = {
+        "vegan",
+        "vegetarian",
+        "keto",
+        "paleo",
+        "gluten",
+        "dairy",
+        "nut",
+        "protein",
+        "fat",
+        "carb",
+    }
 
     def _add(ing: str) -> None:
         ing = ing.strip().rstrip(".,?!")
@@ -24,13 +35,41 @@ def _extract_exclude_ingredients_from_query(query_lower: str) -> list[str]:
             found.append(ing)
 
     patterns = [
-        (r"\bwithout\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", 1, 2),
-        (r"\bno\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", 1, 2),
-        (r"\bavoid(?:ing)?\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", 1, 2),
-        (r"\ballerg(?:ic|y)\s+to\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", 1, 2),
-        (r"\b(?:don't|dont|do\s+not)\s+want\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", 1, 2),
-        (r"\bfree\s+of\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", 1, 2),
-        (r"\bexcluding\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)", 1, 2),
+        (
+            r"\bwithout\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)",
+            1,
+            2,
+        ),
+        (
+            r"\bno\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)",
+            1,
+            2,
+        ),
+        (
+            r"\bavoid(?:ing)?\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)",
+            1,
+            2,
+        ),
+        (
+            r"\ballerg(?:ic|y)\s+to\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)",
+            1,
+            2,
+        ),
+        (
+            r"\b(?:don't|dont|do\s+not)\s+want\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)",
+            1,
+            2,
+        ),
+        (
+            r"\bfree\s+of\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)",
+            1,
+            2,
+        ),
+        (
+            r"\bexcluding\s+([a-z][\w\s\-]{1,25}?)(?:\s+(?:and|or)\s+([a-z][\w\s\-]{1,25}?))?(?:\s|$|\?|,)",
+            1,
+            2,
+        ),
     ]
     for pat, g1, g2 in patterns:
         for m in re.finditer(pat, query_lower):

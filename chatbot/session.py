@@ -19,6 +19,7 @@ from typing import Any
 @dataclass
 class ChatMessage:
     """Single message in the conversation history."""
+
     role: str  # "user" | "assistant" | "system"
     content: str
     intent: str | None = None
@@ -29,6 +30,7 @@ class ChatMessage:
 @dataclass
 class PendingAction:
     """Action awaiting user confirmation before execution."""
+
     action_id: str
     intent: str
     entities: dict[str, Any]
@@ -38,6 +40,7 @@ class PendingAction:
 @dataclass
 class ChatSession:
     """Chat session for one customer, tracks history and pending actions."""
+
     session_id: str
     customer_id: str
     history: list[ChatMessage] = field(default_factory=list)

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
-import os
 import logging
+import os
+from typing import Any
 
 from rag_pipeline.augmentation.condense import (
     condense_for_llm,
@@ -75,7 +75,9 @@ def _build_constraint_instructions(profile: dict[str, Any]) -> str:
 
     allergens = profile.get("allergens") or []
     if allergens:
-        lines.append(f"NEVER suggest or mention these allergens: {', '.join(allergens)}. Never include them in recipes or substitutes.")
+        lines.append(
+            f"NEVER suggest or mention these allergens: {', '.join(allergens)}. Never include them in recipes or substitutes."
+        )
 
     diets = profile.get("diets") or []
     if diets:
@@ -103,7 +105,9 @@ def _build_constraint_instructions(profile: dict[str, Any]) -> str:
 
     conditions = profile.get("health_conditions") or []
     if conditions:
-        lines.append(f"Consider these health conditions: {', '.join(conditions)}. Avoid or warn about ingredients that could worsen them (e.g. high-sodium for hypertension, high-sugar for diabetes).")
+        lines.append(
+            f"Consider these health conditions: {', '.join(conditions)}. Avoid or warn about ingredients that could worsen them (e.g. high-sodium for hypertension, high-sugar for diabetes)."
+        )
 
     return " ".join(lines) if lines else ""
 
@@ -145,7 +149,7 @@ def _build_profile_section(profile: dict[str, Any]) -> str:
 
     recent = profile.get("recent_recipes") or []
     if recent:
-        capped = recent[: _PROFILE_RECENT_RECIPES_CAP]
+        capped = recent[:_PROFILE_RECENT_RECIPES_CAP]
         lines.append(f"Recent meals: {', '.join(capped)}")
 
     household_type = profile.get("household_type")
@@ -300,7 +304,7 @@ def build_augmented_prompt(
 
     # ── Errors (if any) ───────────────────────────────────────────────────────
     if result.errors:
-        sections.append(f"[WARNINGS]\n" + "\n".join(f"- {e}" for e in result.errors))
+        sections.append("[WARNINGS]\n" + "\n".join(f"- {e}" for e in result.errors))
 
     # ── User query ────────────────────────────────────────────────────────────
     sections.append(f"[USER QUERY]\n{user_query}")
@@ -320,7 +324,14 @@ def _format_cypher_results(
 
     lines: list[str] = []
 
-    if intent in ("find_recipe", "find_recipe_by_pantry", "recipes_for_cuisine", "recipes_by_nutrient", "ingredient_in_recipes", "cuisine_recipes"):
+    if intent in (
+        "find_recipe",
+        "find_recipe_by_pantry",
+        "recipes_for_cuisine",
+        "recipes_by_nutrient",
+        "ingredient_in_recipes",
+        "cuisine_recipes",
+    ):
         lines.append("Matching recipes from graph:")
         for i, row in enumerate(rows[:max_items], 1):
             title = row.get("title", "Unknown")

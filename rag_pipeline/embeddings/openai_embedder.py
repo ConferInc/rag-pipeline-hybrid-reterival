@@ -14,4 +14,3 @@ class OpenAIQueryEmbedder:
     def embed_query(self, text: str) -> Sequence[float]:
         resp = self.client.embeddings.create(model=self.model, input=text)
         return resp.data[0].embedding
-

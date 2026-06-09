@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 USDA_GROUPS: tuple[str, ...] = (
     "protein",
     "dairy",
@@ -146,7 +145,5 @@ def build_audit_warnings(missing_groups: list[str]) -> list[str]:
         f"Missing food groups: {', '.join(missing_groups)}.",
     ]
     if ordered_missing:
-        warnings.append(
-            "Relax soft USDA goals in order: " + " -> ".join(ordered_missing) + "."
-        )
+        warnings.append("Relax soft USDA goals in order: " + " -> ".join(ordered_missing) + ".")
     return warnings

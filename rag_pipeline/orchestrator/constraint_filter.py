@@ -265,6 +265,10 @@ def _filter_allergens(
     Drop recipes that contain any allergen/exclude ingredient.
     Uses (1) title with variant expansion (typos, plural), (2) graph CONTAINS match.
     """
+    # Early exit: nothing to filter when no allergens are specified
+    if not allergens:
+        return fused
+
     # Expand terms so "banannas" matches "banana", "bananas" matches "banana bread"
     expanded = list({v for t in allergens for v in _expand_exclude_term_variants(t)})
 
@@ -289,13 +293,11 @@ def _filter_allergens(
         )
 
         if not rid:
-            # No UUID — cannot verify; keep but mark
-            item = dict(item)
-            sources = list(item.get("sources", []))
-            if "unverified_allergen" not in sources:
-                sources.append("unverified_allergen")
-            item["sources"] = sources
-            kept.append(item)
+            # No UUID — ingredients cannot be verified against the graph.
+            # Safety-first: drop the recipe so a user with allergens never receives
+            # a result whose ingredients we could not check.
+            dropped += 1
+            logger.info("Allergen filter dropped unverifiable recipe (no DB id): title=%s", item.get("payload", {}).get("title", "?"))
         elif rid in violating_ids:
             dropped += 1
             logger.info(
@@ -915,7 +917,9 @@ def apply_usda_food_group_bonus(
     This step is fail-safe: if data is missing or malformed, it returns fused
     unchanged for backward compatibility.
     """
-    if os.getenv("ENABLE_USDA_FOOD_GROUP_BONUS", "").strip() != "1":
+    # Default ON — only disable when explicitly set to "0" or empty string.
+    _usda_flag = os.getenv("ENABLE_USDA_FOOD_GROUP_BONUS", "1").strip().lower()
+    if _usda_flag in ("0", "", "false", "no"):
         return fused
     if not fused or intent not in RECIPE_INTENTS:
         return fused

@@ -53,7 +53,11 @@ class LabelCache:
                 self._cache.move_to_end(key)
                 logger.debug(
                     "Label cache hit",
-                    extra={"component": "label_cache", "key": key[:100], "cache_size": len(self._cache)},
+                    extra={
+                        "component": "label_cache",
+                        "key": key[:100],
+                        "cache_size": len(self._cache),
+                    },
                 )
                 return self._cache[key]
         return None

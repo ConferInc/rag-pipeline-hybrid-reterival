@@ -13,24 +13,73 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Ingredients incompatible with Vegan/Vegetarian
-MEAT_INGREDIENTS: frozenset[str] = frozenset({
-    "chicken", "beef", "pork", "lamb", "turkey", "duck", "venison",
-    "bacon", "ham", "sausage", "meat", "fish", "salmon", "tuna", "shrimp",
-    "lobster", "crab", "scallop", "seafood", "anchovy", "cod", "tilapia",
-})
+MEAT_INGREDIENTS: frozenset[str] = frozenset(
+    {
+        "chicken",
+        "beef",
+        "pork",
+        "lamb",
+        "turkey",
+        "duck",
+        "venison",
+        "bacon",
+        "ham",
+        "sausage",
+        "meat",
+        "fish",
+        "salmon",
+        "tuna",
+        "shrimp",
+        "lobster",
+        "crab",
+        "scallop",
+        "seafood",
+        "anchovy",
+        "cod",
+        "tilapia",
+    }
+)
 
 # Ingredients incompatible with Keto / Low-Carb
-SUGARY_INGREDIENTS: frozenset[str] = frozenset({
-    "sugar", "honey", "maple syrup", "agave", "molasses", "corn syrup",
-    "rice", "pasta", "bread", "flour", "potato", "potatoes", "oat",
-    "oatmeal", "quinoa", "beans", "lentils", "fruit juice",
-})
+SUGARY_INGREDIENTS: frozenset[str] = frozenset(
+    {
+        "sugar",
+        "honey",
+        "maple syrup",
+        "agave",
+        "molasses",
+        "corn syrup",
+        "rice",
+        "pasta",
+        "bread",
+        "flour",
+        "potato",
+        "potatoes",
+        "oat",
+        "oatmeal",
+        "quinoa",
+        "beans",
+        "lentils",
+        "fruit juice",
+    }
+)
 
 # Ingredients incompatible with Gluten-Free
-GLUTEN_INGREDIENTS: frozenset[str] = frozenset({
-    "wheat", "barley", "rye", "flour", "bread", "pasta", "couscous",
-    "semolina", "breadcrumbs", "seitan", "malt",
-})
+GLUTEN_INGREDIENTS: frozenset[str] = frozenset(
+    {
+        "wheat",
+        "barley",
+        "rye",
+        "flour",
+        "bread",
+        "pasta",
+        "couscous",
+        "semolina",
+        "breadcrumbs",
+        "seitan",
+        "malt",
+    }
+)
 
 
 def _ingredient_conflicts_with_terms(ingredient: str, forbidden_terms: frozenset[str]) -> bool:
@@ -108,7 +157,11 @@ def validate_entity_compatibility(entities: dict[str, Any]) -> dict[str, Any]:
         logger.info(
             "Entity validation: stripped %d conflicting include_ingredient(s)",
             len(to_remove),
-            extra={"component": "entity_validation", "diets": list(diet_set), "removed_count": len(to_remove)},
+            extra={
+                "component": "entity_validation",
+                "diets": list(diet_set),
+                "removed_count": len(to_remove),
+            },
         )
 
     return result
